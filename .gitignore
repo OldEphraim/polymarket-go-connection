@@ -8,3 +8,6 @@
 # Python virtual environments
 venv/
 */venv/
+
+# Generated database code
+internal/database/
