@@ -3,12 +3,12 @@
 Search Polymarket using the public-search API endpoint
 
 Usage:
-    python polymarket_public_search.py <query> [options]
+    python search_polymarket.py <query> [options]
     
 Examples:
-    python polymarket_public_search.py bitcoin
-    python polymarket_public_search.py "super bowl"
-    python polymarket_public_search.py election --limit 5
+    python search_polymarket.py bitcoin
+    python search_polymarket.py "super bowl"
+    python search_polymarket.py election --limit 5
 """
 
 import sys
