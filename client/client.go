@@ -246,10 +246,12 @@ func (p *PolymarketClient) GetMarketFromSlug(slug string) (map[string]string, er
 		if market.ConditionID != "" {
 			fmt.Printf("No tokens, but found condition_id: %s\n", market.ConditionID)
 			// Try another endpoint
-			resp2, _ := p.client.Get(fmt.Sprintf("%s/markets?condition_id=%s", p.apiURL, market.ConditionID))
-			defer resp2.Body.Close()
-			body2, _ := io.ReadAll(resp2.Body)
-			fmt.Printf("Alternative query result: %s\n", string(body2))
+			resp2, err := p.client.Get(fmt.Sprintf("%s/markets?condition_id=%s", p.apiURL, market.ConditionID))
+			if err == nil {
+				defer resp2.Body.Close()
+				body2, _ := io.ReadAll(resp2.Body)
+				fmt.Printf("Alternative query result: %s\n", string(body2))
+			}
 		}
 		return nil, fmt.Errorf("no tokens found")
 	}

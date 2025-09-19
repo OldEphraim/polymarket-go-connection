@@ -2,67 +2,116 @@ package main
 
 import (
 	"context"
-	dbsql "database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
-	"os/exec"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/client"
 	"github.com/OldEphraim/polymarket-go-connection/db"
-	"github.com/OldEphraim/polymarket-go-connection/internal/database"
+	"github.com/OldEphraim/polymarket-go-connection/utils/common"
+	"github.com/OldEphraim/polymarket-go-connection/utils/config"
+	"github.com/OldEphraim/polymarket-go-connection/utils/dbops"
+	"github.com/OldEphraim/polymarket-go-connection/utils/logging"
+	"github.com/OldEphraim/polymarket-go-connection/utils/market"
+	"github.com/OldEphraim/polymarket-go-connection/utils/position"
+	"github.com/OldEphraim/polymarket-go-connection/utils/scheduler"
+	"github.com/OldEphraim/polymarket-go-connection/utils/strategy"
+	"github.com/OldEphraim/polymarket-go-connection/utils/websocket"
 	"github.com/joho/godotenv"
 )
 
-type Strategy struct {
-	store     *db.Store
-	pmClient  *client.PolymarketClient
-	wsClient  *client.WSClient
-	sessionID int32
+type MomentumStrategy struct {
+	*strategy.BaseStrategy
 
-	// Strategy parameters
-	initialBalance    float64
-	currentBalance    float64
-	maxPositionSize   float64
-	stopLossPercent   float64
-	takeProfitPercent float64
+	// Configuration
+	config *config.MomentumConfig
 
-	// Position tracking
-	positions map[string]*Position
-	mu        sync.Mutex
+	// Managers and utilities
+	posManager    *position.Manager
+	wsManager     *websocket.Manager
+	taskScheduler *scheduler.Scheduler
+	marketFetcher market.Fetcher
+	searchService *market.SearchService
+	logger        *logging.StrategyLogger
+	perfTracker   *logging.PerformanceTracker
 
-	// Control
-	ctx    context.Context
-	cancel context.CancelFunc
-}
-
-type Position struct {
-	TokenID      string
-	Market       string
-	Shares       float64
-	EntryPrice   float64
-	CurrentPrice float64
-	EntryTime    time.Time
-	UpdateChan   <-chan client.MarketUpdate
+	// Strategy state
+	updateCounter int
+	lastPrices    map[string]float64
 }
 
 func main() {
+	// Parse command line flags
+	configFile := flag.String("config", "momentum.json", "Configuration file")
+	generateConfig := flag.Bool("generate-config", false, "Generate default configuration")
+	logLevel := flag.String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR)")
+	flag.Parse()
+
+	// Load environment
 	godotenv.Load()
+	rand.Seed(time.Now().UnixNano())
 
-	// SHORT TEST DURATION - change to 8*time.Hour for overnight
-	duration := 10 * time.Minute
-	initialBalance := 1000.0
+	// Generate config if requested
+	if *generateConfig {
+		loader := config.NewLoader()
+		if err := loader.GenerateDefaultConfigs(); err != nil {
+			log.Fatal("Failed to generate configs: ", err)
+		}
+		log.Println("Configuration files generated in configs/")
+		return
+	}
 
-	log.Printf("Starting momentum strategy for %v with $%.2f", duration, initialBalance)
+	// Load configuration
+	loader := config.NewLoader()
+	cfg, err := loader.LoadMomentumConfig(*configFile)
+	if err != nil {
+		log.Fatal("Failed to load config: ", err)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	// Override from environment
+	loader.LoadFromEnv(&cfg.BaseConfig)
+
+	// Get duration from config
+	duration, err := cfg.GetDuration()
+	if err != nil {
+		log.Fatal("Invalid duration in config: ", err)
+	}
+
+	log.Printf("=== STARTING MOMENTUM STRATEGY ===")
+	log.Printf("Configuration: %s", *configFile)
+	if cfg.IsInfinite() {
+		log.Printf("Duration: INFINITE (manual stop required)")
+	} else {
+		log.Printf("Duration: %v", duration)
+	}
+	log.Printf("Initial Balance: $%.2f", cfg.InitialBalance)
+
+	// Create context based on duration
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if cfg.IsInfinite() {
+		ctx, cancel = context.WithCancel(context.Background())
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), duration)
+	}
 	defer cancel()
 
-	strategy, err := NewStrategy(ctx, cancel, initialBalance)
+	// Parse log level
+	level := logging.INFO
+	switch *logLevel {
+	case "DEBUG":
+		level = logging.DEBUG
+	case "WARN":
+		level = logging.WARN
+	case "ERROR":
+		level = logging.ERROR
+	}
+
+	strategy, err := NewMomentumStrategy(ctx, cancel, cfg, level)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -70,465 +119,407 @@ func main() {
 	strategy.Run()
 }
 
-func NewStrategy(ctx context.Context, cancel context.CancelFunc, balance float64) (*Strategy, error) {
-	store, err := db.NewStore("user=a8garber dbname=polymarket_dev sslmode=disable")
+func NewMomentumStrategy(ctx context.Context, cancel context.CancelFunc, cfg *config.MomentumConfig, logLevel logging.LogLevel) (*MomentumStrategy, error) {
+	// Create logger
+	logger, err := logging.NewStrategyLoggerWithLevel(cfg.Name, logLevel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create logger: %w", err)
+	}
+
+	logger.Info("=== INITIALIZING MOMENTUM STRATEGY ===")
+
+	// Initialize base strategy
+	base := &strategy.BaseStrategy{
+		InitialBalance: cfg.InitialBalance,
+		CurrentBalance: cfg.InitialBalance,
+		Positions:      make(map[string]*strategy.Position),
+		Ctx:            ctx,
+		Cancel:         cancel,
+	}
+
+	// Initialize database
+	store, err := db.NewStore(dbops.GetDBConnection())
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
+	base.Store = store
+	logger.Info("✓ Database connected")
 
-	strategyRec, err := store.CreateStrategy(ctx, database.CreateStrategyParams{
-		Name: "momentum_overnight",
-		Config: json.RawMessage(`{
-            "max_position_size": 100,
-            "stop_loss": 0.15,
-            "take_profit": 0.25
-        }`),
-		InitialBalance: dbsql.NullString{String: fmt.Sprintf("%.2f", balance), Valid: true},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create strategy: %w", err)
+	// Initialize strategy and session
+	dbConfig := dbops.StrategyConfig{
+		Name: cfg.Name,
+		Config: json.RawMessage(fmt.Sprintf(`{
+            "max_position_size": %f,
+            "stop_loss": %f,
+            "take_profit": %f,
+            "max_spread": %f,
+            "min_volume_24h": %f,
+            "momentum_threshold": %f
+        }`, cfg.MaxPositionSize, cfg.StopLoss, cfg.TakeProfit,
+			cfg.MaxSpreadPercent, cfg.MinVolume24h, cfg.MomentumThreshold)),
+		InitialBalance: cfg.InitialBalance,
 	}
 
-	session, err := store.CreateSession(ctx, database.CreateSessionParams{
-		StrategyID:     dbsql.NullInt32{Int32: strategyRec.ID, Valid: true},
-		StartBalance:   dbsql.NullString{String: fmt.Sprintf("%.2f", balance), Valid: true},
-		CurrentBalance: dbsql.NullString{String: fmt.Sprintf("%.2f", balance), Valid: true},
-	})
+	strategyID, sessionID, err := dbops.InitializeStrategy(ctx, store, dbConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create session: %w", err)
+		return nil, err
 	}
+	base.SessionID = sessionID
+	logger.Info("✓ Strategy %d, Session %d created", strategyID, sessionID)
 
+	// Initialize clients
 	pmClient, err := client.NewPolymarketClient(os.Getenv("PRIVATE_KEY"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Polymarket client: %w", err)
 	}
+	base.PMClient = pmClient
 
 	wsClient, err := client.NewWSClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WebSocket client: %w", err)
 	}
+	base.WSClient = wsClient
 
-	log.Printf("Created session %d for strategy %s", session.ID, strategyRec.Name)
+	// Create managers
+	posManager := position.NewManager(
+		cfg.MaxPositions,
+		cfg.MaxPositionSize,
+		cfg.StopLoss,
+		cfg.TakeProfit,
+		0, // No max hold time - using strategy duration instead
+	)
 
-	return &Strategy{
-		store:             store,
-		pmClient:          pmClient,
-		wsClient:          wsClient,
-		sessionID:         session.ID,
-		initialBalance:    balance,
-		currentBalance:    balance,
-		maxPositionSize:   100.0,
-		stopLossPercent:   0.15,
-		takeProfitPercent: 0.25,
-		positions:         make(map[string]*Position),
-		ctx:               ctx,
-		cancel:            cancel,
-	}, nil
+	wsManager := websocket.NewManager(wsClient)
+	marketFetcher := market.NewStandardFetcher(pmClient, wsClient)
+
+	// Create search service with filters
+	searchService := market.NewSearchService()
+	searchService.SetFilters(market.SearchFilters{
+		MinVolume24hr: cfg.MinVolume24h,
+		ActiveOnly:    true,
+		MinPrice:      0.05,
+		MaxPrice:      0.95,
+		MaxResults:    20,
+	})
+
+	// Create performance tracker
+	perfTracker := logging.NewPerformanceTracker(logger)
+
+	s := &MomentumStrategy{
+		BaseStrategy:  base,
+		config:        cfg,
+		posManager:    posManager,
+		wsManager:     wsManager,
+		marketFetcher: marketFetcher,
+		searchService: searchService,
+		logger:        logger,
+		perfTracker:   perfTracker,
+		lastPrices:    make(map[string]float64),
+	}
+
+	// Build task scheduler
+	s.taskScheduler = scheduler.NewBuilder().
+		AddTask("discover_markets", 30*time.Minute, s.discoverMarkets).
+		AddTask("check_exits", 5*time.Second, s.checkExitConditions).
+		AddTask("status_update", 30*time.Second, s.printStatus).
+		AddTask("performance_log", 5*time.Minute, s.logPerformance).
+		Build()
+
+	logger.Info("=== CONFIGURATION ===")
+	logger.Info("  Max Positions: %d", cfg.MaxPositions)
+	logger.Info("  Max Position Size: $%.2f", cfg.MaxPositionSize)
+	logger.Info("  Stop Loss: %.1f%%", cfg.StopLoss*100)
+	logger.Info("  Take Profit: %.1f%%", cfg.TakeProfit*100)
+	logger.Info("  Min Volume: $%.0f", cfg.MinVolume24h)
+	logger.Info("  Max Spread: %.1f%%", cfg.MaxSpreadPercent*100)
+	logger.Info("  Momentum Threshold: %.2f%%", cfg.MomentumThreshold*100)
+	logger.Info("  Search Queries: %v", cfg.SearchQueries)
+
+	return s, nil
 }
 
-func (s *Strategy) Run() {
-	log.Println("Starting strategy components...")
+func (s *MomentumStrategy) Run() {
+	s.logger.Info("=== STARTING STRATEGY COMPONENTS ===")
 
-	go s.wsClient.Listen(s.ctx)
-	go s.discoverMarkets()
-	go s.monitorPositions()
-	go s.statusUpdates()
+	// Start WebSocket manager
+	go s.wsManager.MaintainConnection(s.Ctx)
+	go s.WSClient.Listen(s.Ctx)
 
-	<-s.ctx.Done()
+	// Initial market discovery
+	s.discoverMarkets()
+
+	if s.config.TestMode {
+		s.logger.Info("TEST MODE ENABLED")
+		go s.simulateMarketActivity()
+	}
+
+	// Start scheduler (blocks until context done)
+	s.taskScheduler.Run(s.Ctx)
+
+	// Cleanup
 	s.shutdown()
 }
 
-func (s *Strategy) discoverMarkets() {
-	// Search immediately, then every 30 minutes
-	s.searchAndSubscribe()
+func (s *MomentumStrategy) simulateMarketActivity() {
+	s.logger.Debug("Starting market simulation for testing")
+	time.Sleep(15 * time.Second)
 
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-s.Ctx.Done():
 			return
 		case <-ticker.C:
-			s.searchAndSubscribe()
+			s.Mu.Lock()
+			if len(s.Positions) == 0 && s.posManager.CanEnter(s.CurrentBalance, 0, s.config.MaxPositionSize) {
+				s.logger.Debug("TEST MODE: Simulating buy conditions")
+			}
+			s.Mu.Unlock()
 		}
 	}
 }
 
-func (s *Strategy) searchAndSubscribe() {
-	queries := []string{"NFL", "NBA", "Premier League", "bitcoin"}
+func (s *MomentumStrategy) discoverMarkets() {
+	s.logger.Info("=== DISCOVERING MARKETS ===")
 
-	log.Printf("Searching for markets...")
-
-	for _, query := range queries {
-		markets := s.searchMarkets(query)
-		log.Printf("Found %d markets for query '%s'", len(markets), query)
-
-		for _, market := range markets {
-			if !market.Active || market.Volume24h < 1000 {
-				continue
-			}
-
-			for _, token := range market.Tokens {
-				s.mu.Lock()
-				if _, exists := s.positions[token.TokenID]; exists {
-					s.mu.Unlock()
-					continue
-				}
-				s.mu.Unlock()
-
-				if token.Price < 0.20 || token.Price > 0.80 {
-					continue
-				}
-
-				updates, err := s.wsClient.Subscribe(token.TokenID)
-				if err != nil {
-					log.Printf("Failed to subscribe to %s: %v", token.TokenID[:20], err)
-					continue
-				}
-
-				go s.monitorToken(token, market.Question, updates)
-
-				// Safe market name truncation
-				marketName := market.Question
-				if len(marketName) > 50 {
-					marketName = marketName[:47] + "..."
-				}
-				log.Printf("Monitoring: %s (%.1f%%)", marketName, token.Price*100)
-			}
-		}
-	}
-}
-
-func (s *Strategy) searchMarkets(query string) []MarketInfo {
-	cmd := exec.Command("./run_search.sh", query, "--json", "--limit", "5")
-
-	output, err := cmd.Output()
+	// Use search service to find markets
+	results, err := s.searchService.FindMarkets(s.config.SearchQueries)
 	if err != nil {
-		log.Printf("Search failed for '%s': %v", query, err)
-		return []MarketInfo{}
-	}
-
-	// Handle outcome_prices as strings
-	var result struct {
-		Markets []struct {
-			Question      string   `json:"question"`
-			Active        bool     `json:"active"`
-			Volume24hr    float64  `json:"volume24hr"`
-			TokenIDs      []string `json:"token_ids"`
-			Outcomes      []string `json:"outcomes"`
-			OutcomePrices []string `json:"outcome_prices"` // These come as strings!
-		} `json:"markets"`
-	}
-
-	if err := json.Unmarshal(output, &result); err != nil {
-		log.Printf("Failed to parse search results: %v", err)
-		return []MarketInfo{}
-	}
-
-	var markets []MarketInfo
-	for _, m := range result.Markets {
-		market := MarketInfo{
-			Question:  m.Question,
-			Active:    m.Active,
-			Volume24h: m.Volume24hr,
-		}
-
-		// Convert string prices to floats
-		for i := 0; i < len(m.TokenIDs) && i < len(m.Outcomes) && i < len(m.OutcomePrices); i++ {
-			price, err := strconv.ParseFloat(m.OutcomePrices[i], 64)
-			if err != nil {
-				price = 0 // Default if parse fails
-			}
-
-			market.Tokens = append(market.Tokens, TokenInfo{
-				TokenID: m.TokenIDs[i],
-				Outcome: m.Outcomes[i],
-				Price:   price,
-			})
-		}
-
-		markets = append(markets, market)
-	}
-
-	return markets
-}
-
-func (s *Strategy) monitorToken(token TokenInfo, market string, updates <-chan client.MarketUpdate) {
-	entryThreshold := 0.001
-	var lastPrice float64
-	updateCount := 0
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			log.Printf("Token monitor shutting down for %s after %d updates",
-				token.TokenID[:20], updateCount)
-			return
-
-		case update := <-updates:
-			updateCount++
-			if updateCount <= 5 {
-				log.Printf("Update #%d for %s: Type=%s, Ask=%.4f",
-					updateCount, token.TokenID[:20], update.EventType, update.BestAsk)
-			}
-
-			if update.EventType != "book" {
-				continue
-			}
-
-			currentPrice := update.BestAsk
-			if currentPrice == 0 {
-				continue
-			}
-
-			if lastPrice > 0 {
-				priceChange := (currentPrice - lastPrice) / lastPrice
-
-				if updateCount%10 == 0 {
-					log.Printf("Price change for %s: %.4f%% (%.4f -> %.4f)",
-						token.TokenID[:20], priceChange*100, lastPrice, currentPrice)
-				}
-
-				s.mu.Lock()
-				_, hasPosition := s.positions[token.TokenID]
-				canAfford := s.currentBalance >= s.maxPositionSize
-				s.mu.Unlock()
-
-				if !hasPosition && canAfford && priceChange > entryThreshold {
-					log.Printf("ENTRY SIGNAL: %s moved %.2f%% (threshold %.2f%%)",
-						token.TokenID[:20], priceChange*100, entryThreshold*100)
-					s.enterPosition(token.TokenID, market, currentPrice, updates)
-				}
-			}
-
-			lastPrice = currentPrice
-		}
-	}
-}
-
-func (s *Strategy) enterPosition(tokenID, market string, price float64, updates <-chan client.MarketUpdate) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.currentBalance < s.maxPositionSize {
+		s.logger.Error("Failed to search markets: %v", err)
 		return
 	}
 
-	shares := s.maxPositionSize / price
+	s.logger.Info("Found %d markets matching filters", len(results))
 
-	_, err := s.store.RecordSignal(s.ctx, database.RecordSignalParams{
-		SessionID:    dbsql.NullInt32{Int32: s.sessionID, Valid: true},
-		TokenID:      tokenID,
-		SignalType:   "buy",
-		BestBid:      dbsql.NullString{String: fmt.Sprintf("%.6f", price), Valid: true},
-		BestAsk:      dbsql.NullString{String: fmt.Sprintf("%.6f", price), Valid: true},
-		ActionReason: dbsql.NullString{String: "Momentum detected", Valid: true},
-		Confidence:   dbsql.NullString{String: "70", Valid: true},
-	})
-	if err != nil {
-		log.Printf("Failed to record buy signal: %v", err)
+	subscribed := 0
+	maxSubscriptions := 10
+
+	for _, market := range results {
+		if subscribed >= maxSubscriptions {
+			break
+		}
+
+		for _, token := range market.Tokens {
+			if subscribed >= maxSubscriptions {
+				break
+			}
+
+			// Additional spread check before subscribing
+			book, err := s.marketFetcher.GetOrderBook(token.TokenID)
+			if err == nil {
+				bid := common.ExtractBestBid(book)
+				ask := common.ExtractBestAsk(book)
+				if bid > 0 && ask > 0 {
+					spread := common.CalculateSpread(bid, ask)
+					if spread > s.config.MaxSpreadPercent {
+						s.logger.Debug("Skipping %s - spread too wide (%.2f%%)",
+							token.TokenID[:20], spread*100)
+						continue
+					}
+				}
+			}
+
+			// Subscribe using WebSocket manager
+			err = s.wsManager.Subscribe(token.TokenID, func(update client.MarketUpdate) {
+				s.handleMarketUpdate(token, market.Question, update)
+			})
+
+			if err == nil {
+				subscribed++
+				s.lastPrices[token.TokenID] = token.Price
+				s.logger.Info("✓ Subscribed to %s @ %.3f",
+					common.TruncateString(market.Question, 40), token.Price)
+			}
+		}
 	}
 
-	position := &Position{
+	s.logger.Info("Subscribed to %d markets", subscribed)
+}
+
+func (s *MomentumStrategy) handleMarketUpdate(token market.TokenResult, marketName string, update client.MarketUpdate) {
+	if update.EventType != "book" {
+		return
+	}
+
+	s.updateCounter++
+
+	// Check spread
+	if update.BestBid > 0 && update.BestAsk > 0 {
+		spread := common.CalculateSpread(update.BestBid, update.BestAsk)
+		if spread > s.config.MaxSpreadPercent {
+			return
+		}
+	}
+
+	// Momentum detection
+	s.Mu.Lock()
+	_, hasPosition := s.Positions[token.TokenID]
+	canEnter := s.posManager.CanEnter(s.CurrentBalance, len(s.Positions), s.config.MaxPositionSize)
+	lastPrice := s.lastPrices[token.TokenID]
+	s.Mu.Unlock()
+
+	if !hasPosition && canEnter && lastPrice > 0 {
+		// Calculate momentum
+		priceChange := (update.BestAsk - lastPrice) / lastPrice
+
+		if s.config.TestMode || priceChange > s.config.MomentumThreshold {
+			s.logger.Debug("Momentum detected: %.2f%% move in %s",
+				priceChange*100, token.TokenID[:20])
+			s.enterPosition(token.TokenID, marketName, update.BestAsk, update)
+		}
+	}
+
+	// Update last price
+	s.Mu.Lock()
+	s.lastPrices[token.TokenID] = update.BestAsk
+	s.Mu.Unlock()
+}
+
+func (s *MomentumStrategy) enterPosition(tokenID, market string, price float64, lastUpdate client.MarketUpdate) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	if !s.posManager.CanEnter(s.CurrentBalance, len(s.Positions), s.config.MaxPositionSize) {
+		return
+	}
+
+	shares := s.config.MaxPositionSize / price
+
+	s.logger.LogEntry(tokenID, market, price, s.config.MaxPositionSize, "Momentum signal")
+
+	// Record signal
+	signalID, err := dbops.RecordSignal(s.Ctx, s.Store, dbops.SignalParams{
+		SessionID:    s.SessionID,
+		TokenID:      tokenID,
+		SignalType:   "buy",
+		BestBid:      lastUpdate.BestBid,
+		BestAsk:      lastUpdate.BestAsk,
+		ActionReason: "Momentum signal",
+		Confidence:   70,
+	})
+
+	if err != nil {
+		s.logger.Error("Failed to record signal: %v", err)
+	} else {
+		s.logger.Debug("Signal %d recorded", signalID)
+	}
+
+	s.Positions[tokenID] = &strategy.Position{
 		TokenID:      tokenID,
 		Market:       market,
 		Shares:       shares,
 		EntryPrice:   price,
 		CurrentPrice: price,
 		EntryTime:    time.Now(),
-		UpdateChan:   updates,
+		Metadata: map[string]interface{}{
+			"spread":           common.CalculateSpread(lastUpdate.BestBid, lastUpdate.BestAsk),
+			"momentumStrength": (price - s.lastPrices[tokenID]) / s.lastPrices[tokenID],
+		},
 	}
 
-	s.positions[tokenID] = position
-	s.currentBalance -= s.maxPositionSize
-
-	marketName := market
-	if len(marketName) > 30 {
-		marketName = marketName[:27] + "..."
-	}
-
-	log.Printf("BOUGHT %.2f shares of %s at %.2f%% ($%.2f)",
-		shares, marketName, price*100, s.maxPositionSize)
+	s.CurrentBalance -= s.config.MaxPositionSize
 }
 
-func (s *Strategy) monitorPositions() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+func (s *MomentumStrategy) checkExitConditions() {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			s.checkExitConditions()
-		}
-	}
-}
-
-func (s *Strategy) checkExitConditions() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for tokenID, pos := range s.positions {
-		book, err := s.pmClient.GetOrderBook(tokenID)
-		if err != nil {
-			continue
-		}
-
-		var bestBid float64
-		if bids, ok := book["bids"].([]interface{}); ok && len(bids) > 0 {
-			if bid, ok := bids[0].(map[string]interface{}); ok {
-				if priceStr, ok := bid["price"].(string); ok {
-					bestBid, _ = strconv.ParseFloat(priceStr, 64)
+	for tokenID, pos := range s.Positions {
+		// Update price
+		if s.config.TestMode && time.Since(pos.EntryTime) > 20*time.Second {
+			pos.CurrentPrice = pos.EntryPrice * 1.12
+		} else {
+			book, err := s.marketFetcher.GetOrderBook(tokenID)
+			if err == nil {
+				if bestBid := common.ExtractBestBid(book); bestBid > 0 {
+					pos.CurrentPrice = bestBid
 				}
 			}
 		}
 
-		if bestBid == 0 {
-			continue
+		// Use position manager to check exits
+		params := position.ExitParams{
+			CurrentPrice: pos.CurrentPrice,
+			EntryPrice:   pos.EntryPrice,
+			EntryTime:    pos.EntryTime,
+			Metadata:     pos.Metadata,
 		}
 
-		pos.CurrentPrice = bestBid
-		pnlPercent := (bestBid - pos.EntryPrice) / pos.EntryPrice
-
-		shouldExit := false
-		reason := ""
-
-		if pnlPercent <= -s.stopLossPercent {
-			shouldExit = true
-			reason = fmt.Sprintf("Stop loss (%.1f%%)", pnlPercent*100)
-		} else if pnlPercent >= s.takeProfitPercent {
-			shouldExit = true
-			reason = fmt.Sprintf("Take profit (%.1f%%)", pnlPercent*100)
-		} else if time.Since(pos.EntryTime) > 4*time.Hour {
-			shouldExit = true
-			reason = "Time limit"
-		}
+		// Check exit conditions (no max hold time check needed)
+		shouldExit, reason := s.posManager.CheckExitConditions(params)
 
 		if shouldExit {
-			s.exitPosition(tokenID, bestBid, reason)
+			s.exitPosition(tokenID, pos.CurrentPrice, reason)
 		}
 	}
 }
 
-func (s *Strategy) exitPosition(tokenID string, price float64, reason string) {
-	pos, exists := s.positions[tokenID]
-	if !exists {
+func (s *MomentumStrategy) exitPosition(tokenID string, price float64, reason string) {
+	pos := s.Positions[tokenID]
+	if pos == nil {
 		return
 	}
 
 	proceeds := pos.Shares * price
-	pnl := proceeds - s.maxPositionSize
+	pnl, _ := s.posManager.CalculatePnLFromCost(s.config.MaxPositionSize, proceeds)
 
-	_, err := s.store.RecordSignal(s.ctx, database.RecordSignalParams{
-		SessionID:    dbsql.NullInt32{Int32: s.sessionID, Valid: true},
+	s.logger.LogExit(tokenID, pos.EntryPrice, price, pnl, reason)
+	s.perfTracker.RecordTrade(pnl)
+
+	dbops.RecordSignal(s.Ctx, s.Store, dbops.SignalParams{
+		SessionID:    s.SessionID,
 		TokenID:      tokenID,
 		SignalType:   "sell",
-		BestBid:      dbsql.NullString{String: fmt.Sprintf("%.6f", price), Valid: true},
-		BestAsk:      dbsql.NullString{String: fmt.Sprintf("%.6f", price), Valid: true},
-		ActionReason: dbsql.NullString{String: reason, Valid: true},
-		Confidence:   dbsql.NullString{String: "90", Valid: true},
+		BestBid:      price,
+		BestAsk:      price,
+		ActionReason: reason,
+		Confidence:   90,
 	})
-	if err != nil {
-		log.Printf("Failed to record sell signal: %v", err)
-	}
 
-	delete(s.positions, tokenID)
-	s.currentBalance += proceeds
-
-	marketName := pos.Market
-	if len(marketName) > 30 {
-		marketName = marketName[:27] + "..."
-	}
-
-	log.Printf("SOLD %.2f shares of %s at %.2f%% - %s (P&L: $%.2f)",
-		pos.Shares, marketName, price*100, reason, pnl)
+	delete(s.Positions, tokenID)
+	s.CurrentBalance += proceeds
 }
 
-func (s *Strategy) statusUpdates() {
-	// First update after 1 minute, then every 30 minutes
-	time.Sleep(1 * time.Minute)
-	s.printStatus()
+func (s *MomentumStrategy) printStatus() {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
-	ticker := time.NewTicker(30 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			s.printStatus()
-		}
-	}
-}
-
-func (s *Strategy) printStatus() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	totalValue := s.currentBalance
-	for _, pos := range s.positions {
+	totalValue := s.CurrentBalance
+	for _, pos := range s.Positions {
 		totalValue += pos.Shares * pos.CurrentPrice
 	}
 
-	pnl := totalValue - s.initialBalance
-	pnlPercent := pnl / s.initialBalance * 100
+	pnl := totalValue - s.config.InitialBalance
+	s.perfTracker.UpdateBalance(totalValue)
 
-	log.Printf("STATUS: Balance: $%.2f, Positions: %d, Total Value: $%.2f (%.1f%%)",
-		s.currentBalance, len(s.positions), totalValue, pnlPercent)
-
-	err := s.store.UpdateSessionBalance(s.ctx, database.UpdateSessionBalanceParams{
-		ID:             s.sessionID,
-		CurrentBalance: dbsql.NullString{String: fmt.Sprintf("%.2f", totalValue), Valid: true},
-	})
-	if err != nil {
-		log.Printf("Failed to update session balance: %v", err)
-	}
+	s.logger.LogStatus(totalValue, len(s.Positions), pnl)
+	dbops.UpdateSessionBalance(s.Ctx, s.Store, s.SessionID, totalValue)
 }
 
-func (s *Strategy) shutdown() {
-	log.Println("Strategy shutting down...")
+func (s *MomentumStrategy) logPerformance() {
+	s.perfTracker.LogSummary()
+}
 
-	s.mu.Lock()
-	for tokenID, pos := range s.positions {
+func (s *MomentumStrategy) shutdown() {
+	s.logger.Info("=== SHUTTING DOWN ===")
+
+	s.Mu.Lock()
+	for tokenID, pos := range s.Positions {
 		price := pos.CurrentPrice
 		if price == 0 {
-			// Try to get current price
-			if book, err := s.pmClient.GetOrderBook(tokenID); err == nil {
-				if bids, ok := book["bids"].([]interface{}); ok && len(bids) > 0 {
-					if bid, ok := bids[0].(map[string]interface{}); ok {
-						if priceStr, ok := bid["price"].(string); ok {
-							price, _ = strconv.ParseFloat(priceStr, 64)
-						}
-					}
-				}
-			}
+			price = pos.EntryPrice
 		}
-		s.exitPosition(tokenID, price, "Strategy ended")
+		s.exitPosition(tokenID, price, "Strategy shutdown")
 	}
-	s.mu.Unlock()
+	s.Mu.Unlock()
 
-	err := s.store.EndSession(s.ctx, s.sessionID)
-	if err != nil {
-		log.Printf("Failed to end session: %v", err)
-	}
+	dbops.EndSession(s.Ctx, s.Store, s.SessionID)
 
-	finalPnL := s.currentBalance - s.initialBalance
-	log.Printf("FINAL: Started with $%.2f, Ended with $%.2f, P&L: $%.2f (%.1f%%)",
-		s.initialBalance, s.currentBalance, finalPnL, finalPnL/s.initialBalance*100)
-}
+	// Log final performance
+	s.perfTracker.LogSummary()
 
-type MarketInfo struct {
-	Question  string
-	Active    bool
-	Volume24h float64
-	Tokens    []TokenInfo
-}
-
-type TokenInfo struct {
-	TokenID string
-	Outcome string
-	Price   float64
+	// Close logger
+	s.logger.Close()
 }

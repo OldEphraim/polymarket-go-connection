@@ -11,3 +11,6 @@ venv/
 
 # Generated database code
 internal/database/
+
+# Logs
+logs
