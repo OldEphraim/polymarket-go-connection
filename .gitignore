@@ -9,8 +9,5 @@
 venv/
 */venv/
 
-# Generated database code
-internal/database/
-
-# Logs
-logs
+# Logs (keep this, logs shouldn't be in git)
+logs/
