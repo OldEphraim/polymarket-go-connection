@@ -26,13 +26,24 @@ COPY configs/ /app/configs/
 COPY run_search.sh /app/
 RUN chmod +x /app/run_search.sh
 
-# Create a simple entrypoint
+# Create entrypoint that uses prod configs
 RUN echo '#!/bin/bash\n\
-copycat --config /app/configs/test-copycat.json &\n\
-momentum --config /app/configs/test-momentum.json &\n\
-whale_follow --config /app/configs/test-whale.json &\n\
-wait -n\n\
-exit $?' > /app/entrypoint.sh
+copycat --config /app/configs/prod-copycat.json &\n\
+PID1=$!\n\
+momentum --config /app/configs/prod-momentum.json &\n\
+PID2=$!\n\
+whale_follow --config /app/configs/prod-whale.json &\n\
+PID3=$!\n\
+\n\
+# Keep running and restart if needed\n\
+while true; do\n\
+  if ps -p $PID1 > /dev/null 2>&1 || ps -p $PID2 > /dev/null 2>&1 || ps -p $PID3 > /dev/null 2>&1; then\n\
+    sleep 5\n\
+  else\n\
+    echo "All strategies stopped. Exiting..."\n\
+    exit 1\n\
+  fi\n\
+done' > /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]

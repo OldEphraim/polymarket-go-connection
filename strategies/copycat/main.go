@@ -511,6 +511,13 @@ func (s *CopycatStrategy) checkExitConditions() {
 			return false, ""
 		})
 
+		// Add time-based exit for data collection
+		holdTime := time.Since(pos.EntryTime)
+		if holdTime > 4*time.Hour {
+			shouldExit = true
+			reason = "Max hold time (4h) for data collection"
+		}
+
 		if shouldExit {
 			s.exitPosition(key, pos.CurrentPrice, reason)
 		}
