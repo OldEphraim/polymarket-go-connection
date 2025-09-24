@@ -1,21 +1,5 @@
 package client
 
-type Order struct {
-	Salt          string `json:"salt"`
-	Maker         string `json:"maker"`
-	Signer        string `json:"signer"`
-	Taker         string `json:"taker"`
-	TokenID       string `json:"tokenId"`
-	MakerAmount   string `json:"makerAmount"`
-	TakerAmount   string `json:"takerAmount"`
-	Side          string `json:"side"`
-	Expiration    string `json:"expiration"`
-	Nonce         string `json:"nonce"`
-	FeeRateBps    string `json:"feeRateBps"`
-	SignatureType int    `json:"signatureType"`
-	Signature     string `json:"signature"`
-}
-
 type MarketInfo struct {
 	ConditionID     string `json:"condition_id"`
 	QuestionID      string `json:"question_id"`

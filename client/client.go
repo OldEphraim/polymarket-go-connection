@@ -1,16 +1,10 @@
 package client
 
 import (
-	"bytes"
 	"crypto/ecdsa"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -41,125 +35,6 @@ func NewPolymarketClient(privateKeyHex string) (*PolymarketClient, error) {
 	}, nil
 }
 
-func (p *PolymarketClient) CreateAndSubmitOrder(
-	tokenID string,
-	side string, // "buy" or "sell"
-	price float64, // 0.01 to 0.99
-	size float64, // in USDC
-) (*Order, error) {
-	// Generate random salt
-	salt := new(big.Int)
-	salt.SetString(generateRandomNumber(), 10)
-
-	// Calculate amounts based on price and size
-	var makerAmount, takerAmount *big.Int
-
-	if side == "buy" {
-		// Buying: maker gives USDC, taker gives outcome tokens
-		makerAmount = big.NewInt(int64(size * 1e6)) // USDC has 6 decimals
-		takerAmount = big.NewInt(int64(size / price * 1e6))
-	} else {
-		// Selling: maker gives outcome tokens, taker gives USDC
-		makerAmount = big.NewInt(int64(size * 1e6))
-		takerAmount = big.NewInt(int64(size * price * 1e6))
-	}
-
-	order := &Order{
-		Salt:          salt.String(),
-		Maker:         p.address.Hex(),
-		Signer:        p.address.Hex(),
-		Taker:         "0x0000000000000000000000000000000000000000",
-		TokenID:       tokenID,
-		MakerAmount:   makerAmount.String(),
-		TakerAmount:   takerAmount.String(),
-		Side:          side,
-		Expiration:    "0", // No expiration
-		Nonce:         "0",
-		FeeRateBps:    "0",
-		SignatureType: 0,
-	}
-
-	// Sign the order
-	err := SignOrder(order, p.privateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get API credentials using the simple method from the blog
-	apiKey, apiSecret, apiPassphrase, err := p.CreateAPIKey()
-	if err != nil {
-		return nil, err
-	}
-
-	timestamp := fmt.Sprintf("%d", time.Now().Unix())
-	orderJSON, _ := json.Marshal(order)
-
-	// Create HMAC signature - try without spaces
-	message := fmt.Sprintf("%sPOST/order%s", timestamp, string(orderJSON))
-
-	h := hmac.New(sha256.New, []byte(apiSecret))
-	h.Write([]byte(message))
-	hmacSignature := hex.EncodeToString(h.Sum(nil))
-
-	// Debug output
-	fmt.Printf("DEBUG - Timestamp: %s\n", timestamp)
-	fmt.Printf("DEBUG - API Key: %s\n", apiKey)
-	fmt.Printf("DEBUG - HMAC Signature: %s\n", hmacSignature)
-
-	req, err := http.NewRequest("POST", p.apiURL+"/order", bytes.NewBuffer(orderJSON))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("POLY_ADDRESS", p.address.Hex())
-	req.Header.Set("POLY_SIGNATURE", hmacSignature)
-	req.Header.Set("POLY_TIMESTAMP", timestamp)
-	req.Header.Set("POLY_API_KEY", apiKey)
-	req.Header.Set("POLY_PASSPHRASE", apiPassphrase)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error: %s", string(bodyBytes))
-	}
-
-	return order, nil
-}
-
-func (p *PolymarketClient) CreateAPIKey() (string, string, string, error) {
-	secretSeed := "POLY_ONBOARDING_MESSAGE"
-	message := fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(secretSeed), secretSeed)
-	hash := crypto.Keccak256([]byte(message))
-
-	signature, err := crypto.Sign(hash, p.privateKey)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	// Remove recovery byte
-	secret := signature[:64]
-
-	// Derive credentials
-	apiKey := hex.EncodeToString(crypto.Keccak256(append(secret, []byte("_key")...)))
-	apiSecret := hex.EncodeToString(secret)
-	apiPassphrase := hex.EncodeToString(crypto.Keccak256(append(secret, []byte("_passphrase")...)))
-
-	return apiKey, apiSecret, apiPassphrase, nil
-}
-
-func generateRandomNumber() string {
-	max := new(big.Int)
-	max.Exp(big.NewInt(2), big.NewInt(256), nil).Sub(max, big.NewInt(1))
-	n, _ := rand.Int(rand.Reader, max)
-	return n.String()
-}
-
 // Get market info without placing orders
 func (p *PolymarketClient) GetMarket(conditionID string) (*MarketInfo, error) {
 	resp, err := p.client.Get(fmt.Sprintf("%s/markets/%s",
@@ -186,20 +61,6 @@ func (p *PolymarketClient) GetOrderBook(tokenID string) (map[string]interface{},
 	var book map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&book)
 	return book, nil
-}
-
-// Check your allowances - this verifies your wallet is set up
-func (p *PolymarketClient) GetAllowances() (map[string]interface{}, error) {
-	resp, err := p.client.Get(fmt.Sprintf("%s/allowances?account=%s",
-		p.apiURL, p.address.Hex()))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var allowances map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&allowances)
-	return allowances, nil
 }
 
 func (p *PolymarketClient) GetMarketFromSlug(slug string) (map[string]string, error) {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/OldEphraim/polymarket-go-connection/utils/strategy"
+	"github.com/OldEphraim/polymarket-go-connection/utils/types"
 )
 
 // Manager handles position entry/exit logic and P&L calculations
@@ -67,16 +67,8 @@ func (m *Manager) CalculatePnLFromCost(cost, proceeds float64) (pnl float64, pnl
 	return pnl, pnlPercent
 }
 
-// ExitParams contains parameters for checking exit conditions
-type ExitParams struct {
-	CurrentPrice float64
-	EntryPrice   float64
-	EntryTime    time.Time
-	Metadata     map[string]interface{}
-}
-
 // CheckExitConditions checks if a position should be exited
-func (m *Manager) CheckExitConditions(params ExitParams) (shouldExit bool, reason string) {
+func (m *Manager) CheckExitConditions(params types.ExitParams) (shouldExit bool, reason string) {
 	// Calculate P&L percentage
 	pnlPercent := (params.CurrentPrice - params.EntryPrice) / params.EntryPrice
 	holdTime := time.Since(params.EntryTime)
@@ -100,7 +92,7 @@ func (m *Manager) CheckExitConditions(params ExitParams) (shouldExit bool, reaso
 }
 
 // CheckExitWithCustomRules allows strategies to add custom exit rules
-func (m *Manager) CheckExitWithCustomRules(params ExitParams, customCheck func(ExitParams) (bool, string)) (shouldExit bool, reason string) {
+func (m *Manager) CheckExitWithCustomRules(params types.ExitParams, customCheck func(types.ExitParams) (bool, string)) (shouldExit bool, reason string) {
 	// First check standard conditions
 	shouldExit, reason = m.CheckExitConditions(params)
 	if shouldExit {
@@ -124,7 +116,7 @@ type PositionSummary struct {
 }
 
 // GetPositionSummary creates a summary of a position
-func (m *Manager) GetPositionSummary(pos *strategy.Position) PositionSummary {
+func (m *Manager) GetPositionSummary(pos *types.Position) PositionSummary {
 	pnl, pnlPercent := m.CalculatePnL(pos.EntryPrice, pos.CurrentPrice, pos.Shares)
 
 	return PositionSummary{
