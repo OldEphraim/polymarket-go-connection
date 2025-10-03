@@ -7,6 +7,8 @@ package database
 import (
 	"database/sql"
 	"encoding/json"
+
+	"github.com/sqlc-dev/pqtype"
 )
 
 type Market struct {
@@ -17,6 +19,35 @@ type Market struct {
 	Outcome   sql.NullString `json:"outcome"`
 	CreatedAt sql.NullTime   `json:"created_at"`
 	UpdatedAt sql.NullTime   `json:"updated_at"`
+}
+
+type MarketEvent struct {
+	ID         int32                 `json:"id"`
+	TokenID    string                `json:"token_id"`
+	EventType  sql.NullString        `json:"event_type"`
+	OldValue   sql.NullString        `json:"old_value"`
+	NewValue   sql.NullString        `json:"new_value"`
+	Metadata   pqtype.NullRawMessage `json:"metadata"`
+	DetectedAt sql.NullTime          `json:"detected_at"`
+}
+
+type MarketScan struct {
+	ID            int32                 `json:"id"`
+	TokenID       string                `json:"token_id"`
+	EventID       sql.NullString        `json:"event_id"`
+	Slug          sql.NullString        `json:"slug"`
+	Question      sql.NullString        `json:"question"`
+	LastPrice     sql.NullString        `json:"last_price"`
+	LastVolume    sql.NullString        `json:"last_volume"`
+	Liquidity     sql.NullString        `json:"liquidity"`
+	LastScannedAt sql.NullTime          `json:"last_scanned_at"`
+	Price24hAgo   sql.NullString        `json:"price_24h_ago"`
+	Volume24hAgo  sql.NullString        `json:"volume_24h_ago"`
+	ScanCount     sql.NullInt64         `json:"scan_count"`
+	IsActive      sql.NullBool          `json:"is_active"`
+	Metadata      pqtype.NullRawMessage `json:"metadata"`
+	CreatedAt     sql.NullTime          `json:"created_at"`
+	UpdatedAt     sql.NullTime          `json:"updated_at"`
 }
 
 type MarketSignal struct {
