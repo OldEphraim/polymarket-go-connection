@@ -66,7 +66,7 @@ func New(store *db.Store, config *Config, logger *slog.Logger) *Gatherer {
 	return &Gatherer{
 		store:       store,
 		client:      &http.Client{Timeout: 10 * time.Second},
-		eventChan:   make(chan MarketEvent, 1000),
+		eventChan:   make(chan MarketEvent, 20000),
 		config:      config,
 		logger:      logger,
 		ctx:         ctx,
@@ -335,7 +335,7 @@ func (g *Gatherer) detectEvents(old, new *database.MarketScan, market Polymarket
 		newPrice, okNew := parseNullableFloat(new.LastPrice)
 		if okOld && okNew && oldPrice > 0 {
 			priceChange := (newPrice - oldPrice) / oldPrice
-			if abs(priceChange) > 0.05 {
+			if abs(priceChange) > 0.02 {
 				g.emitEvent(MarketEvent{
 					Type:      PriceJump,
 					TokenID:   tokenID,

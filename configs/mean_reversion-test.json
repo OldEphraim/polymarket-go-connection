@@ -1,0 +1,6 @@
+{
+    "name": "mean_reversion-test",
+    "duration": "48h",
+    "reversion_threshold": 0.25,
+    "hold_period": "2h"
+}

@@ -1,14 +1,6 @@
 {
-    "name": "momentum_test",
-    "duration": "5m",
-    "initial_balance": 100,
-    "max_positions": 2,
-    "max_position_size": 20,
-    "stop_loss": 0.05,
-    "take_profit": 0.10,
-    "test_mode": true,
-    "max_spread_percent": 0.5,
-    "min_volume_24h": 10000,
-    "search_queries": ["September", "October", "November"],
-    "momentum_threshold": 0.001
-  }
+    "name": "momentum-test",
+    "duration": "30m",
+    "momentum_threshold": 0.03,
+    "hold_period": "5m"
+}

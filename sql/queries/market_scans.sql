@@ -57,3 +57,9 @@ SELECT * FROM market_events
 WHERE detected_at > NOW() - INTERVAL '1 hour'
 ORDER BY detected_at DESC
 LIMIT $1;
+
+-- name: GetMarketEventsSince :many
+SELECT * FROM market_events
+WHERE id > $1
+ORDER BY id ASC
+LIMIT 100;

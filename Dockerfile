@@ -7,7 +7,10 @@ COPY . .
 # Build the orchestrator
 RUN CGO_ENABLED=0 GOOS=linux go build -o orchestrator ./main.go
 
-# Dynamically build all strategies found in strategies/ directory
+# Build the gatherer
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/gatherer ./cmd/gatherer/main.go
+
+# Build all strategies
 RUN mkdir -p /app/bin && \
     for dir in strategies/*/; do \
         if [ -f "$dir/main.go" ]; then \
@@ -17,30 +20,24 @@ RUN mkdir -p /app/bin && \
         fi \
     done
 
-FROM python:3.11-slim
+# Use a minimal base image since we don't need Python anymore
+FROM alpine:latest
 WORKDIR /app
 
 # Install PostgreSQL client for debugging
-RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache postgresql-client
 
 # Copy the orchestrator
 COPY --from=go-builder /app/orchestrator /app/
 
-# Copy all strategy binaries to PATH
+# Copy gatherer and strategy binaries
 COPY --from=go-builder /app/bin/* /usr/local/bin/
 
-# Copy configs and Python scripts
+# Copy configs
 COPY configs/ /app/configs/
-COPY python_scripts/ /app/python_scripts/
-COPY run_search.sh /app/
-RUN chmod +x /app/run_search.sh
-
-# Install Python dependencies
-RUN cd /app/python_scripts && pip install requests tabulate
 
 # Default to prod when running in Docker
 ENV RUN_TYPE=prod
 
-# The entrypoint will use the --binary flag since we have compiled binaries
 ENTRYPOINT ["/app/orchestrator", "--binary"]
-CMD ["--run", "prod"]
+CMD ["--run", "test"]

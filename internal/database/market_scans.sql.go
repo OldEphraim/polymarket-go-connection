@@ -70,6 +70,44 @@ func (q *Queries) GetActiveMarketScans(ctx context.Context, limit int32) ([]Mark
 	return items, nil
 }
 
+const getMarketEventsSince = `-- name: GetMarketEventsSince :many
+SELECT id, token_id, event_type, old_value, new_value, metadata, detected_at FROM market_events
+WHERE id > $1
+ORDER BY id ASC
+LIMIT 100
+`
+
+func (q *Queries) GetMarketEventsSince(ctx context.Context, id int32) ([]MarketEvent, error) {
+	rows, err := q.db.QueryContext(ctx, getMarketEventsSince, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MarketEvent{}
+	for rows.Next() {
+		var i MarketEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.TokenID,
+			&i.EventType,
+			&i.OldValue,
+			&i.NewValue,
+			&i.Metadata,
+			&i.DetectedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getMarketScan = `-- name: GetMarketScan :one
 SELECT id, token_id, event_id, slug, question, last_price, last_volume, liquidity, last_scanned_at, price_24h_ago, volume_24h_ago, scan_count, is_active, metadata, created_at, updated_at FROM market_scans
 WHERE token_id = $1

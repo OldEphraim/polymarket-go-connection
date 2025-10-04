@@ -18,6 +18,7 @@ type Querier interface {
 	GetActiveMarkets(ctx context.Context) ([]Market, error)
 	GetActiveSession(ctx context.Context, strategyID sql.NullInt32) (TradingSession, error)
 	GetMarketByTokenID(ctx context.Context, tokenID string) (Market, error)
+	GetMarketEventsSince(ctx context.Context, id int32) ([]MarketEvent, error)
 	GetMarketScan(ctx context.Context, tokenID string) (MarketScan, error)
 	GetRecentMarketEvents(ctx context.Context, limit int32) ([]MarketEvent, error)
 	GetRecentSignals(ctx context.Context, arg GetRecentSignalsParams) ([]MarketSignal, error)
