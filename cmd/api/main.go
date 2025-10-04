@@ -54,9 +54,9 @@ func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
         SELECT 
             (SELECT COUNT(*) FROM market_scans WHERE is_active = true) as active_markets,
             (SELECT COUNT(*) FROM market_events WHERE detected_at > NOW() - INTERVAL '24 hours') as events_24h,
-            (SELECT COUNT(DISTINCT token_id) FROM paper_positions WHERE status = 'open') as open_positions,
-            (SELECT COALESCE(SUM(pnl), 0) FROM paper_positions WHERE status = 'closed') as total_pnl,
-            (SELECT COUNT(DISTINCT strategy) FROM paper_positions) as strategies_count
+            (SELECT COUNT(DISTINCT token_id) FROM paper_positions) as open_positions,
+            (SELECT COALESCE(SUM(unrealized_pnl), 0) FROM paper_positions) as total_pnl,
+            (SELECT COUNT(DISTINCT s.name) FROM trading_sessions ts JOIN strategies s ON ts.strategy_id = s.id) as strategies_count
     `
 
 	var stats struct {
@@ -79,56 +79,28 @@ func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/trades
 func (s *APIServer) getTrades(w http.ResponseWriter, r *http.Request) {
-	// Query parameters
 	limit := getIntParam(r, "limit", 50)
 	offset := getIntParam(r, "offset", 0)
-	strategy := r.URL.Query().Get("strategy")
-	status := r.URL.Query().Get("status")
 
-	// Build query
 	query := `
         SELECT 
-            COALESCE(p.token_id, '') as token_id,
-            p.strategy,
-            p.side,
-            p.entry_price,
-            p.exit_price,
-            p.pnl,
-            p.status,
-            p.created_at,
+            p.token_id,
+            s.name as strategy,
+            p.shares,
+            p.avg_entry_price,
+            p.current_price,
+            p.unrealized_pnl,
+            p.updated_at,
             m.question
         FROM paper_positions p
         LEFT JOIN market_scans m ON p.token_id = m.token_id
-        WHERE 1=1
+        LEFT JOIN trading_sessions ts ON p.session_id = ts.id
+        LEFT JOIN strategies s ON ts.strategy_id = s.id
+        ORDER BY p.updated_at DESC
+        LIMIT $1 OFFSET $2
     `
 
-	args := []interface{}{}
-	argCount := 0
-
-	if strategy != "" {
-		argCount++
-		query += fmt.Sprintf(" AND p.strategy = $%d", argCount)
-		args = append(args, strategy)
-	}
-
-	if status != "" {
-		argCount++
-		query += fmt.Sprintf(" AND p.status = $%d", argCount)
-		args = append(args, status)
-	}
-
-	query += " ORDER BY p.created_at DESC"
-
-	// Add pagination
-	argCount++
-	query += fmt.Sprintf(" LIMIT $%d", argCount)
-	args = append(args, limit)
-
-	argCount++
-	query += fmt.Sprintf(" OFFSET $%d", argCount)
-	args = append(args, offset)
-
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(query, limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -138,36 +110,33 @@ func (s *APIServer) getTrades(w http.ResponseWriter, r *http.Request) {
 	trades := []map[string]interface{}{}
 	for rows.Next() {
 		var tokenID string
-		var strategy, side, status, question sql.NullString
-		var entryPrice, exitPrice, pnl sql.NullFloat64
-		var createdAt time.Time
+		var strategy, question sql.NullString
+		var shares, avgPrice, currentPrice, pnl sql.NullFloat64
+		var updatedAt time.Time
 
 		err := rows.Scan(
 			&tokenID,
 			&strategy,
-			&side,
-			&entryPrice,
-			&exitPrice,
+			&shares,
+			&avgPrice,
+			&currentPrice,
 			&pnl,
-			&status,
-			&createdAt,
+			&updatedAt,
 			&question,
 		)
 		if err != nil {
-			log.Printf("Scan error: %v", err)
 			continue
 		}
 
 		trade := map[string]interface{}{
-			"token_id":    tokenID,
-			"strategy":    strategy.String,
-			"side":        side.String,
-			"entry_price": entryPrice.Float64,
-			"exit_price":  exitPrice.Float64,
-			"pnl":         pnl.Float64,
-			"status":      status.String,
-			"created_at":  createdAt,
-			"question":    question.String,
+			"token_id":      tokenID,
+			"strategy":      strategy.String,
+			"shares":        shares.Float64,
+			"avg_price":     avgPrice.Float64,
+			"current_price": currentPrice.Float64,
+			"pnl":           pnl.Float64,
+			"updated_at":    updatedAt,
+			"question":      question.String,
 		}
 
 		trades = append(trades, trade)
@@ -175,10 +144,6 @@ func (s *APIServer) getTrades(w http.ResponseWriter, r *http.Request) {
 
 	response := map[string]interface{}{
 		"trades": trades,
-		"pagination": map[string]interface{}{
-			"limit":  limit,
-			"offset": offset,
-		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -253,16 +218,17 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/strategy-performance
 func (s *APIServer) getStrategyPerformance(w http.ResponseWriter, r *http.Request) {
+	// Can't do real performance without proper position tracking
+	// Let's at least show what strategies are running
 	query := `
         SELECT 
-            COALESCE(strategy, 'unknown') as strategy,
-            COUNT(*) as total_trades,
-            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-            COALESCE(SUM(pnl), 0) as total_pnl,
-            COALESCE(AVG(pnl), 0) as avg_pnl
-        FROM paper_positions
-        WHERE status = 'closed'
-        GROUP BY strategy
+            s.name as strategy,
+            COUNT(DISTINCT p.token_id) as positions,
+            COALESCE(SUM(p.unrealized_pnl), 0) as unrealized_pnl
+        FROM strategies s
+        LEFT JOIN trading_sessions ts ON s.id = ts.strategy_id
+        LEFT JOIN paper_positions p ON ts.id = p.session_id
+        GROUP BY s.name
     `
 
 	rows, err := s.db.Query(query)
@@ -275,35 +241,19 @@ func (s *APIServer) getStrategyPerformance(w http.ResponseWriter, r *http.Reques
 	performances := []map[string]interface{}{}
 	for rows.Next() {
 		var strategy string
-		var totalTrades, winningTrades int64
-		var totalPnL, avgPnL float64
+		var positions int64
+		var unrealizedPnL float64
 
-		err := rows.Scan(
-			&strategy,
-			&totalTrades,
-			&winningTrades,
-			&totalPnL,
-			&avgPnL,
-		)
+		err := rows.Scan(&strategy, &positions, &unrealizedPnL)
 		if err != nil {
 			continue
 		}
 
-		winRate := float64(0)
-		if totalTrades > 0 {
-			winRate = float64(winningTrades) / float64(totalTrades) * 100
-		}
-
-		perf := map[string]interface{}{
+		performances = append(performances, map[string]interface{}{
 			"strategy":       strategy,
-			"total_trades":   totalTrades,
-			"winning_trades": winningTrades,
-			"win_rate":       winRate,
-			"total_pnl":      totalPnL,
-			"avg_pnl":        avgPnL,
-		}
-
-		performances = append(performances, perf)
+			"positions":      positions,
+			"unrealized_pnl": unrealizedPnL,
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
