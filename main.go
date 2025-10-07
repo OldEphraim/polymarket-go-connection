@@ -55,6 +55,28 @@ func main() {
 	// Wait for gatherer to initialize
 	time.Sleep(10 * time.Second)
 
+	// After starting gatherer, start the API server
+	log.Println("Starting API server...")
+	apiCmd := exec.CommandContext(ctx, "api") // You'll need to build this
+	apiCmd.Stdout = os.Stdout
+	apiCmd.Stderr = os.Stderr
+	apiCmd.Env = append(os.Environ(),
+		"API_KEY="+os.Getenv("API_KEY"),
+		"DATABASE_URL="+os.Getenv("DATABASE_URL"),
+	)
+
+	if err := apiCmd.Start(); err != nil {
+		log.Fatal("Failed to start API:", err)
+	}
+	log.Printf("API server started (PID: %d)", apiCmd.Process.Pid)
+
+	// Also wait for API
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		apiCmd.Wait()
+	}()
+
 	// Find and start strategies
 	configPattern := fmt.Sprintf("configs/*-%s.json", *runType)
 	configFiles, err := filepath.Glob(configPattern)

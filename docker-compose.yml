@@ -29,6 +29,20 @@ services:
     volumes:
       - ./configs:/app/configs:ro
     restart: unless-stopped
+  
+  api:
+    build: .
+    command: ["/usr/local/bin/api"]
+    environment:
+      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+      API_KEY: ${API_KEY}
+      API_PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
 
 volumes:
   postgres_data:

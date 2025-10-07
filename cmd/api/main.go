@@ -80,74 +80,90 @@ func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
 // GET /api/trades
 func (s *APIServer) getTrades(w http.ResponseWriter, r *http.Request) {
 	limit := getIntParam(r, "limit", 50)
-	offset := getIntParam(r, "offset", 0)
 
 	query := `
         SELECT 
-            p.token_id,
-            s.name as strategy,
-            p.shares,
-            p.avg_entry_price,
-            p.current_price,
-            p.unrealized_pnl,
-            p.updated_at,
-            m.question
-        FROM paper_positions p
-        LEFT JOIN market_scans m ON p.token_id = m.token_id
-        LEFT JOIN trading_sessions ts ON p.session_id = ts.id
+            po.id,
+            po.token_id,
+            COALESCE(s.name, 'unknown') as strategy,
+            po.side,
+            po.price as entry_price,
+            po.size,
+            po.status,
+            po.created_at as entry_time,
+            po.filled_at as exit_time,
+            COALESCE(ms.question, po.token_id) as market_id,
+            COALESCE(pp.unrealized_pnl, 0) as pnl
+        FROM paper_orders po
+        LEFT JOIN trading_sessions ts ON po.session_id = ts.id
         LEFT JOIN strategies s ON ts.strategy_id = s.id
-        ORDER BY p.updated_at DESC
-        LIMIT $1 OFFSET $2
+        LEFT JOIN market_scans ms ON po.token_id = ms.token_id
+        LEFT JOIN paper_positions pp ON pp.session_id = po.session_id 
+            AND pp.token_id = po.token_id
+        ORDER BY po.created_at DESC
+        LIMIT $1
     `
 
-	rows, err := s.db.Query(query, limit, offset)
+	rows, err := s.db.Query(query, limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Error querying trades: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]interface{}{}) // Return empty array on error
 		return
 	}
 	defer rows.Close()
 
 	trades := []map[string]interface{}{}
 	for rows.Next() {
-		var tokenID string
-		var strategy, question sql.NullString
-		var shares, avgPrice, currentPrice, pnl sql.NullFloat64
-		var updatedAt time.Time
+		var id int
+		var tokenID, strategy, side, status string
+		var entryPrice, size, pnl float64
+		var marketID sql.NullString
+		var entryTime time.Time
+		var exitTime sql.NullTime
 
 		err := rows.Scan(
+			&id,
 			&tokenID,
 			&strategy,
-			&shares,
-			&avgPrice,
-			&currentPrice,
+			&side,
+			&entryPrice,
+			&size,
+			&status,
+			&entryTime,
+			&exitTime,
+			&marketID,
 			&pnl,
-			&updatedAt,
-			&question,
 		)
 		if err != nil {
+			log.Printf("Error scanning row: %v", err)
 			continue
 		}
 
 		trade := map[string]interface{}{
-			"token_id":      tokenID,
-			"strategy":      strategy.String,
-			"shares":        shares.Float64,
-			"avg_price":     avgPrice.Float64,
-			"current_price": currentPrice.Float64,
-			"pnl":           pnl.Float64,
-			"updated_at":    updatedAt,
-			"question":      question.String,
+			"id":          id,
+			"token_id":    tokenID,
+			"strategy":    strategy,
+			"market_id":   marketID.String,
+			"side":        side,
+			"entry_price": entryPrice,
+			"size":        size,
+			"status":      status,
+			"entry_time":  entryTime,
+			"pnl":         pnl,
+		}
+
+		if exitTime.Valid {
+			trade["exit_time"] = exitTime.Time
+			trade["exit_price"] = entryPrice + (pnl / size) // Calculate exit price from PnL
 		}
 
 		trades = append(trades, trade)
 	}
 
-	response := map[string]interface{}{
-		"trades": trades,
-	}
-
+	// Return array directly, not wrapped in object
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(trades)
 }
 
 // GET /api/market-events

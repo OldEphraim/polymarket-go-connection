@@ -10,6 +10,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o orchestrator ./main.go
 # Build the gatherer
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/gatherer ./cmd/gatherer/main.go
 
+# Build the API
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/api ./cmd/api/main.go
+
 # Build all strategies
 RUN mkdir -p /app/bin && \
     for dir in strategies/*/; do \
