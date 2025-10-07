@@ -20,6 +20,7 @@ services:
   app:
     build: .
     environment:
+      API_KEY: ${API_KEY}
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       PRIVATE_KEY: ${PRIVATE_KEY}
       RUN_TYPE: test 
