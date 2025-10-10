@@ -1,147 +1,201 @@
 package gatherer
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
-	"strconv"
 	"time"
+
+	"github.com/sqlc-dev/pqtype"
 )
 
-// MarketEvent represents an event detected by the gatherer
-type MarketEvent struct {
-	Type      EventType
-	TokenID   string
-	EventID   string
-	Timestamp time.Time
-	OldValue  float64
-	NewValue  float64
-	Metadata  map[string]interface{}
-}
-
-// EventType represents the type of market event
-type EventType string
+// ===== Existing event type (kept compatible) =====
+type MarketEventType string
 
 const (
-	PriceJump      EventType = "price_jump"
-	VolumeSpike    EventType = "volume_spike"
-	NewMarket      EventType = "new_market"
-	LiquidityShift EventType = "liquidity_shift"
-	MarketClosed   EventType = "market_closed"
+	NewMarket      MarketEventType = "new_market"
+	PriceJump      MarketEventType = "price_jump"
+	VolumeSpike    MarketEventType = "volume_spike"
+	LiquidityShift MarketEventType = "liquidity_shift"
+	VolumeSurge    MarketEventType = "volume_surge"
+	ImbalanceShift MarketEventType = "imbalance_shift"
+	NewHigh        MarketEventType = "new_high"
+	NewLow         MarketEventType = "new_low"
 )
 
-// Tag represents a tag object from the API
-type Tag struct {
-	ID        string    `json:"id"`
-	Label     string    `json:"label"`
-	Slug      string    `json:"slug"`
-	CreatedAt time.Time `json:"createdAt,omitempty"`
-	UpdatedAt time.Time `json:"updatedAt,omitempty"`
+type MarketEvent struct {
+	Type      MarketEventType        `json:"type"`
+	TokenID   string                 `json:"token_id"`
+	EventID   string                 `json:"event_id,omitempty"`
+	Timestamp time.Time              `json:"timestamp"`
+	OldValue  float64                `json:"old_value,omitempty"`
+	NewValue  float64                `json:"new_value,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// PolymarketEvent represents an event from the API
+// ===== Normalized book & tape =====
+type Quote struct {
+	TokenID   string
+	TS        time.Time
+	BestBid   float64
+	BestAsk   float64
+	BidSize1  float64
+	AskSize1  float64
+	SpreadBps float64
+	Mid       float64
+}
+
+type Trade struct {
+	TokenID   string
+	TS        time.Time
+	Price     float64
+	Size      float64
+	Aggressor string // "buy" or "sell"
+	TradeID   string // optional if available
+}
+
+// ===== Derived features snapshot =====
+type FeatureUpdate struct {
+	TokenID        string
+	TS             time.Time
+	Ret1m          float64
+	Ret5m          float64
+	Vol1m          float64
+	AvgVol5m       float64
+	Sigma5m        float64
+	ZScore5m       float64
+	ImbalanceTop   float64
+	SpreadBps      float64
+	BrokeHigh15m   bool
+	BrokeLow15m    bool
+	TimeToResolveH float64
+	SignedFlow1m   float64 // +buy -sell
+}
+
+// ===== DB-facing types (align with your sqlc) =====
+type UpsertMarketScanParams struct {
+	TokenID      string
+	EventID      sql.NullString
+	Slug         sql.NullString
+	Question     sql.NullString
+	LastPrice    sql.NullFloat64
+	LastVolume   sql.NullFloat64
+	Liquidity    sql.NullFloat64
+	Metadata     pqtype.NullRawMessage
+	Price24hAgo  sql.NullFloat64
+	Volume24hAgo sql.NullFloat64
+}
+
+type UpsertMarketParams struct {
+	TokenID  string
+	Slug     sql.NullString
+	Question sql.NullString
+	Outcome  sql.NullString
+}
+
+type RecordMarketEventParams struct {
+	TokenID   string
+	EventType sql.NullString
+	OldValue  sql.NullFloat64
+	NewValue  sql.NullFloat64
+	Metadata  pqtype.NullRawMessage
+}
+
+// Gamma /ws/market price_change frame (top-level, numbers as strings)
+type gammaPriceChange struct {
+	Market       string          `json:"market"`
+	PriceChanges []gammaPCChange `json:"price_changes"`
+	Timestamp    string          `json:"timestamp"`  // ms as string
+	EventType    string          `json:"event_type"` // "price_change"
+}
+
+type gammaPCChange struct {
+	AssetID string `json:"asset_id"`
+	Price   string `json:"price"`    // trade-ish price
+	Size    string `json:"size"`     // "0" if just a quote move
+	Side    string `json:"side"`     // "BUY" / "SELL"
+	BestBid string `json:"best_bid"` // top-of-book as strings
+	BestAsk string `json:"best_ask"`
+}
+
+// Top-level price_change shape the server is sending us
+type priceChangeTop struct {
+	Market       string `json:"market"`
+	EventType    string `json:"event_type"`
+	TimestampStr string `json:"timestamp"` // often stringified millis
+	PriceChanges []struct {
+		AssetID string `json:"asset_id"`
+		// best_* come as strings; parse to float
+		BestBid string `json:"best_bid"`
+		BestAsk string `json:"best_ask"`
+		// other fields we don't need right now:
+		Price string `json:"price"`
+		Size  string `json:"size"`
+		Side  string `json:"side"`
+		Hash  string `json:"hash"`
+	} `json:"price_changes"`
+}
+
+// ===== Store interface (backed by your sqlc-generated Store) =====
+type Store interface {
+	UpsertMarketScan(ctx context.Context, p UpsertMarketScanParams) (MarketScanRow, error)
+	UpsertMarket(ctx context.Context, p UpsertMarketParams) (interface{}, error)
+	RecordMarketEvent(ctx context.Context, p RecordMarketEventParams) (interface{}, error)
+
+	// New tables (quotes/trades/features) — fill with your sqlc names
+	InsertQuote(ctx context.Context, q Quote) error            // TODO(sqlc)
+	InsertTrade(ctx context.Context, t Trade) error            // TODO(sqlc)
+	UpsertFeatures(ctx context.Context, f FeatureUpdate) error // TODO(sqlc)
+
+	// Convenience
+	GetActiveMarketScans(ctx context.Context, limit int) ([]MarketScanRow, error)
+}
+
+// Minimal projection of your sqlc MarketScan row.
+type MarketScanRow struct {
+	TokenID      string
+	EventID      sql.NullString
+	Slug         sql.NullString
+	Question     sql.NullString
+	LastPrice    sql.NullFloat64
+	LastVolume   sql.NullFloat64
+	Liquidity    sql.NullFloat64
+	Metadata     pqtype.NullRawMessage
+	Price24hAgo  sql.NullFloat64
+	Volume24hAgo sql.NullFloat64
+}
+
+// ===== Polymarket types =====
 type PolymarketEvent struct {
-	ID          string             `json:"id"`
-	Slug        string             `json:"slug"`
-	Title       string             `json:"title"`
-	Description string             `json:"description"`
-	Markets     []PolymarketMarket `json:"markets"`
-	CreatedAt   time.Time          `json:"createdAt"`
-	UpdatedAt   time.Time          `json:"updatedAt"`
-	StartDate   time.Time          `json:"startDate"`
-	EndDate     time.Time          `json:"endDate"`
-	Closed      bool               `json:"closed"`
-	Active      bool               `json:"active"`
-	Tags        []Tag              `json:"tags"`
-	Liquidity   float64            `json:"liquidity"`
-	Volume      float64            `json:"volume"`
-	Volume24hr  float64            `json:"volume24hr"`
+	ID        string             `json:"id"`
+	Slug      string             `json:"slug"`
+	Title     string             `json:"title"`
+	StartDate *time.Time         `json:"startDate"`
+	EndDate   *time.Time         `json:"endDate"`
+	Markets   []PolymarketMarket `json:"markets"`
 }
 
-// PolymarketMarket represents a market from the API
 type PolymarketMarket struct {
-	ID          string    `json:"id"`
-	Slug        string    `json:"slug"`
-	Question    string    `json:"question"`
-	GroupID     string    `json:"groupId,omitempty"`
-	ConditionID string    `json:"conditionId"`
-	QuestionID  string    `json:"questionID"`
-	Description string    `json:"description"`
-	Active      bool      `json:"active"`
-	Closed      bool      `json:"closed"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
-	StartDate   time.Time `json:"startDate"`
-	EndDate     time.Time `json:"endDate"`
+	ID          string     `json:"id"`
+	Question    string     `json:"question"`
+	ConditionID string     `json:"conditionId"`
+	QuestionID  string     `json:"questionID"`
+	Slug        string     `json:"slug"`
+	Closed      bool       `json:"closed"`
+	CreatedAt   *time.Time `json:"createdAt"`
 
-	// Price fields
+	// Prices / top-of-book (Gamma)
+	LastTradePrice float64 `json:"lastTradePrice"`
 	BestBid        float64 `json:"bestBid"`
 	BestAsk        float64 `json:"bestAsk"`
-	LastTradePrice float64 `json:"lastTradePrice"`
-	OutcomePrices  string  `json:"outcomePrices"` // JSON string array like "[\"0.0245\", \"0.9755\"]"
-	Outcomes       string  `json:"outcomes"`      // JSON string array like "[\"Yes\", \"No\"]"
 
-	// Volume and liquidity - can be string or number
-	Volume       interface{} `json:"volume"` // Can be string or float
-	Volume24hr   interface{} `json:"volume24hr"`
-	Volume1wk    interface{} `json:"volume1wk"`
-	Volume1mo    interface{} `json:"volume1mo"`
-	Liquidity    interface{} `json:"liquidity"` // Can be string or float
-	LiquidityNum float64     `json:"liquidityNum"`
-	VolumeNum    float64     `json:"volumeNum"`
+	// Liquidity / volume (Gamma)
+	VolumeNum    float64 `json:"volumeNum"` // total volume (numeric)
+	LiquidityNum float64 `json:"liquidityNum"`
+	Volume24hr   float64 `json:"volume24hr"` // 24h flow
 
-	// Other fields
-	Spread       float64 `json:"spread"`
-	OrderMinSize float64 `json:"orderMinSize"`
-}
+	ClobTokenIds string `json:"clobTokenIds"`
 
-// Helper methods to safely get numeric values
-func (m PolymarketMarket) GetVolume() float64 {
-	return parseInterface(m.Volume)
-}
-
-func (m PolymarketMarket) GetVolume24hr() float64 {
-	return parseInterface(m.Volume24hr)
-}
-
-func (m PolymarketMarket) GetLiquidity() float64 {
-	return parseInterface(m.Liquidity)
-}
-
-func (m PolymarketMarket) GetOutcomePrices() []float64 {
-	// Parse JSON string array like "[\"0.0245\", \"0.9755\"]"
-	if m.OutcomePrices == "" {
-		return []float64{}
-	}
-
-	var prices []string
-	if err := json.Unmarshal([]byte(m.OutcomePrices), &prices); err != nil {
-		return []float64{}
-	}
-
-	result := make([]float64, len(prices))
-	for i, p := range prices {
-		result[i] = parseFloat(p)
-	}
-	return result
-}
-
-// parseInterface converts interface{} (string or float64) to float64
-func parseInterface(v interface{}) float64 {
-	switch val := v.(type) {
-	case float64:
-		return val
-	case string:
-		return parseFloat(val)
-	case nil:
-		return 0
-	default:
-		return 0
-	}
-}
-
-func parseFloat(s string) float64 {
-	if s == "" {
-		return 0
-	}
-	f, _ := strconv.ParseFloat(s, 64)
-	return f
+	// Nice-to-have (present in docs; safe to omit if absent)
+	OutcomePrices json.RawMessage `json:"outcomePrices,omitempty"`
 }

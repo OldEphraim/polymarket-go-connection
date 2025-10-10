@@ -3,7 +3,6 @@ package gatherer_client
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/db"
@@ -38,16 +37,13 @@ func (c *Client) StreamEvents(ctx context.Context) <-chan gatherer.MarketEvent {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Get new events since last check
 				events, err := c.store.GetMarketEventsSince(ctx, c.lastEventID)
 				if err != nil {
-					// Log error but continue polling
+					// you can log here if you want
 					continue
 				}
-
 				for _, e := range events {
 					eventChan <- convertDBEventToMarketEvent(e)
-					// Update last event ID to track progress
 					if e.ID > c.lastEventID {
 						c.lastEventID = e.ID
 					}
@@ -59,56 +55,44 @@ func (c *Client) StreamEvents(ctx context.Context) <-chan gatherer.MarketEvent {
 	return eventChan
 }
 
-// convertDBEventToMarketEvent converts database event to gatherer event
 func convertDBEventToMarketEvent(dbEvent database.MarketEvent) gatherer.MarketEvent {
-	// Parse metadata from JSON
+	// metadata
 	var metadata map[string]interface{}
 	if dbEvent.Metadata.Valid {
-		json.Unmarshal(dbEvent.Metadata.RawMessage, &metadata)
+		_ = json.Unmarshal(dbEvent.Metadata.RawMessage, &metadata)
 	} else {
-		metadata = make(map[string]interface{})
+		metadata = map[string]interface{}{}
 	}
 
-	// Parse numeric values from SQL NullString
+	// numeric values are NullFloat64 after migration 003
 	oldValue := 0.0
 	newValue := 0.0
-
 	if dbEvent.OldValue.Valid {
-		fmt.Sscanf(dbEvent.OldValue.String, "%f", &oldValue)
+		oldValue = dbEvent.OldValue.Float64
 	}
 	if dbEvent.NewValue.Valid {
-		fmt.Sscanf(dbEvent.NewValue.String, "%f", &newValue)
+		newValue = dbEvent.NewValue.Float64
 	}
 
-	// Convert event type (handle NULL case)
-	eventType := ""
+	// event type
+	evType := ""
 	if dbEvent.EventType.Valid {
-		eventType = dbEvent.EventType.String
+		evType = dbEvent.EventType.String
 	}
 
-	// Handle nullable timestamp
+	// timestamp (likely sql.NullTime)
 	ts := time.Time{}
 	if dbEvent.DetectedAt.Valid {
 		ts = dbEvent.DetectedAt.Time
 	}
 
 	return gatherer.MarketEvent{
-		Type:      gatherer.EventType(eventType),
+		Type:      gatherer.MarketEventType(evType),
 		TokenID:   dbEvent.TokenID,
-		EventID:   "", // Not stored in market_events table
+		EventID:   "", // not stored in market_events
 		Timestamp: ts,
 		OldValue:  oldValue,
 		NewValue:  newValue,
 		Metadata:  metadata,
 	}
-}
-
-// SetPollInterval allows adjusting the polling frequency
-func (c *Client) SetPollInterval(interval time.Duration) {
-	c.pollInterval = interval
-}
-
-// GetLastEventID returns the last processed event ID (useful for debugging)
-func (c *Client) GetLastEventID() int32 {
-	return c.lastEventID
 }

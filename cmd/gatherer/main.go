@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"log"
 	"log/slog"
 	"os"
@@ -8,63 +9,64 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/OldEphraim/polymarket-go-connection/db"
+	_ "github.com/lib/pq"
+
 	"github.com/OldEphraim/polymarket-go-connection/gatherer"
+	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: .env file not found")
-	}
+	// Load env
+	_ = godotenv.Load()
 
-	// Initialize logger
+	// Logger
 	logLevel := slog.LevelInfo
 	if os.Getenv("DEBUG") == "true" {
 		logLevel = slog.LevelDebug
 	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
-
-	// Connect to database
+	// DB
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL environment variable not set")
 	}
-
-	store, err := db.NewStore(dbURL)
+	sqlDB, err := sql.Open("postgres", dbURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("open db: %v", err)
 	}
+	if err := sqlDB.Ping(); err != nil {
+		log.Fatalf("ping db: %v", err)
+	}
+	q := database.New(sqlDB)
+	store := gatherer.NewSQLCStore(q)
 
-	// Configure gatherer
-	config := gatherer.DefaultConfig()
-	config.ScanInterval = 30 * time.Second
-
-	// Override from environment if set
+	// Config
+	cfg := gatherer.DefaultConfig()
+	cfg.ScanInterval = 30 * time.Second
 	if interval := os.Getenv("GATHERER_SCAN_INTERVAL"); interval != "" {
-		if duration, err := time.ParseDuration(interval); err == nil {
-			config.ScanInterval = duration
+		if d, err := time.ParseDuration(interval); err == nil {
+			cfg.ScanInterval = d
 		}
 	}
+	// Make sure this is true to enable WS:
+	// cfg.UseWebsocket = true
 
-	// Create and start gatherer
-	g := gatherer.New(store, config, logger)
+	// Start
+	g := gatherer.New(store, cfg, logger)
 	if err := g.Start(); err != nil {
-		log.Fatalf("Failed to start gatherer: %v", err)
+		log.Fatalf("start gatherer: %v", err)
 	}
 
 	logger.Info("Gatherer service started",
-		"scan_interval", config.ScanInterval,
-		"base_url", config.BaseURL)
+		"scan_interval", cfg.ScanInterval,
+		"base_url", cfg.BaseURL)
 
-	// Run until killed
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	// Wait for signal
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
 
 	logger.Info("Shutdown signal received")
 	g.Stop()

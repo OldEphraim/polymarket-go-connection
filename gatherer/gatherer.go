@@ -2,487 +2,345 @@ package gatherer
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/OldEphraim/polymarket-go-connection/db"
-	"github.com/OldEphraim/polymarket-go-connection/internal/database"
+	"database/sql"
+
 	"github.com/sqlc-dev/pqtype"
 )
 
 type Gatherer struct {
-	store     *db.Store
-	client    *http.Client
-	eventChan chan MarketEvent
-	config    *Config
-	logger    *slog.Logger
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	store    Store
+	client   *http.Client
+	config   *Config
+	logger   *slog.Logger
+	lastEmit map[string]time.Time
+	emitMu   sync.Mutex
 
-	// Track what we've seen
-	marketCache map[string]*database.MarketScan
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// Channels
+	eventChan  chan MarketEvent
+	quotesCh   chan Quote
+	tradesCh   chan Trade
+	featuresCh chan FeatureUpdate
+
+	// Cache
 	cacheMu     sync.RWMutex
+	marketCache map[string]*MarketScanRow
 
 	// Metrics
 	scansPerformed int64
 	marketsFound   int64
 	eventsEmitted  int64
+
+	assetToToken map[string]string // clob asset_id -> market token_id
+	assetMu      sync.RWMutex
 }
 
-type Config struct {
-	BaseURL          string        `json:"base_url"`
-	ScanInterval     time.Duration `json:"scan_interval"`
-	LogLevel         string        `json:"log_level"`
-	EmitNewMarkets   bool          `json:"emit_new_markets"`
-	EmitPriceJumps   bool          `json:"emit_price_jumps"`
-	EmitVolumeSpikes bool          `json:"emit_volume_spikes"`
-}
-
-func DefaultConfig() *Config {
-	return &Config{
-		BaseURL:          "https://gamma-api.polymarket.com",
-		ScanInterval:     30 * time.Second,
-		LogLevel:         "info",
-		EmitNewMarkets:   true,
-		EmitPriceJumps:   true,
-		EmitVolumeSpikes: true,
-	}
-}
-
-func New(store *db.Store, config *Config, logger *slog.Logger) *Gatherer {
+// NOTE: WSClient removed from signature; the gatherer owns WS in ingest_ws.go
+func New(store Store, config *Config, logger *slog.Logger) *Gatherer {
 	if config == nil {
 		config = DefaultConfig()
 	}
-
+	if logger == nil {
+		logger = slog.Default()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// honor EventQueueSize if present
+	evSize := 20000
+	if config.EventQueueSize > 0 {
+		evSize = config.EventQueueSize
+	}
+
 	return &Gatherer{
-		store:       store,
-		client:      &http.Client{Timeout: 10 * time.Second},
-		eventChan:   make(chan MarketEvent, 20000),
-		config:      config,
-		logger:      logger,
-		ctx:         ctx,
-		cancel:      cancel,
-		marketCache: make(map[string]*database.MarketScan),
+		store:        store,
+		client:       &http.Client{Timeout: 10 * time.Second},
+		config:       config,
+		logger:       logger,
+		ctx:          ctx,
+		cancel:       cancel,
+		eventChan:    make(chan MarketEvent, evSize),
+		quotesCh:     make(chan Quote, 50000),
+		tradesCh:     make(chan Trade, 100000),
+		featuresCh:   make(chan FeatureUpdate, 20000),
+		marketCache:  make(map[string]*MarketScanRow),
+		lastEmit:     make(map[string]time.Time),
+		assetToToken: make(map[string]string),
 	}
 }
 
 func (g *Gatherer) Start() error {
-	g.logger.Info("Starting gatherer",
+	g.logger.Info("starting gatherer",
 		"scan_interval", g.config.ScanInterval,
-		"base_url", g.config.BaseURL)
+		"use_ws", g.config.UseWebsocket)
 
-	// Load existing market data into cache
+	// Warm cache
 	if err := g.loadMarketCache(); err != nil {
-		g.logger.Error("Failed to load market cache", "error", err)
-		// Continue anyway - not fatal
+		g.logger.Error("load market cache", "err", err)
 	}
 
-	// Start the main scanning loop
+	// Feature engine
 	g.wg.Add(1)
-	go g.scanLoop()
+	go func() {
+		defer g.wg.Done()
+		runFeatureEngine(g.ctx, g.logger, g.config, g.store, g.featuresCh, g.quotesCh, g.tradesCh)
+	}()
 
-	// Start metrics reporter
+	// Detector loop
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.detectorLoop()
+	}()
+
+	// Metrics loop
 	g.wg.Add(1)
 	go g.metricsLoop()
+
+	// REST scanner loop
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.scanLoop()
+	}()
+
+	// WS ingest loop (optional)
+	if g.config.UseWebsocket {
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			g.runWSIngest()
+		}()
+	}
 
 	return nil
 }
 
 func (g *Gatherer) Stop() {
-	g.logger.Info("Stopping gatherer")
+	g.logger.Info("stopping gatherer")
 	g.cancel()
 	g.wg.Wait()
 	close(g.eventChan)
-
-	g.logger.Info("Gatherer stopped",
+	g.logger.Info("stopped",
 		"total_scans", g.scansPerformed,
 		"total_markets", g.marketsFound,
 		"total_events", g.eventsEmitted)
 }
 
-func (g *Gatherer) EventChannel() <-chan MarketEvent {
-	return g.eventChan
-}
+func (g *Gatherer) EventChannel() <-chan MarketEvent { return g.eventChan }
 
-func (g *Gatherer) scanLoop() {
-	defer g.wg.Done()
-
-	ticker := time.NewTicker(g.config.ScanInterval)
-	defer ticker.Stop()
-
-	// Initial scan immediately
-	g.performScan()
-
-	for {
-		select {
-		case <-g.ctx.Done():
-			return
-		case <-ticker.C:
-			g.performScan()
-		}
-	}
-}
-
-func (g *Gatherer) performScan() {
-	startTime := time.Now()
-	g.scansPerformed++
-
-	g.logger.Debug("Starting scan cycle", "scan_number", g.scansPerformed)
-
-	var allEvents []PolymarketEvent
-	offset := 0
-	limit := 100
-
-	// Fetch all events with pagination
-	for {
-		events, hasMore, err := g.fetchEventsBatch(offset, limit)
-		if err != nil {
-			g.logger.Error("Failed to fetch events batch",
-				"error", err,
-				"offset", offset)
-			break
-		}
-
-		allEvents = append(allEvents, events...)
-
-		if !hasMore || len(events) < limit {
-			break
-		}
-
-		offset += limit
-
-		// Be nice to the API
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	g.logger.Info("Fetched all events",
-		"count", len(allEvents),
-		"duration", time.Since(startTime))
-
-	// Process all markets
-	marketCount := 0
-	for _, event := range allEvents {
-		for _, market := range event.Markets {
-			if !market.Closed {
-				marketCount++
-				g.marketsFound++
-				g.processMarket(market, event.ID)
-			}
-		}
-	}
-
-	g.logger.Info("Scan complete",
-		"markets_processed", marketCount,
-		"duration", time.Since(startTime))
-}
-
-func (g *Gatherer) fetchEventsBatch(offset, limit int) ([]PolymarketEvent, bool, error) {
-	url := fmt.Sprintf("%s/events?closed=false&order=id&ascending=false&limit=%d&offset=%d",
-		g.config.BaseURL, limit, offset)
-
-	g.logger.Debug("Fetching events batch", "offset", offset, "limit", limit)
-
-	resp, err := g.client.Get(url)
-	if err != nil {
-		return nil, false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 429 {
-		g.logger.Warn("Rate limited, backing off")
-		time.Sleep(5 * time.Second)
-		return g.fetchEventsBatch(offset, limit) // Retry
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	var events []PolymarketEvent
-	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
-		return nil, false, err
-	}
-
-	// Check if there might be more
-	hasMore := len(events) == limit
-
-	return events, hasMore, nil
-}
-
-func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
-	// Use market.ID as token_id (they're the same in Polymarket)
-	tokenID := market.ID
-
-	// Get cached data
-	g.cacheMu.RLock()
-	oldScan, exists := g.marketCache[tokenID]
-	g.cacheMu.RUnlock()
-
-	// Calculate the current price (average of outcome prices for binary markets)
-	currentPrice := g.calculateMarketPrice(market)
-
-	// Parse float values from strings
-	volume := market.GetVolume()
-	liquidity := market.GetLiquidity()
-
-	// Prepare metadata
-	metadata := map[string]interface{}{
-		"outcome_prices": market.GetOutcomePrices(),
-		"condition_id":   market.ConditionID,
-		"question_id":    market.QuestionID,
-		"volume_24hr":    market.GetVolume24hr(),
-		"best_bid":       market.BestBid,
-		"best_ask":       market.BestAsk,
-	}
-	metadataJSON, _ := json.Marshal(metadata)
-
-	// Store in database
-	params := database.UpsertMarketScanParams{
-		TokenID:    tokenID,
-		EventID:    sql.NullString{String: eventID, Valid: eventID != ""},
-		Slug:       sql.NullString{String: market.Slug, Valid: market.Slug != ""},
-		Question:   sql.NullString{String: market.Question, Valid: market.Question != ""},
-		LastPrice:  sql.NullString{String: strconv.FormatFloat(currentPrice, 'f', -1, 64), Valid: true},
-		LastVolume: sql.NullString{String: strconv.FormatFloat(volume, 'f', -1, 64), Valid: true},
-		Liquidity:  sql.NullString{String: strconv.FormatFloat(liquidity, 'f', -1, 64), Valid: true},
-		Metadata:   pqtype.NullRawMessage{RawMessage: metadataJSON, Valid: true},
-	}
-
-	// If we have old data, preserve the 24h ago values
-	if exists && oldScan != nil {
-		params.Price24hAgo = oldScan.Price24hAgo
-		params.Volume24hAgo = oldScan.Volume24hAgo
-	}
-
-	newScan, err := g.store.UpsertMarketScan(g.ctx, params)
-	if err != nil {
-		g.logger.Error("Failed to upsert market scan",
-			"token_id", tokenID,
-			"error", err)
-		return
-	}
-
-	// Also update the markets table for compatibility with existing code
-	_, err = g.store.UpsertMarket(g.ctx, database.UpsertMarketParams{
-		TokenID:  tokenID,
-		Slug:     sql.NullString{String: market.Slug, Valid: market.Slug != ""},
-		Question: sql.NullString{String: market.Question, Valid: market.Question != ""},
-		Outcome:  sql.NullString{String: "YES", Valid: true}, // Default for binary markets
-	})
-	if err != nil {
-		g.logger.Error("Failed to update markets table", "token_id", tokenID, "error", err)
-	}
-
-	// Update cache
-	g.cacheMu.Lock()
-	g.marketCache[tokenID] = &newScan
-	g.cacheMu.Unlock()
-
-	// Detect and emit events
-	if exists && oldScan != nil {
-		g.detectEvents(oldScan, &newScan, market)
-	} else if g.config.EmitNewMarkets {
-		// New market found
-		marketAge := time.Since(market.CreatedAt)
-		g.emitEvent(MarketEvent{
-			Type:      NewMarket,
-			TokenID:   tokenID,
-			EventID:   eventID,
-			Timestamp: time.Now(),
-			Metadata: map[string]interface{}{
-				"question":         market.Question,
-				"volume":           volume,
-				"slug":             market.Slug,
-				"created_at":       market.CreatedAt,
-				"market_age_hours": marketAge.Hours(),
-				"liquidity":        liquidity,
-			},
-		})
-	}
-}
-
-func (g *Gatherer) calculateMarketPrice(market PolymarketMarket) float64 {
-	// Try to use LastTradePrice first
-	if market.LastTradePrice > 0 {
-		return market.LastTradePrice
-	}
-
-	// Otherwise use the first outcome price
-	prices := market.GetOutcomePrices()
-	if len(prices) > 0 {
-		return prices[0]
-	}
-
-	// Fallback to bestBid
-	return market.BestBid
-}
-
-func (g *Gatherer) detectEvents(old, new *database.MarketScan, market PolymarketMarket) {
-	tokenID := market.ID
-
-	// Price jump detection (>5% change)
-	if g.config.EmitPriceJumps {
-		oldPrice, okOld := parseNullableFloat(old.LastPrice)
-		newPrice, okNew := parseNullableFloat(new.LastPrice)
-		if okOld && okNew && oldPrice > 0 {
-			priceChange := (newPrice - oldPrice) / oldPrice
-			if abs(priceChange) > 0.02 {
-				g.emitEvent(MarketEvent{
-					Type:      PriceJump,
-					TokenID:   tokenID,
-					EventID:   new.EventID.String,
-					Timestamp: time.Now(),
-					OldValue:  oldPrice,
-					NewValue:  newPrice,
-					Metadata: map[string]interface{}{
-						"percent_change": priceChange * 100,
-						"question":       market.Question,
-					},
-				})
-			}
-		}
-	}
-
-	// Volume spike detection (>200% of previous)
-	if g.config.EmitVolumeSpikes {
-		oldVol, okOld := parseNullableFloat(old.LastVolume)
-		newVol, okNew := parseNullableFloat(new.LastVolume)
-		if okOld && okNew && oldVol > 0 && newVol > oldVol*2 {
-			g.emitEvent(MarketEvent{
-				Type:      VolumeSpike,
-				TokenID:   tokenID,
-				EventID:   new.EventID.String,
-				Timestamp: time.Now(),
-				OldValue:  oldVol,
-				NewValue:  newVol,
-				Metadata: map[string]interface{}{
-					"multiplier": newVol / oldVol,
-					"question":   market.Question,
-				},
-			})
-		}
-	}
-
-	// Liquidity shift detection (>50% change)
-	{
-		oldLiq, okOld := parseNullableFloat(old.Liquidity)
-		newLiq, okNew := parseNullableFloat(new.Liquidity)
-		if okOld && okNew && oldLiq > 0 {
-			liqChange := (newLiq - oldLiq) / oldLiq
-			if abs(liqChange) > 0.5 {
-				g.emitEvent(MarketEvent{
-					Type:      LiquidityShift,
-					TokenID:   tokenID,
-					EventID:   new.EventID.String,
-					Timestamp: time.Now(),
-					OldValue:  oldLiq,
-					NewValue:  newLiq,
-					Metadata: map[string]interface{}{
-						"percent_change": liqChange * 100,
-						"question":       market.Question,
-					},
-				})
-			}
-		}
-	}
-}
+// ===== Shared helpers =====
 
 func (g *Gatherer) emitEvent(event MarketEvent) {
 	g.eventsEmitted++
 
+	// 1) Persist to DB
+	meta, _ := json.Marshal(event.Metadata)
+	_, err := g.store.RecordMarketEvent(g.ctx, RecordMarketEventParams{
+		TokenID:   event.TokenID,
+		EventType: sql.NullString{String: string(event.Type), Valid: true},
+		OldValue:  sql.NullFloat64{Float64: event.OldValue, Valid: true},
+		NewValue:  sql.NullFloat64{Float64: event.NewValue, Valid: true},
+		Metadata:  pqtype.NullRawMessage{RawMessage: meta, Valid: true},
+	})
+	if err != nil {
+		g.logger.Error("record event failed", "type", event.Type, "token_id", event.TokenID, "err", err)
+	}
+
+	// 2) Non-blocking publish
 	select {
 	case g.eventChan <- event:
-		g.logger.Debug("Emitted event",
-			"type", event.Type,
-			"token_id", event.TokenID)
-
-		// Also record to database for analysis
-		metadata, _ := json.Marshal(event.Metadata)
-		_, err := g.store.RecordMarketEvent(g.ctx, database.RecordMarketEventParams{
-			TokenID:   event.TokenID,
-			EventType: sql.NullString{String: string(event.Type), Valid: true},
-			OldValue:  sql.NullString{String: strconv.FormatFloat(event.OldValue, 'f', -1, 64), Valid: true},
-			NewValue:  sql.NullString{String: strconv.FormatFloat(event.NewValue, 'f', -1, 64), Valid: true},
-			Metadata:  pqtype.NullRawMessage{RawMessage: metadata, Valid: true},
-		})
-		if err != nil {
-			g.logger.Error("Failed to record event", "error", err)
-		}
 	default:
-		g.logger.Warn("Event channel full, dropping event",
-			"type", event.Type,
-			"token_id", event.TokenID)
+		g.logger.Warn("event publish queue full; skipping publish",
+			"type", event.Type, "token_id", event.TokenID)
 	}
 }
 
+func isNaN(f float64) bool { return f != f }
+
 func (g *Gatherer) loadMarketCache() error {
-	// Load recent market scans into memory for comparison
-	markets, err := g.store.GetActiveMarketScans(g.ctx, 10000) // Load up to 10k markets
+	rows, err := g.store.GetActiveMarketScans(g.ctx, 10000)
 	if err != nil {
 		return err
 	}
-
 	g.cacheMu.Lock()
 	defer g.cacheMu.Unlock()
-
-	for _, market := range markets {
-		marketCopy := market // Important: create a copy
-		g.marketCache[market.TokenID] = &marketCopy
+	for i := range rows {
+		r := rows[i]
+		g.marketCache[r.TokenID] = &r
 	}
-
-	g.logger.Info("Loaded market cache", "count", len(g.marketCache))
+	g.logger.Info("cache loaded", "count", len(g.marketCache))
 	return nil
 }
 
-func (g *Gatherer) metricsLoop() {
-	defer g.wg.Done()
+func (g *Gatherer) updateCache(tokenID string, scan *MarketScanRow) {
+	g.cacheMu.Lock()
+	g.marketCache[tokenID] = scan
+	g.cacheMu.Unlock()
+}
 
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
+func (g *Gatherer) lastScan(tokenID string) (*MarketScanRow, bool) {
+	g.cacheMu.RLock()
+	defer g.cacheMu.RUnlock()
+	r, ok := g.marketCache[tokenID]
+	return r, ok
+}
 
-	for {
-		select {
-		case <-g.ctx.Done():
-			return
-		case <-ticker.C:
-			g.cacheMu.RLock()
-			cacheSize := len(g.marketCache)
-			g.cacheMu.RUnlock()
+// Clean price formatting helper
+func f64(v float64) sql.NullFloat64 {
+	if v == 0 && (1/v) == math.Inf(1) {
+		return sql.NullFloat64{Valid: false}
+	}
+	return sql.NullFloat64{Float64: v, Valid: true}
+}
 
-			g.logger.Info("Gatherer metrics",
-				"scans_performed", g.scansPerformed,
-				"markets_found", g.marketsFound,
-				"events_emitted", g.eventsEmitted,
-				"cache_size", cacheSize)
+func (g *Gatherer) addClobMap(tokenID string, clobIDs string) {
+	if clobIDs == "" {
+		return
+	}
+
+	ids := decodeAssetIDs(clobIDs)
+	if len(ids) == 0 {
+		return
+	}
+
+	g.assetMu.Lock()
+	for _, id := range ids {
+		if id != "" {
+			g.assetToToken[id] = tokenID
 		}
 	}
+	g.assetMu.Unlock()
 }
 
-func abs(x float64) float64 {
-	if x < 0 {
-		return -x
+func decodeAssetIDs(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
 	}
-	return x
+
+	// JSON array? e.g. ["id1","id2"]
+	if strings.HasPrefix(s, "[") {
+		var arr []string
+		if err := json.Unmarshal([]byte(s), &arr); err == nil {
+			out := make([]string, 0, len(arr))
+			for _, v := range arr {
+				v = strings.TrimSpace(v)
+				v = strings.Trim(v, `"'`)
+				if v != "" {
+					out = append(out, v)
+				}
+			}
+			return out
+		}
+	}
+
+	// Fallback: CSV (strip stray quotes/brackets)
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.Trim(p, `[]"'"`)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
-// parseNullableFloat converts sql.NullString holding a numeric string to float64.
-// Returns (value, true) if valid; (0, false) otherwise.
-func parseNullableFloat(ns sql.NullString) (float64, bool) {
-	if !ns.Valid {
-		return 0, false
+func (g *Gatherer) wsAssetList() []string {
+	g.assetMu.RLock()
+	defer g.assetMu.RUnlock()
+	out := make([]string, 0, len(g.assetToToken))
+	for k := range g.assetToToken {
+		out = append(out, k)
 	}
-	v, err := strconv.ParseFloat(ns.String, 64)
-	if err != nil {
-		return 0, false
+	return out
+}
+
+func (g *Gatherer) tokenForAsset(assetID string) string {
+	g.assetMu.RLock()
+	defer g.assetMu.RUnlock()
+	return g.assetToToken[assetID]
+}
+
+func (g *Gatherer) runWSIngest() {
+	backoff := time.Second
+	for {
+		if g.ctx.Err() != nil {
+			return
+		}
+		assets := g.wsAssetList()
+		if len(assets) == 0 {
+			time.Sleep(2 * time.Second) // wait for first REST scan to fill assetToToken
+			continue
+		}
+
+		onQuote := func(assetID string, bestBid, bestAsk float64, ts time.Time) {
+			g.assetMu.RLock()
+			tokenID := g.tokenForAsset(assetID)
+			g.assetMu.RUnlock()
+			if tokenID == "" {
+				return
+			}
+			mid := (bestBid + bestAsk) / 2
+			spreadBps := 0.0
+			if mid > 0 {
+				spreadBps = (bestAsk - bestBid) / mid * 10000
+			}
+			select {
+			case g.quotesCh <- Quote{
+				TokenID:   tokenID,
+				TS:        ts,
+				BestBid:   bestBid,
+				BestAsk:   bestAsk,
+				SpreadBps: spreadBps,
+				Mid:       mid,
+			}:
+			default:
+			}
+		}
+
+		onTrade := func(assetID string, price float64, side string, size float64, ts time.Time) {
+			g.assetMu.RLock()
+			tokenID := g.tokenForAsset(assetID)
+			g.assetMu.RUnlock()
+			if tokenID == "" {
+				return
+			}
+			select {
+			case g.tradesCh <- Trade{
+				TokenID:   tokenID,
+				TS:        ts,
+				Price:     price,
+				Size:      size,
+				Aggressor: side, // "buy"/"sell"
+			}:
+			default:
+			}
+		}
+
+		// 👇 create the client here (no g.ws field needed)
+		ws := NewPolymarketWSClient(g.logger)
+		err := ws.Run(g.ctx, g.config.WebsocketURL, assets, onQuote, onTrade)
+		if err != nil && g.ctx.Err() == nil {
+			g.logger.Warn("ws ingest ended with error; reconnecting", "err", err)
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff += time.Second
+			}
+			continue
+		}
+		return
 	}
-	return v, true
 }

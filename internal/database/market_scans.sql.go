@@ -187,8 +187,8 @@ RETURNING id, token_id, event_type, old_value, new_value, metadata, detected_at
 type RecordMarketEventParams struct {
 	TokenID   string                `json:"token_id"`
 	EventType sql.NullString        `json:"event_type"`
-	OldValue  sql.NullString        `json:"old_value"`
-	NewValue  sql.NullString        `json:"new_value"`
+	OldValue  sql.NullFloat64       `json:"old_value"`
+	NewValue  sql.NullFloat64       `json:"new_value"`
 	Metadata  pqtype.NullRawMessage `json:"metadata"`
 }
 
@@ -250,11 +250,11 @@ type UpsertMarketScanParams struct {
 	EventID      sql.NullString        `json:"event_id"`
 	Slug         sql.NullString        `json:"slug"`
 	Question     sql.NullString        `json:"question"`
-	LastPrice    sql.NullString        `json:"last_price"`
-	LastVolume   sql.NullString        `json:"last_volume"`
-	Liquidity    sql.NullString        `json:"liquidity"`
-	Price24hAgo  sql.NullString        `json:"price_24h_ago"`
-	Volume24hAgo sql.NullString        `json:"volume_24h_ago"`
+	LastPrice    sql.NullFloat64       `json:"last_price"`
+	LastVolume   sql.NullFloat64       `json:"last_volume"`
+	Liquidity    sql.NullFloat64       `json:"liquidity"`
+	Price24hAgo  sql.NullFloat64       `json:"price_24h_ago"`
+	Volume24hAgo sql.NullFloat64       `json:"volume_24h_ago"`
 	Metadata     pqtype.NullRawMessage `json:"metadata"`
 }
 

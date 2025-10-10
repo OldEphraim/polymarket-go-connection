@@ -7,6 +7,7 @@ package database
 import (
 	"database/sql"
 	"encoding/json"
+	"time"
 
 	"github.com/sqlc-dev/pqtype"
 )
@@ -25,10 +26,39 @@ type MarketEvent struct {
 	ID         int32                 `json:"id"`
 	TokenID    string                `json:"token_id"`
 	EventType  sql.NullString        `json:"event_type"`
-	OldValue   sql.NullString        `json:"old_value"`
-	NewValue   sql.NullString        `json:"new_value"`
+	OldValue   sql.NullFloat64       `json:"old_value"`
+	NewValue   sql.NullFloat64       `json:"new_value"`
 	Metadata   pqtype.NullRawMessage `json:"metadata"`
 	DetectedAt sql.NullTime          `json:"detected_at"`
+}
+
+type MarketFeature struct {
+	TokenID        string          `json:"token_id"`
+	Ts             time.Time       `json:"ts"`
+	Ret1m          sql.NullFloat64 `json:"ret_1m"`
+	Ret5m          sql.NullFloat64 `json:"ret_5m"`
+	Vol1m          sql.NullFloat64 `json:"vol_1m"`
+	AvgVol5m       sql.NullFloat64 `json:"avg_vol_5m"`
+	Sigma5m        sql.NullFloat64 `json:"sigma_5m"`
+	Zscore5m       sql.NullFloat64 `json:"zscore_5m"`
+	ImbalanceTop   sql.NullFloat64 `json:"imbalance_top"`
+	SpreadBps      sql.NullFloat64 `json:"spread_bps"`
+	BrokeHigh15m   sql.NullBool    `json:"broke_high_15m"`
+	BrokeLow15m    sql.NullBool    `json:"broke_low_15m"`
+	TimeToResolveH sql.NullFloat64 `json:"time_to_resolve_h"`
+	SignedFlow1m   sql.NullFloat64 `json:"signed_flow_1m"`
+}
+
+type MarketQuote struct {
+	ID        int64           `json:"id"`
+	TokenID   string          `json:"token_id"`
+	Ts        time.Time       `json:"ts"`
+	BestBid   sql.NullFloat64 `json:"best_bid"`
+	BestAsk   sql.NullFloat64 `json:"best_ask"`
+	BidSize1  sql.NullFloat64 `json:"bid_size1"`
+	AskSize1  sql.NullFloat64 `json:"ask_size1"`
+	SpreadBps sql.NullFloat64 `json:"spread_bps"`
+	Mid       sql.NullFloat64 `json:"mid"`
 }
 
 type MarketScan struct {
@@ -37,12 +67,12 @@ type MarketScan struct {
 	EventID       sql.NullString        `json:"event_id"`
 	Slug          sql.NullString        `json:"slug"`
 	Question      sql.NullString        `json:"question"`
-	LastPrice     sql.NullString        `json:"last_price"`
-	LastVolume    sql.NullString        `json:"last_volume"`
-	Liquidity     sql.NullString        `json:"liquidity"`
+	LastPrice     sql.NullFloat64       `json:"last_price"`
+	LastVolume    sql.NullFloat64       `json:"last_volume"`
+	Liquidity     sql.NullFloat64       `json:"liquidity"`
 	LastScannedAt sql.NullTime          `json:"last_scanned_at"`
-	Price24hAgo   sql.NullString        `json:"price_24h_ago"`
-	Volume24hAgo  sql.NullString        `json:"volume_24h_ago"`
+	Price24hAgo   sql.NullFloat64       `json:"price_24h_ago"`
+	Volume24hAgo  sql.NullFloat64       `json:"volume_24h_ago"`
 	ScanCount     sql.NullInt64         `json:"scan_count"`
 	IsActive      sql.NullBool          `json:"is_active"`
 	Metadata      pqtype.NullRawMessage `json:"metadata"`
@@ -62,6 +92,16 @@ type MarketSignal struct {
 	AskLiquidity sql.NullString `json:"ask_liquidity"`
 	ActionReason sql.NullString `json:"action_reason"`
 	Confidence   sql.NullString `json:"confidence"`
+}
+
+type MarketTrade struct {
+	ID        int64          `json:"id"`
+	TokenID   string         `json:"token_id"`
+	Ts        time.Time      `json:"ts"`
+	Price     float64        `json:"price"`
+	Size      float64        `json:"size"`
+	Aggressor sql.NullString `json:"aggressor"`
+	TradeID   sql.NullString `json:"trade_id"`
 }
 
 type PaperOrder struct {

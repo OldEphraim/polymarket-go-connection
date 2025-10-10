@@ -17,15 +17,24 @@ type Querier interface {
 	GetActiveMarketScans(ctx context.Context, limit int32) ([]MarketScan, error)
 	GetActiveMarkets(ctx context.Context) ([]Market, error)
 	GetActiveSession(ctx context.Context, strategyID sql.NullInt32) (TradingSession, error)
+	// === Utility ===
+	GetActiveTokenIDs(ctx context.Context, limit int32) ([]string, error)
+	GetLatestMid(ctx context.Context, tokenID string) (sql.NullFloat64, error)
 	GetMarketByTokenID(ctx context.Context, tokenID string) (Market, error)
 	GetMarketEventsSince(ctx context.Context, id int32) ([]MarketEvent, error)
 	GetMarketScan(ctx context.Context, tokenID string) (MarketScan, error)
 	GetRecentMarketEvents(ctx context.Context, limit int32) ([]MarketEvent, error)
 	GetRecentSignals(ctx context.Context, arg GetRecentSignalsParams) ([]MarketSignal, error)
 	GetSignalsByType(ctx context.Context, arg GetSignalsByTypeParams) ([]MarketSignal, error)
+	// === Quotes ===
+	InsertQuote(ctx context.Context, arg InsertQuoteParams) error
+	// === Trades ===
+	InsertTrade(ctx context.Context, arg InsertTradeParams) error
 	RecordMarketEvent(ctx context.Context, arg RecordMarketEventParams) (MarketEvent, error)
 	RecordSignal(ctx context.Context, arg RecordSignalParams) (MarketSignal, error)
 	UpdateSessionBalance(ctx context.Context, arg UpdateSessionBalanceParams) error
+	// === Features ===
+	UpsertFeatures(ctx context.Context, arg UpsertFeaturesParams) error
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (Market, error)
 	UpsertMarketScan(ctx context.Context, arg UpsertMarketScanParams) (MarketScan, error)
 }
