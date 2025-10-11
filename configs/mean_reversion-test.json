@@ -2,5 +2,7 @@
     "name": "mean_reversion-test",
     "duration": "48h",
     "reversion_threshold": 0.25,
-    "hold_period": "2h"
+    "hold_period": "2h",
+    "max_spread_bps": 150,
+    "min_abs_z": 2.0  
 }

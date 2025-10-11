@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"strconv"
 	"time"
+
+	_ "github.com/lib/pq"
 
 	"github.com/OldEphraim/polymarket-go-connection/db"
 	"github.com/OldEphraim/polymarket-go-connection/gatherer"
@@ -17,7 +21,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// ===== Helper function to safely truncate strings =====
+// ===== Helper: truncate for logs =====
 func truncateID(s string, length int) string {
 	if len(s) <= length {
 		return s
@@ -25,32 +29,36 @@ func truncateID(s string, length int) string {
 	return s[:length]
 }
 
-// ===== Configuration Structure =====
+// ===== Configuration =====
 type MeanReversionConfig struct {
 	Name               string  `json:"name"`
 	Duration           string  `json:"duration"`
-	ReversionThreshold float64 `json:"reversion_threshold"` // How far from 0.5 before we bet on reversion
+	ReversionThreshold float64 `json:"reversion_threshold"` // legacy fallback: distance from 0.5 (e.g., 0.30)
 	HoldPeriod         string  `json:"hold_period"`
+
+	// NEW: feature-driven gates
+	MaxSpreadBps int     `json:"max_spread_bps"`
+	MinAbsZ      float64 `json:"min_abs_z"` // |zscore_5m| minimum (e.g., 2.5)
 }
 
 func loadConfig(filename string) *MeanReversionConfig {
 	cfg := &MeanReversionConfig{
 		Name:               "mean_reversion",
 		Duration:           "24h",
-		ReversionThreshold: 0.30, // Bet on reversion when price is 0.20 or 0.80
-		HoldPeriod:         "2h", // Hold longer for reversion
-	}
+		ReversionThreshold: 0.30, // legacy fallback
+		HoldPeriod:         "2h",
 
+		MaxSpreadBps: 120,
+		MinAbsZ:      2.5,
+	}
 	data, err := ioutil.ReadFile(fmt.Sprintf("configs/%s", filename))
 	if err != nil {
 		log.Printf("Using default config (couldn't load %s: %v)", filename, err)
 		return cfg
 	}
-
 	if err := json.Unmarshal(data, cfg); err != nil {
 		log.Printf("Error parsing config: %v, using defaults", err)
 	}
-
 	return cfg
 }
 
@@ -66,16 +74,15 @@ func main() {
 
 	// ===== STEP 3: Load Configuration =====
 	cfg := loadConfig(*configFile)
-	log.Printf("Config loaded: threshold=%.2f, hold=%s",
-		cfg.ReversionThreshold, cfg.HoldPeriod)
+	log.Printf("Config loaded: legacy_thresh=%.2f, hold=%s, gates={max_spread_bps=%d,min_abs_z=%.2f}",
+		cfg.ReversionThreshold, cfg.HoldPeriod, cfg.MaxSpreadBps, cfg.MinAbsZ)
 
 	// ===== STEP 4: Create Context =====
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if cfg.Duration != "" && cfg.Duration != "infinite" {
-		duration, err := time.ParseDuration(cfg.Duration)
-		if err == nil {
+		if duration, err := time.ParseDuration(cfg.Duration); err == nil {
 			log.Printf("Will run for %s", duration)
 			time.AfterFunc(duration, cancel)
 		}
@@ -87,6 +94,12 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("Connected to database")
+
+	sqlDB, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sqlDB.Close()
 
 	// ===== STEP 6: Initialize Paper Trading Framework =====
 	trader := paper_trading.New(store, paper_trading.Config{
@@ -102,21 +115,20 @@ func main() {
 
 	// ===== STEP 8: Initialize Strategy State =====
 	positions := make(map[string]*paper_trading.Position)
-
 	eventsProcessed := 0
-	extremesFound := 0
+	reversionHits := 0
 	positionsEntered := 0
 
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				log.Printf("STATUS: Events=%d, Extremes=%d, Positions=%d",
-					eventsProcessed, extremesFound, positionsEntered)
+			case <-t.C:
+				log.Printf("STATUS: Events=%d, ReversionHits=%d, Positions=%d",
+					eventsProcessed, reversionHits, positionsEntered)
 			}
 		}
 	}()
@@ -144,76 +156,93 @@ func main() {
 				log.Println("Event channel closed")
 				return
 			}
-
 			eventsProcessed++
 			if eventsProcessed%100 == 0 {
 				log.Printf("Processed %d events...", eventsProcessed)
 			}
 
-			// ===== STEP 10: Filter for Price Jump Events (we look for extremes) =====
+			// ===== STEP 10: Filter for reversion-eligible events =====
 			if event.Type != gatherer.PriceJump {
 				continue
 			}
 
-			// ===== STEP 11: Check if Price is at Extreme =====
-			currentPrice := event.NewValue
+			// We target feature-driven "mean reversion hints" by looking for zscore_5m + spread_bps.
+			z, hasZ := getFloat(event.Metadata, "zscore_5m")
+			spreadBps, hasSpread := getFloat(event.Metadata, "spread_bps")
 
-			// Check if price is extreme (far from 0.5)
-			distanceFromMiddle := abs(currentPrice - 0.5)
-			if distanceFromMiddle < cfg.ReversionThreshold {
-				continue // Not extreme enough
+			var passes bool
+			if hasZ && hasSpread {
+				// ===== STEP 11: Apply feature gates (z-score + spread) =====
+				if abs(z) >= cfg.MinAbsZ && int(spreadBps) <= cfg.MaxSpreadBps {
+					passes = true
+				}
+			} else {
+				// ===== STEP 11 (fallback): legacy extreme by price distance from 0.5 =====
+				px := event.NewValue
+				if px <= 0 {
+					if mid, ok := latestMidOrTrade(ctx, sqlDB, event.TokenID); ok {
+						px = mid
+					}
+				}
+				if px > 0 && abs(px-0.5) >= cfg.ReversionThreshold {
+					passes = true
+				}
 			}
+			if !passes {
+				continue
+			}
+			reversionHits++
 
-			extremesFound++
-			log.Printf("Extreme price found: Token=%s, Price=%.3f (%.1f%% from middle)",
-				truncateID(event.TokenID, 8), currentPrice, distanceFromMiddle*100)
-
-			// ===== STEP 12: Check if Already in Position =====
+			// ===== STEP 12: If already in position, skip =====
 			if _, exists := positions[event.TokenID]; exists {
-				log.Printf("  → Already in position, skipping")
 				continue
 			}
 
-			// ===== STEP 13: Calculate Position Size =====
-			// Size based on how extreme the price is
-			size := calculatePositionSize(distanceFromMiddle)
-			log.Printf("  → Entering reversion position with size $%.2f", size)
-
-			// ===== STEP 14: Enter Position (bet AGAINST the extreme) =====
-			question, _ := event.Metadata["question"].(string)
-			if question == "" {
-				question = "Unknown market"
+			// ===== STEP 13: Determine current price (mid preferred) =====
+			price := event.NewValue
+			if price <= 0 {
+				if mid, ok := latestMidOrTrade(ctx, sqlDB, event.TokenID); ok {
+					price = mid
+				} else {
+					log.Printf("Skipping %s — no price available", truncateID(event.TokenID, 8))
+					continue
+				}
 			}
 
-			// If price is high (>0.5), bet NO. If price is low (<0.5), bet YES
+			// ===== STEP 14: Decide side (bet against the extreme) =====
 			side := "YES"
-			if currentPrice > 0.5 {
+			if price > 0.5 {
 				side = "NO"
-				log.Printf("  → Price high (%.3f), betting NO for reversion", currentPrice)
-			} else {
-				log.Printf("  → Price low (%.3f), betting YES for reversion", currentPrice)
 			}
+
+			// ===== STEP 15: Compose reason & size =====
+			reason := "MeanReversion"
+			if hasZ {
+				reason += fmt.Sprintf(" z=%.2f", z)
+			}
+			if hasSpread {
+				reason += fmt.Sprintf(" spread=%.0fbps", spreadBps)
+			}
+			dist := abs(price - 0.5)
+			size := sizeFromExtremeness(dist, abs(z), hasZ)
 
 			position, err := trader.EnterPosition(ctx, paper_trading.Entry{
 				TokenID:  event.TokenID,
-				Market:   question,
+				Market:   strFromMeta(event.Metadata, "question", "Unknown market"),
 				Side:     side,
 				Size:     size,
-				Price:    event.NewValue,
-				Reason:   fmt.Sprintf("Mean reversion from %.3f", currentPrice),
+				Price:    price,
+				Reason:   reason,
 				Strategy: "mean_reversion",
 			})
 			if err != nil {
-				log.Printf("  → Failed to enter: %v", err)
+				log.Printf("Enter failed: %v", err)
 				continue
 			}
 
 			positionsEntered++
-			log.Printf("  ✓ ENTERED: %s %s at %.4f (position #%d)",
-				truncateID(event.TokenID, 8), side, event.NewValue, positionsEntered)
-
-			// ===== STEP 15: Track Position =====
-			positions[event.TokenID] = position
+			log.Printf("✓ ENTERED %s %s at %.4f (pos#%d) — %s",
+				truncateID(event.TokenID, 8), side, price, positionsEntered, reason)
 
 			// ===== STEP 16: Schedule Exit =====
 			go scheduleExit(ctx, trader, position, cfg.HoldPeriod)
@@ -221,37 +250,47 @@ func main() {
 	}
 }
 
-func calculatePositionSize(extremeness float64) float64 {
-	// ===== STEP 17: Size Based on How Extreme =====
-	baseSize := 100.0
-
-	if extremeness > 0.45 { // Price is 0.05 or 0.95
-		return baseSize * 3
-	} else if extremeness > 0.40 { // Price is 0.10 or 0.90
-		return baseSize * 2
+// ===== STEP 17: Sizing helper =====
+func sizeFromExtremeness(distFromMid, absZ float64, hasZ bool) float64 {
+	base := 100.0
+	boost := 1.0
+	// by distance from 0.5 (price)
+	switch {
+	case distFromMid >= 0.45:
+		boost *= 3
+	case distFromMid >= 0.40:
+		boost *= 2
+	case distFromMid >= 0.30:
+		boost *= 1.5
 	}
-	return baseSize
+	// by z-score if available
+	if hasZ {
+		switch {
+		case absZ >= 4.0:
+			boost *= 2.0
+		case absZ >= 3.0:
+			boost *= 1.5
+		}
+	}
+	return base * boost
 }
 
+// ===== STEP 18: Exit timer =====
 func scheduleExit(ctx context.Context, trader *paper_trading.Framework, position *paper_trading.Position, holdPeriod string) {
-	// ===== STEP 18: Parse Hold Period =====
-	duration, _ := time.ParseDuration(holdPeriod)
-
-	// ===== STEP 19: Wait for Hold Period =====
-	timer := time.NewTimer(duration)
+	dur, err := time.ParseDuration(holdPeriod)
+	if err != nil || dur <= 0 {
+		dur = 2 * time.Hour
+	}
+	timer := time.NewTimer(dur)
 	select {
 	case <-ctx.Done():
 		return
 	case <-timer.C:
-		// ===== STEP 20: Exit Position =====
-		// Assume partial reversion for testing
-		exitPrice := position.EntryPrice
-		if position.Side == "YES" {
-			exitPrice = position.EntryPrice + 0.05 // Moved up 5 cents
-		} else {
-			exitPrice = position.EntryPrice - 0.05 // Moved down 5 cents
+		// simple partial reversion placeholder (paper)
+		exitPrice := position.CurrentPrice
+		if exitPrice <= 0 {
+			exitPrice = position.EntryPrice
 		}
-
 		_, err := trader.ExitPosition(ctx, position.TokenID, exitPrice, "Hold period expired")
 		if err != nil {
 			log.Printf("Failed to exit %s: %v", truncateID(position.TokenID, 8), err)
@@ -261,9 +300,71 @@ func scheduleExit(ctx context.Context, trader *paper_trading.Framework, position
 	}
 }
 
+// ===== STEP 19: Small helpers (shared pattern with momentum) =====
+func getFloat(meta map[string]interface{}, key string) (float64, bool) {
+	if v, ok := meta[key]; ok {
+		switch x := v.(type) {
+		case float64:
+			return x, true
+		case json.Number:
+			if f, err := x.Float64(); err == nil {
+				return f, true
+			}
+		case string:
+			if f, err := strconvParseFloat(x); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func strFromMeta(meta map[string]interface{}, key, def string) string {
+	if v, ok := meta[key]; ok {
+		if s, ok2 := v.(string); ok2 && s != "" {
+			return s
+		}
+	}
+	return def
+}
+
 func abs(x float64) float64 {
 	if x < 0 {
 		return -x
 	}
 	return x
+}
+
+// ===== STEP 20: Price resolution helpers =====
+func latestMidOrTrade(ctx context.Context, db *sql.DB, token string) (float64, bool) {
+	// Try mid from latest quote
+	var bid, ask sql.NullFloat64
+	err := db.QueryRowContext(ctx, `
+		SELECT best_bid, best_ask
+		FROM market_quotes
+		WHERE token_id = $1
+		ORDER BY ts DESC
+		LIMIT 1
+	`, token).Scan(&bid, &ask)
+	if err == nil && bid.Valid && ask.Valid && bid.Float64 > 0 && ask.Float64 > 0 {
+		return (bid.Float64 + ask.Float64) / 2.0, true
+	}
+	// fallback to last trade price
+	var px sql.NullFloat64
+	err = db.QueryRowContext(ctx, `
+		SELECT price
+		FROM market_trades
+		WHERE token_id = $1
+		ORDER BY ts DESC
+		LIMIT 1
+	`, token).Scan(&px)
+	if err == nil && px.Valid && px.Float64 > 0 {
+		return px.Float64, true
+	}
+	return 0, false
+}
+
+// parse string to float64 (no import clutter up top)
+func strconvParseFloat(s string) (float64, error) {
+	return strconv.ParseFloat(s, 64)
 }

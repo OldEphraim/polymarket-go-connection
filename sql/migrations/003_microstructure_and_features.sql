@@ -1,7 +1,3 @@
--- 003_microstructure_and_features.sql
--- Adds microstructure tables (quotes, trades) and rolling features.
--- Converts key numeric columns to DOUBLE PRECISION.
-
 -- +goose Up
 BEGIN;
 

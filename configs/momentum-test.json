@@ -2,5 +2,9 @@
     "name": "momentum-test",
     "duration": "30m",
     "momentum_threshold": 0.03,
-    "hold_period": "5m"
+    "hold_period": "5m",
+    "max_spread_bps": 150,
+    "min_vol_surge": 1.5,
+    "min_abs_ret_1m": 0.005
+  
 }
