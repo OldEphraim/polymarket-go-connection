@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,148 +10,194 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/joho/godotenv"
 )
 
-type ServiceProcess struct {
-	Name   string
-	Cmd    *exec.Cmd
-	Config string
-	IsCore bool // Core services like gatherer must start first
+type child struct {
+	name      string
+	config    string
+	cmd       *exec.Cmd
+	crashBack time.Duration
+	cancel    context.CancelFunc
 }
 
 func main() {
-	godotenv.Load()
-
-	runType := flag.String("run", "test", "Run type (test, prod, etc.)")
-	useBinary := flag.Bool("binary", false, "Use compiled binaries")
+	runType := flag.String("run", getenv("RUN_TYPE", "prod"), "Run profile (prod, test, etc.)")
+	useBinary := flag.Bool("binary", true, "Use compiled binaries in /usr/local/bin")
+	include := flag.String("include", "", "Comma-separated strategy names to include (optional)")
+	exclude := flag.String("exclude", "", "Comma-separated strategy names to exclude (optional)")
+	configGlob := flag.String("config_glob", "configs/*-%s.json", "Glob for configs, %s replaced with run")
 	flag.Parse()
 
-	log.Printf("Starting orchestrator with run type: %s (binary mode: %v)", *runType, *useBinary)
+	log.Printf("[runner] starting (run=%s, binary=%v)", *runType, *useBinary)
+
+	glob := *configGlob
+	if strings.Contains(glob, "%s") {
+		glob = fmt.Sprintf(glob, *runType)
+	}
+	cfgs, err := filepath.Glob(glob)
+	if err != nil {
+		log.Fatalf("[runner] bad glob: %v", err)
+	}
+	if len(cfgs) == 0 {
+		log.Printf("[runner] no configs matched %q; nothing to do", glob)
+	}
+
+	inc := splitSet(*include)
+	exc := splitSet(*exclude)
+
+	// Resolve strategy name from config: "<name>-<run>.json" -> "<name>"
+	strategies := make([]child, 0, len(cfgs))
+	for _, cf := range cfgs {
+		base := filepath.Base(cf)
+		name := strings.SplitN(base, "-", 2)[0]
+		if len(inc) > 0 && !inc[name] {
+			continue
+		}
+		if exc[name] {
+			continue
+		}
+		strategies = append(strategies, child{name: name, config: base})
+	}
+	sort.Slice(strategies, func(i, j int) bool { return strategies[i].name < strategies[j].name })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// graceful shutdown
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var startOne func(*child)
 
-	// Start gatherer first
-	log.Println("Starting gatherer service...")
-	gathererCmd := exec.CommandContext(ctx, "gatherer")
-	gathererCmd.Stdout = os.Stdout
-	gathererCmd.Stderr = os.Stderr
+	startOne = func(ch *child) {
+		mu.Lock()
+		defer mu.Unlock()
 
-	if err := gathererCmd.Start(); err != nil {
-		log.Fatal("Failed to start gatherer:", err)
-	}
-	log.Printf("Gatherer started (PID: %d)", gathererCmd.Process.Pid)
-
-	// Wait for gatherer to initialize
-	time.Sleep(10 * time.Second)
-
-	// After starting gatherer, start the API server
-	log.Println("Starting API server...")
-	apiCmd := exec.CommandContext(ctx, "api") // You'll need to build this
-	apiCmd.Stdout = os.Stdout
-	apiCmd.Stderr = os.Stderr
-	apiCmd.Env = append(os.Environ(),
-		"API_KEY="+os.Getenv("API_KEY"),
-		"DATABASE_URL="+os.Getenv("DATABASE_URL"),
-	)
-
-	if err := apiCmd.Start(); err != nil {
-		log.Fatal("Failed to start API:", err)
-	}
-	log.Printf("API server started (PID: %d)", apiCmd.Process.Pid)
-
-	// Also wait for API
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		apiCmd.Wait()
-	}()
-
-	// Find and start strategies
-	configPattern := fmt.Sprintf("configs/*-%s.json", *runType)
-	configFiles, err := filepath.Glob(configPattern)
-	if err != nil {
-		log.Fatal("Failed to find config files:", err)
-	}
-
-	strategies := []ServiceProcess{}
-
-	for _, configFile := range configFiles {
-		baseName := filepath.Base(configFile)
-		parts := strings.Split(baseName, "-")
-		if len(parts) < 2 {
-			continue
+		if ch.cmd != nil && ch.cmd.Process != nil {
+			return // already running
 		}
-		strategyName := parts[0]
+
+		ctxChild, cancelChild := context.WithCancel(ctx)
+		ch.cancel = cancelChild
 
 		var cmd *exec.Cmd
 		if *useBinary {
-			binaryPath, err := exec.LookPath(strategyName)
-			if err != nil {
-				log.Printf("Strategy binary not found: %s", strategyName)
-				continue
-			}
-			cmd = exec.CommandContext(ctx, binaryPath, "--config", baseName)
-		} else {
-			strategyPath := fmt.Sprintf("./strategies/%s/main.go", strategyName)
-			if _, err := os.Stat(strategyPath); os.IsNotExist(err) {
-				continue
-			}
-			cmd = exec.CommandContext(ctx, "go", "run", strategyPath, "--config", baseName)
-		}
-
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		strategies = append(strategies, ServiceProcess{
-			Name:   strategyName,
-			Cmd:    cmd,
-			Config: baseName,
-		})
-
-		wg.Add(1)
-		go func(sp ServiceProcess) {
-			defer wg.Done()
-			time.Sleep(2 * time.Second)
-
-			if err := sp.Cmd.Start(); err != nil {
-				log.Printf("Failed to start %s: %v", sp.Name, err)
+			// binary named exactly the strategy (e.g., /usr/local/bin/momentum)
+			bin := ch.name
+			if _, err := exec.LookPath(bin); err != nil {
+				log.Printf("[runner] binary not found for %s: %v", ch.name, err)
 				return
 			}
+			cmd = exec.CommandContext(ctxChild, bin, "--config", ch.config)
+		} else {
+			// dev mode: run from source
+			path := fmt.Sprintf("./strategies/%s/main.go", ch.name)
+			cmd = exec.CommandContext(ctxChild, "go", "run", path, "--config", ch.config)
+		}
 
-			log.Printf("Started %s (PID: %d)", sp.Name, sp.Cmd.Process.Pid)
+		cmd.Stdout = prefixWriter(os.Stdout, ch.name)
+		cmd.Stderr = prefixWriter(os.Stderr, ch.name)
+		ch.cmd = cmd
 
-			if err := sp.Cmd.Wait(); err != nil {
-				log.Printf("Strategy %s exited: %v", sp.Name, err)
+		go func(c *child) {
+			log.Printf("[runner] starting %s (config=%s)", c.name, c.config)
+			err := c.cmd.Start()
+			if err != nil {
+				log.Printf("[runner] start failed %s: %v", c.name, err)
+				mu.Lock()
+				c.cmd = nil
+				mu.Unlock()
+				backoff(c)
+				return
 			}
-		}(strategies[len(strategies)-1])
+			waitErr := c.cmd.Wait()
+			mu.Lock()
+			c.cmd = nil
+			mu.Unlock()
+			if ctx.Err() != nil {
+				return // shutting down
+			}
+			if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+				log.Printf("[runner] %s crashed: %v", c.name, waitErr)
+				d := backoff(c)
+				go func() {
+					time.Sleep(d)
+					if ctx.Err() == nil {
+						startOne(c) // restart the same strategy
+					}
+				}()
+			}
+		}(ch)
 	}
 
-	// Wait for interrupt
-	go func() {
-		<-sigChan
-		log.Println("\nShutdown signal received...")
-		cancel()
-	}()
+	stopOne := func(ch *child) {
+		mu.Lock()
+		defer mu.Unlock()
+		if ch.cancel != nil {
+			ch.cancel()
+		}
+		if ch.cmd != nil && ch.cmd.Process != nil {
+			_ = ch.cmd.Process.Signal(syscall.SIGTERM)
+		}
+		ch.cmd = nil
+		ch.cancel = nil
+	}
 
-	// Also wait for gatherer
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		gathererCmd.Wait()
-	}()
+	// Start all
+	for i := range strategies {
+		startOne(&strategies[i])
+		time.Sleep(300 * time.Millisecond) // small stagger
+	}
 
-	wg.Wait()
-	log.Println("All services stopped")
+	// Block until signal
+	<-sigs
+	log.Printf("[runner] shutdown requested")
+	for i := range strategies {
+		stopOne(&strategies[i])
+	}
+	log.Printf("[runner] stopped")
+}
+
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func splitSet(csv string) map[string]bool {
+	if strings.TrimSpace(csv) == "" {
+		return nil
+	}
+	m := map[string]bool{}
+	for _, s := range strings.Split(csv, ",") {
+		m[strings.TrimSpace(s)] = true
+	}
+	return m
+}
+
+func prefixWriter(w *os.File, prefix string) *os.File {
+	// keep it simple; if you want strict prefixing per line, wrap with a custom writer
+	return w
+}
+
+func backoff(c *child) time.Duration {
+	if c.crashBack == 0 {
+		c.crashBack = time.Second
+	} else {
+		c.crashBack *= 2
+		if c.crashBack > 60*time.Second {
+			c.crashBack = 60 * time.Second
+		}
+	}
+	log.Printf("[runner] scheduling restart %s in %s", c.name, c.crashBack)
+	d := c.crashBack
+	c.crashBack = 0
+	return d
 }

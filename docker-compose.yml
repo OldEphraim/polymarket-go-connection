@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   postgres:
     image: postgres:14
@@ -7,42 +8,77 @@ services:
       POSTGRES_USER: a8garber
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - ./sql/schemas/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready"]
+      test: ["CMD-SHELL", "pg_isready -U a8garber -d polymarket_dev"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
-  app:
-    build: .
-    environment:
-      API_KEY: ${API_KEY}
-      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-      PRIVATE_KEY: ${PRIVATE_KEY}
-      RUN_TYPE: test 
+  # Run Goose migrations before others
+  migrator:
+    image: ghcr.io/pressly/goose:latest
     depends_on:
       postgres:
         condition: service_healthy
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
     volumes:
-      - ./configs:/app/configs:ro
+      - ./migrations:/migrations:ro
+    command: ["goose","-dir","/migrations","up"]
+    restart: "no"
+
+  gatherer:
+    build: .
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+      API_KEY: ${API_KEY}
+      RUN_TYPE: prod
+      # WS Flags (optional)
+      GATHERER_USE_WS: ${GATHERER_USE_WS:-true}
+      GATHERER_WS_URL: ${GATHERER_WS_URL:-wss://ws-subscriptions-clob.polymarket.com/ws/market}
+      GATHERER_SCAN_INTERVAL: ${GATHERER_SCAN_INTERVAL:-30s}
+      POLY_WS_DEBUG: ${POLY_WS_DEBUG:-0}
+      POLY_WS_LOG_UNKNOWN: ${POLY_WS_LOG_UNKNOWN:-0}
+    command: ["/usr/local/bin/gatherer"]
     restart: unless-stopped
-  
+
   api:
     build: .
-    command: ["/usr/local/bin/api"]
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       API_KEY: ${API_KEY}
       API_PORT: 8080
-    depends_on:
-      postgres:
-        condition: service_healthy
+    command: ["/usr/local/bin/api"]
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  strategies:
+    build: .
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+      RUN_TYPE: prod
+    command: ["/app/orchestrator", "--binary", "--run", "prod"]
+    volumes:
+      - ./configs:/app/configs:ro
     restart: unless-stopped
 
 volumes:

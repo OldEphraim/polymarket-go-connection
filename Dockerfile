@@ -27,8 +27,8 @@ RUN mkdir -p /app/bin && \
 FROM alpine:latest
 WORKDIR /app
 
-# Install PostgreSQL client for debugging
-RUN apk add --no-cache postgresql-client
+# Networking & TLS sanity
+RUN apk add --no-cache postgresql-client ca-certificates tzdata && update-ca-certificates
 
 # Copy the orchestrator
 COPY --from=go-builder /app/orchestrator /app/
@@ -41,6 +41,3 @@ COPY configs/ /app/configs/
 
 # Default to prod when running in Docker
 ENV RUN_TYPE=prod
-
-ENTRYPOINT ["/app/orchestrator", "--binary"]
-CMD ["--run", "test"]
