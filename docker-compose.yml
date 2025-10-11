@@ -19,16 +19,16 @@ services:
 
   # Run Goose migrations before others
   migrator:
-    image: ghcr.io/pressly/goose:latest
+    image: pressly/goose:latest   
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      GOOSE_DRIVER: postgres
       GOOSE_DBSTRING: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
     volumes:
       - ./migrations:/migrations:ro
-    command: ["goose","-dir","/migrations","up"]
+    working_dir: /migrations
+    command: ["-dir", "/migrations", "postgres", "postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable", "up"]
     restart: "no"
 
   gatherer:
