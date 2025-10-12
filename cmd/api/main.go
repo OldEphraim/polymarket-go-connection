@@ -101,55 +101,81 @@ func (s *APIServer) authenticate(next http.HandlerFunc) http.HandlerFunc {
 
 // GET /api/stats
 func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := s.reqCtx(r)
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
+	// Count active markets, events, open positions, total PnL.
+	// strategies_count is derived from *recent activity*: distinct sessions with orders in last 24h.
+	// Lags are MAX(ts) deltas with 0 fallback if table empty.
 	const q = `
-WITH q_lag AS (
-  SELECT COALESCE(EXTRACT(EPOCH FROM (now()-MAX(ts)))::bigint, -1) AS lag_sec
-  FROM market_quotes
-),
-t_lag AS (
-  SELECT COALESCE(EXTRACT(EPOCH FROM (now()-MAX(ts)))::bigint, -1) AS lag_sec
-  FROM market_trades
-),
-f_lag AS (
-  SELECT COALESCE(EXTRACT(EPOCH FROM (now()-MAX(ts)))::bigint, -1) AS lag_sec
-  FROM market_features
-)
+WITH
+  active_markets AS (
+    SELECT COUNT(*) AS n FROM market_scans WHERE is_active = TRUE
+  ),
+  events_24h AS (
+    SELECT COUNT(*) AS n FROM market_events WHERE detected_at > NOW() - INTERVAL '24 hours'
+  ),
+  positions AS (
+    SELECT
+      COALESCE(COUNT(*),0) AS open_positions,
+      COALESCE(SUM(unrealized_pnl),0) AS total_pnl
+    FROM paper_positions
+  ),
+  strategies_active AS (
+    -- Sessions that actually did something in the last 24h
+    SELECT COUNT(DISTINCT po.session_id) AS n
+    FROM paper_orders po
+    WHERE po.created_at > NOW() - INTERVAL '24 hours'
+  ),
+  quotes_lag AS (
+    SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_quotes
+  ),
+  trades_lag AS (
+    SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_trades
+  ),
+  features_lag AS (
+    SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_features
+  )
 SELECT
-  (SELECT COUNT(*) FROM market_scans WHERE is_active = true)                                 AS active_markets,
-  (SELECT COUNT(*) FROM market_events WHERE detected_at > now()-interval '24 hours')        AS events_24h,
-  (SELECT COUNT(DISTINCT token_id) FROM paper_positions)                                     AS open_positions,
-  (SELECT COALESCE(SUM(unrealized_pnl),0) FROM paper_positions)                              AS total_pnl,
-  (SELECT COUNT(DISTINCT s.name) FROM trading_sessions ts JOIN strategies s ON ts.strategy_id = s.id) AS strategies_count,
-  (SELECT lag_sec FROM q_lag)                                                                AS quotes_lag_sec,
-  (SELECT lag_sec FROM t_lag)                                                                AS trades_lag_sec,
-  (SELECT lag_sec FROM f_lag)                                                                AS features_lag_sec
+  (SELECT n FROM active_markets)                        AS active_markets,
+  (SELECT n FROM events_24h)                            AS events_24h,
+  (SELECT open_positions FROM positions)                AS open_positions,
+  (SELECT total_pnl FROM positions)                     AS total_pnl,
+  (SELECT n FROM strategies_active)                     AS strategies_count,
+  (SELECT sec FROM quotes_lag)                          AS quotes_lag_sec,
+  (SELECT sec FROM trades_lag)                          AS trades_lag_sec,
+  (SELECT sec FROM features_lag)                        AS features_lag_sec
 ;`
 
 	var out struct {
-		ActiveMarkets   int64   `json:"active_markets"`
-		Events24h       int64   `json:"events_24h"`
-		OpenPositions   int64   `json:"open_positions"`
-		TotalPnL        float64 `json:"total_pnl"`
-		StrategiesCount int64   `json:"strategies_count"`
-		QuotesLagSec    int64   `json:"quotes_lag_sec"`
-		TradesLagSec    int64   `json:"trades_lag_sec"`
-		FeaturesLagSec  int64   `json:"features_lag_sec"`
+		ActiveMarkets  int64   `json:"active_markets"`
+		Events24h      int64   `json:"events_24h"`
+		OpenPositions  int64   `json:"open_positions"`
+		TotalPnL       float64 `json:"total_pnl"`
+		Strategies     int64   `json:"strategies_count"`
+		QuotesLagSec   int64   `json:"quotes_lag_sec"`
+		TradesLagSec   int64   `json:"trades_lag_sec"`
+		FeaturesLagSec int64   `json:"features_lag_sec"`
 	}
 
 	row := s.db.QueryRowContext(ctx, q)
 	if err := row.Scan(
-		&out.ActiveMarkets, &out.Events24h, &out.OpenPositions, &out.TotalPnL, &out.StrategiesCount,
-		&out.QuotesLagSec, &out.TradesLagSec, &out.FeaturesLagSec,
+		&out.ActiveMarkets,
+		&out.Events24h,
+		&out.OpenPositions,
+		&out.TotalPnL,
+		&out.Strategies,
+		&out.QuotesLagSec,
+		&out.TradesLagSec,
+		&out.FeaturesLagSec,
 	); err != nil {
-		s.log.Error("getStats", "err", err)
-		writeErr(w, http.StatusInternalServerError, "query failed")
+		slog.Error("getStats", "err", err)
+		http.Error(w, "stats error", http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, out)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // GET /api/market-events  (now returns metadata too; safe interval)
