@@ -16,19 +16,16 @@ services:
       retries: 10
 
   migrator:
-    build: .                         # <-- use your app image (contains /usr/local/bin/goose)
+    build: .
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      # optional; we pass DSN on CLI anyway
       GOOSE_DRIVER: postgres
       GOOSE_DBSTRING: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
     volumes:
-      - ./migrations:/migrations:ro
-    working_dir: /migrations
-    # goose CLI: goose -dir /migrations postgres <DSN> up
-    command: ["/usr/local/bin/goose","-dir","/migrations","postgres","postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable","up"]
+      - ./sql/migrations:/migrations:ro
+    command: ["goose","-dir","/migrations","up"]
     restart: "no"
 
   gatherer:
