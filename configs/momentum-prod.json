@@ -1,6 +1,6 @@
 {
     "name": "momentum-test",
-    "duration": "30m",
+    "duration": "168h",
     "momentum_threshold": 0.03,
     "hold_period": "5m",
     "max_spread_bps": 150,

@@ -1,6 +1,6 @@
 {
     "name": "mean_reversion-test",
-    "duration": "48h",
+    "duration": "168h",
     "reversion_threshold": 0.25,
     "hold_period": "2h",
     "max_spread_bps": 150,
