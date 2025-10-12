@@ -85,7 +85,6 @@ func (c *polyWS) Run(
 		EnableCompression: true,
 	}
 
-	// ---- log what we’re subscribing to
 	if wsDebug {
 		first := assetIDs
 		if len(first) > 10 {
@@ -100,22 +99,19 @@ func (c *polyWS) Run(
 
 	conn, resp, err := dialer.Dial(url, nil)
 	if err != nil {
-		// Helpful body on 404 etc.
 		if resp != nil && wsDebug {
-			buf := make([]byte, 2048)
-			n, _ := resp.Body.Read(buf)
 			c.log.Warn("ws dial failed",
 				"url", url,
 				"status", resp.StatusCode,
 				"err", err,
-				"body", string(buf[:n]),
+				"body", tryReadBody(resp),
 			)
 		}
 		return err
 	}
 	defer conn.Close()
 
-	// Subscribe to MARKET channel
+	// Subscribe to MARKET channel (Polymarket expects "type":"market" + "assets_ids")
 	sub := map[string]any{
 		"type":       "market",
 		"assets_ids": assetIDs,
@@ -153,26 +149,24 @@ func (c *polyWS) Run(
 			return err
 		}
 
-		// optional: dump every frame
 		if wsDebug {
 			writeUnknown("frame", data)
 		}
 
-		// Handle PONG (text)
+		// PONGs are plain text
 		if typ == websocket.TextMessage && string(data) == "PONG" {
 			continue
 		}
 
 		var env map[string]json.RawMessage
 		if err := json.Unmarshal(data, &env); err != nil {
-			// dump unparseable
 			if wsLogUnknown {
 				writeUnknown("unmarshal_env", data)
 			}
 			continue
 		}
 
-		// find the event type (may be "type", "event", or "event_type")
+		// Event discriminator can be "type", "event", or "event_type"
 		et := readString(env, "type")
 		if et == "" {
 			et = readString(env, "event")
@@ -203,10 +197,7 @@ func (c *polyWS) Run(
 				}
 				continue
 			}
-			asset := strings.TrimSpace(b.TokenID)
-			if asset == "" {
-				asset = strings.TrimSpace(b.AssetID)
-			}
+			asset := strings.TrimSpace(firstNonEmpty(b.TokenID, b.AssetID))
 			if asset == "" {
 				if wsLogUnknown {
 					writeUnknown("book_no_asset", data)
@@ -214,32 +205,25 @@ func (c *polyWS) Run(
 				continue
 			}
 			bestBid, bestAsk := topOfBook(b.Bids), topOfBook(b.Asks)
-			// emit only when both sides exist
 			if bestBid > 0 && bestAsk > 0 && onQuote != nil {
-				ts := time.Now()
-				onQuote(asset, bestBid, bestAsk, ts)
+				onQuote(asset, bestBid, bestAsk, time.Now())
 			}
 
 		case "price_change":
-			// Polymarket Gamma sends price_change as a TOP-LEVEL object
+			// Variant A (common now): top-level payload with price_changes array
 			var gpc gammaPriceChange
 			if err := json.Unmarshal(data, &gpc); err == nil && len(gpc.PriceChanges) > 0 {
-				// parse timestamp (ms in a string)
 				ts := time.Now()
-				if ms, err := strconv.ParseInt(gpc.Timestamp, 10, 64); err == nil && ms > 0 {
+				if ms, err := strconv.ParseInt(strings.TrimSpace(gpc.Timestamp), 10, 64); err == nil && ms > 0 {
 					ts = time.Unix(0, ms*int64(time.Millisecond))
 				}
-
 				for _, ch := range gpc.PriceChanges {
 					bid := f64s(ch.BestBid)
 					ask := f64s(ch.BestAsk)
-
-					// 1) QUOTE: only when both sides exist
 					if onQuote != nil && bid > 0 && ask > 0 {
 						onQuote(ch.AssetID, bid, ask, ts)
 					}
-
-					// 2) TRADE: when size>0 and price>0
+					// Opportunistic trade from price_change if present
 					price := f64s(ch.Price)
 					size := f64s(ch.Size)
 					if onTrade != nil && price > 0 && size > 0 {
@@ -249,7 +233,7 @@ func (c *polyWS) Run(
 				break
 			}
 
-			// Fallback to your older nested shape, if Polymarket ever sends it
+			// Variant B: nested data/payload with { token_id, price_changes: [{best_bid,best_ask}] }
 			raw := firstPresent(env["data"], env["payload"])
 			if len(raw) == 0 {
 				if wsLogUnknown {
@@ -272,9 +256,15 @@ func (c *polyWS) Run(
 				}
 			}
 
-		// ---- NEW: accept multiple trade variants
+		// trades can arrive with several labels
 		case "last_trade_price", "last_trade", "trade", "trades":
+			// payload may be in data/payload OR top-level "trades"
 			raw := firstPresent(env["data"], env["payload"])
+			if len(raw) == 0 {
+				if v, ok := env["trades"]; ok {
+					raw = v
+				}
+			}
 			if len(raw) == 0 {
 				if wsLogUnknown {
 					writeUnknown("trade_no_payload", data)
@@ -282,7 +272,14 @@ func (c *polyWS) Run(
 				continue
 			}
 
-			// Use tolerant extractor (handles many shapes)
+			// Extract a fallback frame timestamp (if present)
+			fallbackTS := time.Now()
+			if s := readString(env, "timestamp"); s != "" {
+				if ms, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil && ms > 0 {
+					fallbackTS = time.Unix(0, ms*int64(time.Millisecond))
+				}
+			}
+
 			trades := extractTrades(raw, data)
 			if len(trades) == 0 {
 				if wsLogUnknown {
@@ -295,19 +292,13 @@ func (c *polyWS) Run(
 				for _, t := range trades {
 					ts := t.ts
 					if ts.IsZero() {
-						ts = time.Now()
+						ts = fallbackTS
 					}
 					onTrade(t.assetID, t.price, t.side, t.size, ts)
 				}
 			}
 
-			// unknown trade shape → write it
-			if wsLogUnknown {
-				writeUnknown(fmt.Sprintf("trade_unknown_%s", et), data)
-			}
-
 		default:
-			// only stash unknowns if asked
 			if wsLogUnknown {
 				writeUnknown("unknown_event_"+et, data)
 			}
@@ -337,7 +328,7 @@ func ioReadAllN(r io.ReadCloser, n int) ([]byte, error) {
 			total += k
 		}
 		if err != nil {
-			if errors.Is(err, os.ErrClosed) {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return buf, nil
@@ -351,13 +342,6 @@ func firstPresent(a, b json.RawMessage) json.RawMessage {
 		return a
 	}
 	return b
-}
-
-func trim(b []byte, max int) string {
-	if len(b) <= max {
-		return string(b)
-	}
-	return string(b[:max]) + "...(" + strconv.Itoa(len(b)) + " bytes)"
 }
 
 func readString(m map[string]json.RawMessage, key string) string {
@@ -382,9 +366,9 @@ func firstNonEmpty(ss ...string) string {
 // ---- book / quotes ----
 
 type bookMsg struct {
-	TokenID string               `json:"token_id"` // also seen as asset_id
+	TokenID string               `json:"token_id"`
 	AssetID string               `json:"asset_id"`
-	Bids    [][2]json.RawMessage `json:"bids"` // [["0.52","100"], ...] as strings
+	Bids    [][2]json.RawMessage `json:"bids"` // [["0.52","100"], ...]
 	Asks    [][2]json.RawMessage `json:"asks"`
 }
 
@@ -392,20 +376,20 @@ func topOfBook(levels [][2]json.RawMessage) float64 {
 	if len(levels) == 0 || len(levels[0]) < 1 {
 		return 0
 	}
-	// Polymarket often sends strings; be permissive
+	// Commonly strings; try string → float
 	var s string
 	if err := json.Unmarshal(levels[0][0], &s); err == nil {
 		if f, err := strconv.ParseFloat(s, 64); err == nil {
 			return f
 		}
 	}
-	// Try numeric directly
+	// Fallback numeric
 	var f float64
 	_ = json.Unmarshal(levels[0][0], &f)
 	return f
 }
 
-// ---- price_change (best bid/ask deltas) ----
+// ---- price_change (two shapes) ----
 
 type priceChangeMsg struct {
 	TokenID string       `json:"token_id"`
@@ -414,6 +398,16 @@ type priceChangeMsg struct {
 type bestChange struct {
 	BestBid float64 `json:"best_bid"`
 	BestAsk float64 `json:"best_ask"`
+}
+
+type gammaChange struct {
+	AssetID string `json:"asset_id"`
+	Price   string `json:"price"`
+	Size    string `json:"size"`
+	Side    string `json:"side"` // "BUY"/"SELL"
+	Hash    string `json:"hash"`
+	BestBid string `json:"best_bid"`
+	BestAsk string `json:"best_ask"`
 }
 
 // ---- tolerant trade extraction ----
@@ -426,10 +420,10 @@ type tradeOut struct {
 	ts      time.Time
 }
 
-func extractTrades(raw json.RawMessage, whole []byte) []tradeOut {
+func extractTrades(raw json.RawMessage, _whole []byte) []tradeOut {
 	var out []tradeOut
 
-	// 1) If it's an array, try each element as a trade-ish map
+	// 1) Array of objects
 	var arr []map[string]any
 	if json.Unmarshal(raw, &arr) == nil && len(arr) > 0 {
 		for _, m := range arr {
@@ -442,20 +436,20 @@ func extractTrades(raw json.RawMessage, whole []byte) []tradeOut {
 		}
 	}
 
-	// 2) Object wrapper: may have "trade" or "trades" or be the trade itself
+	// 2) Single object / wrappers
 	var obj map[string]any
 	if json.Unmarshal(raw, &obj) == nil {
-		// a) direct
+		// direct
 		if t, ok := tradeFromAnyMap(obj); ok {
 			out = append(out, t)
 		}
-		// b) nested "trade"
+		// nested "trade"
 		if m, ok := obj["trade"].(map[string]any); ok {
 			if t, ok := tradeFromAnyMap(m); ok {
 				out = append(out, t)
 			}
 		}
-		// c) nested "trades"
+		// nested "trades"
 		if xs, ok := obj["trades"].([]any); ok {
 			for _, el := range xs {
 				if m, ok := el.(map[string]any); ok {
@@ -465,12 +459,7 @@ func extractTrades(raw json.RawMessage, whole []byte) []tradeOut {
 				}
 			}
 		}
-		// d) nested "data"/"payload" as arrays
-		if m, ok := obj["data"].(map[string]any); ok {
-			if t, ok := tradeFromAnyMap(m); ok {
-				out = append(out, t)
-			}
-		}
+		// nested arrays under "data" / "payload"
 		if xs, ok := obj["data"].([]any); ok {
 			for _, el := range xs {
 				if m, ok := el.(map[string]any); ok {
@@ -478,11 +467,6 @@ func extractTrades(raw json.RawMessage, whole []byte) []tradeOut {
 						out = append(out, t)
 					}
 				}
-			}
-		}
-		if m, ok := obj["payload"].(map[string]any); ok {
-			if t, ok := tradeFromAnyMap(m); ok {
-				out = append(out, t)
 			}
 		}
 		if xs, ok := obj["payload"].([]any); ok {
@@ -500,13 +484,12 @@ func extractTrades(raw json.RawMessage, whole []byte) []tradeOut {
 }
 
 func tradeFromAnyMap(m map[string]any) (tradeOut, bool) {
-	// Try common IDs
+	// asset id
 	asset := strAny(m["token_id"])
 	if asset == "" {
 		asset = strAny(m["asset_id"])
 	}
 	if asset == "" {
-		// sometimes nested market
 		if mm, ok := m["market"].(map[string]any); ok {
 			asset = strAny(mm["token_id"])
 			if asset == "" {
@@ -515,13 +498,13 @@ func tradeFromAnyMap(m map[string]any) (tradeOut, bool) {
 		}
 	}
 
-	// Price: "price" or short "p"
+	// price
 	price := fAny(m["price"])
 	if price == 0 {
 		price = fAny(m["p"])
 	}
 
-	// Size/qty: "size", "quantity", short "q"
+	// size / quantity
 	size := fAny(m["size"])
 	if size == 0 {
 		size = fAny(m["quantity"])
@@ -530,7 +513,7 @@ func tradeFromAnyMap(m map[string]any) (tradeOut, bool) {
 		size = fAny(m["q"])
 	}
 
-	// Side/aggressor: "side", "taker_side", "aggressor", also normalize ask/bid
+	// side
 	side := strAny(m["side"])
 	if side == "" {
 		side = strAny(m["taker_side"])
@@ -540,15 +523,14 @@ func tradeFromAnyMap(m map[string]any) (tradeOut, bool) {
 	}
 	side = normSide(side)
 
-	// Timestamp: millis "timestamp" or "timestamp_ms" or "ts"
+	// timestamp(s)
 	ts := time.Time{}
 	if v := iAny(m["timestamp"]); v > 0 {
 		ts = time.Unix(0, v*int64(time.Millisecond))
 	} else if v := iAny(m["timestamp_ms"]); v > 0 {
 		ts = time.Unix(0, v*int64(time.Millisecond))
 	} else if v := iAny(m["ts"]); v > 0 {
-		// some feeds use seconds
-		if v > 1_000_000_000_000 { // looks like ms
+		if v > 1_000_000_000_000 {
 			ts = time.Unix(0, v*int64(time.Millisecond))
 		} else {
 			ts = time.Unix(v, 0)
@@ -562,7 +544,6 @@ func tradeFromAnyMap(m map[string]any) (tradeOut, bool) {
 		side:    side,
 		ts:      ts,
 	}
-	// minimally require asset, price, size, side
 	if t.assetID == "" || t.price <= 0 || t.size <= 0 || t.side == "" {
 		return tradeOut{}, false
 	}
@@ -594,7 +575,7 @@ func fAny(v any) float64 {
 		f, _ := x.Float64()
 		return f
 	case string:
-		if f, err := strconv.ParseFloat(x, 64); err == nil {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(x), 64); err == nil {
 			return f
 		}
 	}
@@ -609,7 +590,7 @@ func iAny(v any) int64 {
 		i, _ := x.Int64()
 		return i
 	case string:
-		if i, err := strconv.ParseInt(x, 10, 64); err == nil {
+		if i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64); err == nil {
 			return i
 		}
 	}
@@ -628,8 +609,7 @@ func normSide(s string) string {
 	}
 }
 
-// f64s converts string to float64
 func f64s(s string) float64 {
-	f, _ := strconv.ParseFloat(s, 64)
+	f, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	return f
 }

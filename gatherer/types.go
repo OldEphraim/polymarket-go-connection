@@ -103,10 +103,11 @@ type RecordMarketEventParams struct {
 
 // Gamma /ws/market price_change frame (top-level, numbers as strings)
 type gammaPriceChange struct {
-	Market       string          `json:"market"`
-	PriceChanges []gammaPCChange `json:"price_changes"`
-	Timestamp    string          `json:"timestamp"`  // ms as string
-	EventType    string          `json:"event_type"` // "price_change"
+	Market       string            `json:"market"`
+	PriceChanges []gammaPCChange   `json:"price_changes"`
+	Timestamp    string            `json:"timestamp"`  // ms as string
+	EventType    string            `json:"event_type"` // "price_change"
+	Extra        map[string]string `json:"extra,omitempty"`
 }
 
 type gammaPCChange struct {
