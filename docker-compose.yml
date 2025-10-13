@@ -22,7 +22,7 @@ services:
         condition: service_healthy
     volumes:
       - ./sql/migrations:/migrations:ro
-    command: ["goose", "-dir", "/migrations", "postgres", "postgresql://a8garber:Grimsvotn1783@postgres:5432/polymarket_dev?sslmode=disable", "up"]
+    command: ["goose", "-dir", "/migrations", "postgres", "postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable", "up"]
     restart: "no"
 
   gatherer:
@@ -83,15 +83,7 @@ services:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
       AWS_REGION: ${AWS_REGION:-us-east-1}
-      # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY both set using IAM role
-    entrypoint: ["/bin/sh","-lc"]
-    command: |
-      while true; do
-        /usr/local/bin/archiver -table market_features -prefix market_features || true
-        /usr/local/bin/archiver -table market_trades   -prefix market_trades   || true
-        /usr/local/bin/archiver -table market_quotes   -prefix market_quotes   || true
-        sleep 300
-      done
+    command: ["/bin/sh", "-c", "while true; do /usr/local/bin/archiver -table market_features || true; /usr/local/bin/archiver -table market_trades || true; /usr/local/bin/archiver -table market_quotes || true; sleep 300; done"]
     restart: unless-stopped
 
   janitor:
@@ -101,15 +93,7 @@ services:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-    entrypoint: ["/bin/sh","-lc"]
-    command: |
-      while true; do
-        # keep a 6h hot window in Postgres
-        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT delete_exported_hours_features('6 hours');"
-        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT delete_exported_hours_trades('6 hours');"
-        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT delete_exported_hours_quotes('6 hours');"
-        sleep 600
-      done
+    command: ["/bin/sh", "-c", "while true; do /usr/local/bin/janitor -tables features,trades,quotes; sleep 600; done"]
     restart: unless-stopped
 
 volumes:
