@@ -74,17 +74,14 @@ services:
       - ./configs:/app/configs:ro
     restart: unless-stopped
 
-  archiver:
-    build: .
-    depends_on:
-      migrator:
-        condition: service_completed_successfully
-    environment:
-      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-      ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
-      AWS_REGION: ${AWS_REGION:-us-east-1}
-    command: ["/bin/sh", "-c", "while true; do /usr/local/bin/archiver -table market_features || true; /usr/local/bin/archiver -table market_trades || true; /usr/local/bin/archiver -table market_quotes || true; sleep 300; done"]
-    restart: unless-stopped
+archiver:
+  build: .
+  environment:
+    DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+    ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
+    AWS_REGION: ${AWS_REGION}
+  command: ["/bin/sh", "-c", "while true; do /usr/local/bin/archiver -table market_features -backfill || /usr/local/bin/archiver -table market_features || true; /usr/local/bin/archiver -table market_trades -backfill || /usr/local/bin/archiver -table market_trades || true; /usr/local/bin/archiver -table market_quotes -backfill || /usr/local/bin/archiver -table market_quotes || true; sleep 300; done"]
+  restart: unless-stopped
 
   janitor:
     build: .

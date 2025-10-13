@@ -28,11 +28,11 @@ type HourWindow struct {
 
 func main() {
 	var (
-		table  = flag.String("table", "", "Table to export: market_features | market_trades | market_quotes (required)")
-		prefix = flag.String("prefix", "", "S3 prefix (defaults to table name)")
-		// optionally allow override of hour for backfills (UTC, format 2006-01-02T15)
-		hourStr = flag.String("hour", "", "UTC hour to export (e.g. 2025-10-12T00). Default = last closed hour")
-		timeout = flag.Duration("timeout", 10*time.Minute, "Overall timeout per export")
+		table    = flag.String("table", "", "Table to export: market_features | market_trades | market_quotes (required)")
+		prefix   = flag.String("prefix", "", "S3 prefix (defaults to table name)")
+		hourStr  = flag.String("hour", "", "UTC hour to export (e.g. 2025-10-12T00). Default = last closed hour")
+		backfill = flag.Bool("backfill", false, "Backfill mode: process oldest unarchived hour")
+		timeout  = flag.Duration("timeout", 10*time.Minute, "Overall timeout per export")
 	)
 	flag.Parse()
 
@@ -71,13 +71,30 @@ func main() {
 	}
 	s3c := s3.NewFromConfig(awsCfg)
 
-	win := lastClosedHourUTC()
+	var win HourWindow
+
 	if *hourStr != "" {
+		// Explicit hour specified
 		t, err := time.Parse("2006-01-02T15", *hourStr)
 		if err != nil {
 			log.Fatalf("bad -hour: %v", err)
 		}
 		win = HourWindow{Start: t.UTC(), End: t.UTC().Add(time.Hour)}
+	} else if *backfill {
+		// Backfill mode: find oldest unarchived hour
+		oldest, err := findOldestUnarchivedHour(ctx, db, *table)
+		if err != nil {
+			log.Fatalf("finding oldest unarchived: %v", err)
+		}
+		if oldest == nil {
+			log.Printf("All historical data archived for %s", *table)
+			return
+		}
+		win = *oldest
+		log.Printf("Backfilling %s from %s", *table, win.Start.Format(time.RFC3339))
+	} else {
+		// Default: last closed hour
+		win = lastClosedHourUTC()
 	}
 
 	// S3 key layout: <prefix>/dt=YYYY-MM-DD/hour=HH/part-00000.json.gz
@@ -132,6 +149,44 @@ func main() {
 	_ = markArchiveDone(ctx, db, *table, win, key, n, byteSize)
 	log.Printf("ok: archived %s hour=%s rows=%d bytes=%d s3://%s/%s",
 		*table, win.Start.Format("2006-01-02T15"), n, byteSize, bucket, key)
+}
+
+func findOldestUnarchivedHour(ctx context.Context, db *sql.DB, table string) (*HourWindow, error) {
+	var oldestTS sql.NullTime
+
+	// Find the oldest hour that hasn't been archived yet
+	q := fmt.Sprintf(`
+		WITH hourly_data AS (
+			SELECT date_trunc('hour', ts) as hour, COUNT(*) as cnt
+			FROM %s
+			GROUP BY 1
+		)
+		SELECT MIN(hour) 
+		FROM hourly_data hd
+		WHERE NOT EXISTS (
+			SELECT 1 FROM archive_jobs aj
+			WHERE aj.table_name = $1
+			AND aj.status = 'done'
+			AND hd.hour >= aj.ts_start
+			AND hd.hour < aj.ts_end
+		)`, table)
+
+	err := db.QueryRowContext(ctx, q, table).Scan(&oldestTS)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Everything is archived
+		}
+		return nil, err
+	}
+
+	if !oldestTS.Valid {
+		return nil, nil // No unarchived data
+	}
+
+	return &HourWindow{
+		Start: oldestTS.Time,
+		End:   oldestTS.Time.Add(time.Hour),
+	}, nil
 }
 
 func lastClosedHourUTC() HourWindow {
