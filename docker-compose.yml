@@ -20,8 +20,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      # Environment removed, explicit connection strings being used
     volumes:
       - ./sql/migrations:/migrations:ro
     entrypoint: ["/bin/sh","-c"]
