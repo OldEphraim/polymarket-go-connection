@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict y5qM4HEmGhhINKK2g1eLaNfEG3i36rqrSDGQLPuJ6kJahvmveYcLLtcLIksWGc0
+\restrict kdVmzA19SGDoGvPQZLMf7Gt8VrvHUvVg1FbWa8ktEflTbmJQ9BfAaZzeBK1Ff3u
 
 -- Dumped from database version 14.19 (Homebrew)
 -- Dumped by pg_dump version 14.19 (Homebrew)
@@ -244,7 +244,8 @@ CREATE TABLE public.market_features (
     broke_low_15m boolean,
     time_to_resolve_h double precision,
     signed_flow_1m double precision
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02');
 
 
 --
@@ -261,7 +262,8 @@ CREATE TABLE public.market_quotes (
     ask_size1 double precision,
     spread_bps double precision,
     mid double precision
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02');
 
 
 --
@@ -379,7 +381,8 @@ CREATE TABLE public.market_trades (
     aggressor text,
     trade_id text,
     CONSTRAINT market_trades_aggressor_check CHECK ((aggressor = ANY (ARRAY['buy'::text, 'sell'::text])))
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02');
 
 
 --
@@ -969,5 +972,5 @@ ALTER TABLE ONLY public.trading_sessions
 -- PostgreSQL database dump complete
 --
 
-\unrestrict y5qM4HEmGhhINKK2g1eLaNfEG3i36rqrSDGQLPuJ6kJahvmveYcLLtcLIksWGc0
+\unrestrict kdVmzA19SGDoGvPQZLMf7Gt8VrvHUvVg1FbWa8ktEflTbmJQ9BfAaZzeBK1Ff3u
 

@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"flag"
+	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -81,5 +83,35 @@ func call(ctx context.Context, db *sql.DB, sqlstmt, window string) {
 		log.Printf("janitor call failed (%s): %v", sqlstmt, err)
 		return
 	}
-	log.Printf("janitor %s → deleted %d rows", sqlstmt, deleted) // Show actual count
+	log.Printf("janitor %s → deleted %d rows", sqlstmt, deleted)
+
+	// If we deleted significant data, run a gentle vacuum
+	if deleted > 10000 {
+		tableName := extractTableName(sqlstmt)
+		vacuumTable(ctx, db, tableName)
+	}
+}
+
+func extractTableName(sqlstmt string) string {
+	if strings.Contains(sqlstmt, "features") {
+		return "market_features"
+	} else if strings.Contains(sqlstmt, "trades") {
+		return "market_trades"
+	} else if strings.Contains(sqlstmt, "quotes") {
+		return "market_quotes"
+	}
+	return ""
+}
+
+func vacuumTable(ctx context.Context, db *sql.DB, table string) {
+	if table == "" {
+		return
+	}
+	// Regular VACUUM (not FULL) - non-blocking, just marks space as reusable
+	_, err := db.ExecContext(ctx, fmt.Sprintf("VACUUM ANALYZE %s", table))
+	if err != nil {
+		log.Printf("vacuum failed for %s: %v", table, err)
+	} else {
+		log.Printf("vacuumed %s successfully", table)
+	}
 }
