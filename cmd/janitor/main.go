@@ -37,10 +37,8 @@ func main() {
 		case "features":
 			call(ctx, db, "SELECT delete_exported_hours_features($1)", *window)
 		case "trades":
-			// add this once you create the function in a migration
 			call(ctx, db, "SELECT delete_exported_hours_trades($1)", *window)
 		case "quotes":
-			// add this once you create the function in a migration
 			call(ctx, db, "SELECT delete_exported_hours_quotes($1)", *window)
 		default:
 			log.Printf("skip unknown table: %s", t)
@@ -78,11 +76,10 @@ func trim(s string) string {
 }
 
 func call(ctx context.Context, db *sql.DB, sqlstmt, window string) {
-	var ok bool
-	if err := db.QueryRowContext(ctx, sqlstmt, window).Scan(&ok); err != nil {
-		// If function is missing, just log and continue
+	var deleted int64
+	if err := db.QueryRowContext(ctx, sqlstmt, window).Scan(&deleted); err != nil {
 		log.Printf("janitor call failed (%s): %v", sqlstmt, err)
 		return
 	}
-	log.Printf("janitor %s → %v", sqlstmt, ok)
+	log.Printf("janitor %s → deleted %d rows", sqlstmt, deleted) // Show actual count
 }
