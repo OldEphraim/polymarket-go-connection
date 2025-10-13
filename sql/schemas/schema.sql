@@ -1,112 +1,973 @@
--- Current schema state for polymarket_dev
--- Last updated: Migration 002
+--
+-- PostgreSQL database dump
+--
 
--- From Migration 001
-CREATE TABLE markets (
-    id SERIAL PRIMARY KEY,
-    token_id VARCHAR(80) UNIQUE NOT NULL,
-    slug VARCHAR(255),
-    question TEXT,
-    outcome VARCHAR(50),
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+\restrict y5qM4HEmGhhINKK2g1eLaNfEG3i36rqrSDGQLPuJ6kJahvmveYcLLtcLIksWGc0
+
+-- Dumped from database version 14.19 (Homebrew)
+-- Dumped by pg_dump version 14.19 (Homebrew)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: delete_exported_hours_features(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.delete_exported_hours_features(p_window text) RETURNS bigint
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  cutoff TIMESTAMPTZ;
+  n BIGINT;
+BEGIN
+  cutoff := NOW() - (p_window::interval);
+
+  WITH gone AS (
+    DELETE FROM market_features mf
+    USING archive_jobs aj
+    WHERE aj.table_name = 'market_features'
+      AND aj.status = 'done'
+      AND aj.ts_start < cutoff
+      AND mf.ts >= aj.ts_start
+      AND mf.ts <  aj.ts_end
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO n FROM gone;
+
+  PERFORM pg_notify(
+    'janitor',
+    json_build_object('table','market_features','deleted',n,'cutoff',cutoff)::text
+  );
+
+  RETURN n;
+END
+$$;
+
+
+--
+-- Name: delete_exported_hours_quotes(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.delete_exported_hours_quotes(p_window text) RETURNS bigint
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  cutoff TIMESTAMPTZ;
+  n BIGINT;
+BEGIN
+  cutoff := NOW() - (p_window::interval);
+
+  WITH gone AS (
+    DELETE FROM market_quotes q
+    USING archive_jobs aj
+    WHERE aj.table_name = 'market_quotes'
+      AND aj.status = 'done'
+      AND aj.ts_start < cutoff
+      AND q.ts >= aj.ts_start
+      AND q.ts <  aj.ts_end
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO n FROM gone;
+
+  PERFORM pg_notify(
+    'janitor',
+    json_build_object('table','market_quotes','deleted',n,'cutoff',cutoff)::text
+  );
+
+  RETURN n;
+END
+$$;
+
+
+--
+-- Name: delete_exported_hours_trades(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.delete_exported_hours_trades(p_window text) RETURNS bigint
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  cutoff TIMESTAMPTZ;
+  n BIGINT;
+BEGIN
+  cutoff := NOW() - (p_window::interval);
+
+  WITH gone AS (
+    DELETE FROM market_trades t
+    USING archive_jobs aj
+    WHERE aj.table_name = 'market_trades'
+      AND aj.status = 'done'
+      AND aj.ts_start < cutoff
+      AND t.ts >= aj.ts_start
+      AND t.ts <  aj.ts_end
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO n FROM gone;
+
+  PERFORM pg_notify(
+    'janitor',
+    json_build_object('table','market_trades','deleted',n,'cutoff',cutoff)::text
+  );
+
+  RETURN n;
+END
+$$;
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: archive_jobs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.archive_jobs (
+    id bigint NOT NULL,
+    table_name text NOT NULL,
+    ts_start timestamp with time zone NOT NULL,
+    ts_end timestamp with time zone NOT NULL,
+    s3_key text NOT NULL,
+    row_count bigint NOT NULL,
+    bytes_written bigint NOT NULL,
+    status text DEFAULT 'done'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT archive_jobs_time_ok CHECK ((ts_end > ts_start))
 );
 
-CREATE TABLE strategies (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL,
-    config JSONB NOT NULL DEFAULT '{}',
-    initial_balance DECIMAL(15, 6) DEFAULT 1000.00,
-    active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT NOW()
+
+--
+-- Name: archive_jobs_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.archive_jobs_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: archive_jobs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.archive_jobs_id_seq OWNED BY public.archive_jobs.id;
+
+
+--
+-- Name: goose_db_version; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.goose_db_version (
+    id integer NOT NULL,
+    version_id bigint NOT NULL,
+    is_applied boolean NOT NULL,
+    tstamp timestamp without time zone DEFAULT now() NOT NULL
 );
 
-CREATE TABLE trading_sessions (
-    id SERIAL PRIMARY KEY,
-    strategy_id INTEGER REFERENCES strategies(id),
-    start_balance DECIMAL(15, 6),
-    current_balance DECIMAL(15, 6),
-    started_at TIMESTAMP DEFAULT NOW(),
-    ended_at TIMESTAMP
+
+--
+-- Name: goose_db_version_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.goose_db_version ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.goose_db_version_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
 );
 
-CREATE TABLE market_signals (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES trading_sessions(id),
-    token_id VARCHAR(80) NOT NULL,
-    signal_type VARCHAR(50) NOT NULL,
-    timestamp TIMESTAMP DEFAULT NOW(),
-    best_bid DECIMAL(10, 6),
-    best_ask DECIMAL(10, 6),
-    bid_liquidity DECIMAL(15, 6),
-    ask_liquidity DECIMAL(15, 6),
-    action_reason TEXT,
-    confidence DECIMAL(5, 2)
+
+--
+-- Name: market_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_events (
+    id integer NOT NULL,
+    token_id character varying(80) NOT NULL,
+    event_type character varying(50),
+    old_value double precision,
+    new_value double precision,
+    metadata jsonb,
+    detected_at timestamp with time zone DEFAULT now()
 );
 
-CREATE TABLE paper_orders (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES trading_sessions(id),
-    signal_id INTEGER REFERENCES market_signals(id),
-    token_id VARCHAR(80) NOT NULL,
-    side VARCHAR(10) NOT NULL,
-    price DECIMAL(10, 6) NOT NULL,
-    size DECIMAL(15, 6) NOT NULL,
-    status VARCHAR(20) DEFAULT 'open',
-    created_at TIMESTAMP DEFAULT NOW(),
-    filled_at TIMESTAMP
+
+--
+-- Name: market_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.market_events_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: market_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.market_events_id_seq OWNED BY public.market_events.id;
+
+
+--
+-- Name: market_features; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_features (
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    ret_1m double precision,
+    ret_5m double precision,
+    vol_1m double precision,
+    avg_vol_5m double precision,
+    sigma_5m double precision,
+    zscore_5m double precision,
+    imbalance_top double precision,
+    spread_bps double precision,
+    broke_high_15m boolean,
+    broke_low_15m boolean,
+    time_to_resolve_h double precision,
+    signed_flow_1m double precision
 );
 
-CREATE TABLE paper_positions (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES trading_sessions(id),
-    token_id VARCHAR(80) NOT NULL,
-    shares DECIMAL(15, 6) NOT NULL,
-    avg_entry_price DECIMAL(10, 6),
-    current_price DECIMAL(10, 6),
-    unrealized_pnl DECIMAL(15, 6),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(session_id, token_id)
+
+--
+-- Name: market_quotes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_quotes (
+    id bigint NOT NULL,
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone DEFAULT now() NOT NULL,
+    best_bid double precision,
+    best_ask double precision,
+    bid_size1 double precision,
+    ask_size1 double precision,
+    spread_bps double precision,
+    mid double precision
 );
 
--- From Migration 002
-CREATE TABLE market_scans (
-    id SERIAL PRIMARY KEY,
-    token_id VARCHAR(80) UNIQUE NOT NULL,
-    event_id VARCHAR(255),
-    slug VARCHAR(255),
-    question TEXT,
-    last_price DECIMAL(10, 6),
-    last_volume DECIMAL(20, 2),
-    liquidity DECIMAL(20, 2),
-    last_scanned_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    price_24h_ago DECIMAL(10, 6),
-    volume_24h_ago DECIMAL(20, 2),
-    scan_count BIGINT DEFAULT 0,
-    is_active BOOLEAN DEFAULT true,
-    metadata JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+
+--
+-- Name: market_quotes_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.market_quotes_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: market_quotes_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.market_quotes_id_seq OWNED BY public.market_quotes.id;
+
+
+--
+-- Name: market_scans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_scans (
+    id integer NOT NULL,
+    token_id character varying(80) NOT NULL,
+    event_id character varying(255),
+    slug character varying(255),
+    question text,
+    last_price double precision,
+    last_volume double precision,
+    liquidity double precision,
+    last_scanned_at timestamp with time zone DEFAULT now(),
+    price_24h_ago double precision,
+    volume_24h_ago double precision,
+    scan_count bigint DEFAULT 0,
+    is_active boolean DEFAULT true,
+    metadata jsonb,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
 );
 
-CREATE TABLE market_events (
-    id SERIAL PRIMARY KEY,
-    token_id VARCHAR(80) NOT NULL,
-    event_type VARCHAR(50),
-    old_value DECIMAL(20, 6),
-    new_value DECIMAL(20, 6),
-    metadata JSONB,
-    detected_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+
+--
+-- Name: market_scans_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.market_scans_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: market_scans_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.market_scans_id_seq OWNED BY public.market_scans.id;
+
+
+--
+-- Name: market_signals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_signals (
+    id integer NOT NULL,
+    session_id integer,
+    token_id character varying(80) NOT NULL,
+    signal_type character varying(50) NOT NULL,
+    "timestamp" timestamp without time zone DEFAULT now(),
+    best_bid numeric(10,6),
+    best_ask numeric(10,6),
+    bid_liquidity numeric(15,6),
+    ask_liquidity numeric(15,6),
+    action_reason text,
+    confidence numeric(5,2)
 );
 
--- Indexes from Migration 001
-CREATE INDEX idx_session_time ON market_signals(session_id, timestamp);
-CREATE INDEX idx_token_time ON market_signals(token_id, timestamp);
-CREATE INDEX idx_session_status ON paper_orders(session_id, status);
 
--- Indexes from Migration 002
-CREATE INDEX idx_active_market_scans ON market_scans(is_active, last_scanned_at);
-CREATE INDEX idx_market_scans_volume ON market_scans(last_volume DESC) WHERE is_active = true;
-CREATE INDEX idx_market_scans_price_change ON market_scans((last_price - price_24h_ago)) WHERE is_active = true;
-CREATE INDEX idx_market_events_type ON market_events(event_type, detected_at DESC);
-CREATE INDEX idx_market_events_token ON market_events(token_id, detected_at DESC);
+--
+-- Name: market_signals_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.market_signals_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: market_signals_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.market_signals_id_seq OWNED BY public.market_signals.id;
+
+
+--
+-- Name: market_trades; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_trades (
+    id bigint NOT NULL,
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    price double precision NOT NULL,
+    size double precision NOT NULL,
+    aggressor text,
+    trade_id text,
+    CONSTRAINT market_trades_aggressor_check CHECK ((aggressor = ANY (ARRAY['buy'::text, 'sell'::text])))
+);
+
+
+--
+-- Name: market_trades_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.market_trades_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: market_trades_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.market_trades_id_seq OWNED BY public.market_trades.id;
+
+
+--
+-- Name: markets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.markets (
+    id integer NOT NULL,
+    token_id character varying(80) NOT NULL,
+    slug character varying(255),
+    question text,
+    outcome character varying(50),
+    created_at timestamp without time zone DEFAULT now(),
+    updated_at timestamp without time zone DEFAULT now()
+);
+
+
+--
+-- Name: markets_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.markets_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: markets_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.markets_id_seq OWNED BY public.markets.id;
+
+
+--
+-- Name: paper_orders; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.paper_orders (
+    id integer NOT NULL,
+    session_id integer,
+    signal_id integer,
+    token_id character varying(80) NOT NULL,
+    side character varying(10) NOT NULL,
+    price numeric(10,6) NOT NULL,
+    size numeric(15,6) NOT NULL,
+    status character varying(20) DEFAULT 'open'::character varying,
+    created_at timestamp without time zone DEFAULT now(),
+    filled_at timestamp without time zone
+);
+
+
+--
+-- Name: paper_orders_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.paper_orders_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: paper_orders_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.paper_orders_id_seq OWNED BY public.paper_orders.id;
+
+
+--
+-- Name: paper_positions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.paper_positions (
+    id integer NOT NULL,
+    session_id integer,
+    token_id character varying(80) NOT NULL,
+    shares numeric(15,6) NOT NULL,
+    avg_entry_price numeric(10,6),
+    current_price numeric(10,6),
+    unrealized_pnl numeric(15,6),
+    updated_at timestamp without time zone DEFAULT now()
+);
+
+
+--
+-- Name: paper_positions_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.paper_positions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: paper_positions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.paper_positions_id_seq OWNED BY public.paper_positions.id;
+
+
+--
+-- Name: strategies; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.strategies (
+    id integer NOT NULL,
+    name character varying(100) NOT NULL,
+    config jsonb DEFAULT '{}'::jsonb NOT NULL,
+    initial_balance numeric(15,6) DEFAULT 1000.00,
+    active boolean DEFAULT true,
+    created_at timestamp without time zone DEFAULT now()
+);
+
+
+--
+-- Name: strategies_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.strategies_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: strategies_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.strategies_id_seq OWNED BY public.strategies.id;
+
+
+--
+-- Name: trading_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.trading_sessions (
+    id integer NOT NULL,
+    strategy_id integer,
+    start_balance numeric(15,6),
+    current_balance numeric(15,6),
+    started_at timestamp without time zone DEFAULT now(),
+    ended_at timestamp without time zone
+);
+
+
+--
+-- Name: trading_sessions_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.trading_sessions_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: trading_sessions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.trading_sessions_id_seq OWNED BY public.trading_sessions.id;
+
+
+--
+-- Name: archive_jobs id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.archive_jobs ALTER COLUMN id SET DEFAULT nextval('public.archive_jobs_id_seq'::regclass);
+
+
+--
+-- Name: market_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_events ALTER COLUMN id SET DEFAULT nextval('public.market_events_id_seq'::regclass);
+
+
+--
+-- Name: market_quotes id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_quotes ALTER COLUMN id SET DEFAULT nextval('public.market_quotes_id_seq'::regclass);
+
+
+--
+-- Name: market_scans id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_scans ALTER COLUMN id SET DEFAULT nextval('public.market_scans_id_seq'::regclass);
+
+
+--
+-- Name: market_signals id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_signals ALTER COLUMN id SET DEFAULT nextval('public.market_signals_id_seq'::regclass);
+
+
+--
+-- Name: market_trades id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_trades ALTER COLUMN id SET DEFAULT nextval('public.market_trades_id_seq'::regclass);
+
+
+--
+-- Name: markets id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.markets ALTER COLUMN id SET DEFAULT nextval('public.markets_id_seq'::regclass);
+
+
+--
+-- Name: paper_orders id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_orders ALTER COLUMN id SET DEFAULT nextval('public.paper_orders_id_seq'::regclass);
+
+
+--
+-- Name: paper_positions id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_positions ALTER COLUMN id SET DEFAULT nextval('public.paper_positions_id_seq'::regclass);
+
+
+--
+-- Name: strategies id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.strategies ALTER COLUMN id SET DEFAULT nextval('public.strategies_id_seq'::regclass);
+
+
+--
+-- Name: trading_sessions id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trading_sessions ALTER COLUMN id SET DEFAULT nextval('public.trading_sessions_id_seq'::regclass);
+
+
+--
+-- Name: archive_jobs archive_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.archive_jobs
+    ADD CONSTRAINT archive_jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: archive_jobs archive_jobs_table_name_ts_start_ts_end_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.archive_jobs
+    ADD CONSTRAINT archive_jobs_table_name_ts_start_ts_end_key UNIQUE (table_name, ts_start, ts_end);
+
+
+--
+-- Name: goose_db_version goose_db_version_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.goose_db_version
+    ADD CONSTRAINT goose_db_version_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: market_events market_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_events
+    ADD CONSTRAINT market_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: market_features market_features_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features
+    ADD CONSTRAINT market_features_pkey PRIMARY KEY (token_id, ts);
+
+
+--
+-- Name: market_quotes market_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_quotes
+    ADD CONSTRAINT market_quotes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: market_scans market_scans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_scans
+    ADD CONSTRAINT market_scans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: market_scans market_scans_token_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_scans
+    ADD CONSTRAINT market_scans_token_id_key UNIQUE (token_id);
+
+
+--
+-- Name: market_signals market_signals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_signals
+    ADD CONSTRAINT market_signals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: market_trades market_trades_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_trades
+    ADD CONSTRAINT market_trades_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: markets markets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.markets
+    ADD CONSTRAINT markets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: markets markets_token_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.markets
+    ADD CONSTRAINT markets_token_id_key UNIQUE (token_id);
+
+
+--
+-- Name: paper_orders paper_orders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_orders
+    ADD CONSTRAINT paper_orders_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: paper_positions paper_positions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_positions
+    ADD CONSTRAINT paper_positions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: paper_positions paper_positions_session_id_token_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_positions
+    ADD CONSTRAINT paper_positions_session_id_token_id_key UNIQUE (session_id, token_id);
+
+
+--
+-- Name: strategies strategies_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.strategies
+    ADD CONSTRAINT strategies_name_key UNIQUE (name);
+
+
+--
+-- Name: strategies strategies_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.strategies
+    ADD CONSTRAINT strategies_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: trading_sessions trading_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trading_sessions
+    ADD CONSTRAINT trading_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: brin_market_events_detected; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX brin_market_events_detected ON public.market_events USING brin (detected_at) WITH (pages_per_range='64');
+
+
+--
+-- Name: brin_market_features_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX brin_market_features_ts ON public.market_features USING brin (ts) WITH (pages_per_range='64');
+
+
+--
+-- Name: brin_market_quotes_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX brin_market_quotes_ts ON public.market_quotes USING brin (ts) WITH (pages_per_range='64');
+
+
+--
+-- Name: brin_market_trades_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX brin_market_trades_ts ON public.market_trades USING brin (ts) WITH (pages_per_range='64');
+
+
+--
+-- Name: idx_active_market_scans; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_active_market_scans ON public.market_scans USING btree (is_active, last_scanned_at);
+
+
+--
+-- Name: idx_archive_jobs_table_ts_done; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_archive_jobs_table_ts_done ON public.archive_jobs USING btree (table_name, ts_start) WHERE (status = 'done'::text);
+
+
+--
+-- Name: idx_market_events_detected; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_events_detected ON public.market_events USING btree (detected_at DESC);
+
+
+--
+-- Name: idx_market_events_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_events_token ON public.market_events USING btree (token_id, detected_at DESC);
+
+
+--
+-- Name: idx_market_events_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_events_type ON public.market_events USING btree (event_type, detected_at DESC);
+
+
+--
+-- Name: idx_market_features_token_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_features_token_ts ON public.market_features USING btree (token_id, ts DESC);
+
+
+--
+-- Name: idx_market_features_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_features_ts ON public.market_features USING btree (ts DESC);
+
+
+--
+-- Name: idx_market_quotes_token_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_quotes_token_ts ON public.market_quotes USING btree (token_id, ts DESC);
+
+
+--
+-- Name: idx_market_quotes_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_quotes_ts ON public.market_quotes USING btree (ts DESC);
+
+
+--
+-- Name: idx_market_scans_price_change; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_scans_price_change ON public.market_scans USING btree (((last_price - price_24h_ago))) WHERE (is_active = true);
+
+
+--
+-- Name: idx_market_scans_volume; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_scans_volume ON public.market_scans USING btree (last_volume DESC) WHERE (is_active = true);
+
+
+--
+-- Name: idx_market_trades_token_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_trades_token_ts ON public.market_trades USING btree (token_id, ts DESC);
+
+
+--
+-- Name: idx_market_trades_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_trades_ts ON public.market_trades USING btree (ts DESC);
+
+
+--
+-- Name: uq_market_trades_trade_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_market_trades_trade_id ON public.market_trades USING btree (trade_id) WHERE (trade_id IS NOT NULL);
+
+
+--
+-- Name: market_signals market_signals_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_signals
+    ADD CONSTRAINT market_signals_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.trading_sessions(id);
+
+
+--
+-- Name: paper_orders paper_orders_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_orders
+    ADD CONSTRAINT paper_orders_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.trading_sessions(id);
+
+
+--
+-- Name: paper_orders paper_orders_signal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_orders
+    ADD CONSTRAINT paper_orders_signal_id_fkey FOREIGN KEY (signal_id) REFERENCES public.market_signals(id);
+
+
+--
+-- Name: paper_positions paper_positions_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_positions
+    ADD CONSTRAINT paper_positions_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.trading_sessions(id);
+
+
+--
+-- Name: trading_sessions trading_sessions_strategy_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.trading_sessions
+    ADD CONSTRAINT trading_sessions_strategy_id_fkey FOREIGN KEY (strategy_id) REFERENCES public.strategies(id);
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict y5qM4HEmGhhINKK2g1eLaNfEG3i36rqrSDGQLPuJ6kJahvmveYcLLtcLIksWGc0
+

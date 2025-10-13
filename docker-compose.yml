@@ -25,7 +25,17 @@ services:
       GOOSE_DBSTRING: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
     volumes:
       - ./sql/migrations:/migrations:ro
-    command: ["goose","-dir","/migrations","up"]
+    entrypoint: ["/bin/sh","-c"]
+    command: |
+      echo '=== Migration Status BEFORE ===' && \
+      goose -dir /migrations status && \
+      echo '' && \
+      echo '=== Applying pending migrations... ===' && \
+      goose -dir /migrations up && \
+      echo '' && \
+      echo '=== Migration Status AFTER ===' && \
+      goose -dir /migrations status && \
+      echo '=== Migrations complete! ==='
     restart: "no"
 
   gatherer:
@@ -75,6 +85,46 @@ services:
     command: ["/app/orchestrator", "--binary", "--run", "prod"]
     volumes:
       - ./configs:/app/configs:ro
+    restart: unless-stopped
+
+  archiver:
+    build: .
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+      ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      # Prefer EC2 IAM role; only set keys if really needed:
+      # AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      # AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    entrypoint: ["/bin/sh","-lc"]
+    command: |
+      while true; do
+        /usr/local/bin/archiver -table market_features -prefix market_features || true
+        /usr/local/bin/archiver -table market_trades   -prefix market_trades   || true
+        /usr/local/bin/archiver -table market_quotes   -prefix market_quotes   || true
+        sleep 300
+      done
+    restart: unless-stopped
+
+  janitor:
+    build: .
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+    entrypoint: ["/bin/sh","-lc"]
+    command: |
+      while true; do
+        # keep a 6h hot window in Postgres
+        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT delete_exported_hours_features('6 hours');"
+        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT delete_exported_hours_trades('6 hours');"
+        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SELECT delete_exported_hours_quotes('6 hours');"
+        sleep 600
+      done
     restart: unless-stopped
 
 volumes:

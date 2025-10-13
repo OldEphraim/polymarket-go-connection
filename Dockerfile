@@ -9,6 +9,8 @@
     RUN CGO_ENABLED=0 GOOS=linux go build -o orchestrator ./main.go
     RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/gatherer ./cmd/gatherer/main.go
     RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/api ./cmd/api/main.go
+    RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/archiver ./cmd/archiver/main.go
+    RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/janitor  ./cmd/janitor/main.go
     
     # Build all strategies
     RUN mkdir -p /app/bin && \
