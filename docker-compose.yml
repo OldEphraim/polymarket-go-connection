@@ -22,9 +22,7 @@ services:
         condition: service_healthy
     volumes:
       - ./sql/migrations:/migrations:ro
-    entrypoint: ["/bin/sh","-c"]
-    command: |
-      goose -dir /migrations postgres "postgresql://a8garber:Grimsvotn1783@postgres:5432/polymarket_dev?sslmode=disable" up
+    command: ["goose", "-dir", "/migrations", "postgres", "postgresql://a8garber:Grimsvotn1783@postgres:5432/polymarket_dev?sslmode=disable", "up"]
     restart: "no"
 
   gatherer:
