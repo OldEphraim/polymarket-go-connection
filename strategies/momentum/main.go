@@ -18,6 +18,7 @@ import (
 	"github.com/OldEphraim/polymarket-go-connection/gatherer"
 	"github.com/OldEphraim/polymarket-go-connection/utils/gatherer_client"
 	"github.com/OldEphraim/polymarket-go-connection/utils/paper_trading"
+	"github.com/OldEphraim/polymarket-go-connection/utils/strategy_persistence"
 	"github.com/joho/godotenv"
 )
 
@@ -33,25 +34,24 @@ func truncateID(s string, length int) string {
 type MomentumConfig struct {
 	Name              string  `json:"name"`
 	Duration          string  `json:"duration"`
-	MomentumThreshold float64 `json:"momentum_threshold"` // legacy fallback: percent_change threshold (0.05 = 5%)
+	MomentumThreshold float64 `json:"momentum_threshold"` // legacy fallback (0.05 = 5%)
 	HoldPeriod        string  `json:"hold_period"`
 
-	// NEW: feature-driven gates (safe defaults keep behavior sane if missing from config)
-	MaxSpreadBps int     `json:"max_spread_bps"` // ignore when spread wider than this
+	// Feature-driven gates (defaults if missing)
+	MaxSpreadBps int     `json:"max_spread_bps"`
 	MinVolSurge  float64 `json:"min_vol_surge"`  // vol_1m_over_5m minimum
-	MinAbsRet1m  float64 `json:"min_abs_ret_1m"` // absolute |ret_1m| minimum (e.g. 0.01 = 1%)
+	MinAbsRet1m  float64 `json:"min_abs_ret_1m"` // absolute |ret_1m|
 }
 
 func loadConfig(filename string) *MomentumConfig {
 	cfg := &MomentumConfig{
 		Name:              "momentum",
 		Duration:          "24h",
-		MomentumThreshold: 0.05, // 5% legacy jump
+		MomentumThreshold: 0.05,
 		HoldPeriod:        "30m",
-
-		MaxSpreadBps: 120,
-		MinVolSurge:  2.0,
-		MinAbsRet1m:  0.01,
+		MaxSpreadBps:      120,
+		MinVolSurge:       2.0,
+		MinAbsRet1m:       0.01,
 	}
 	data, err := ioutil.ReadFile(fmt.Sprintf("configs/%s", filename))
 	if err != nil {
@@ -72,7 +72,7 @@ func main() {
 	log.Println("=== MOMENTUM STRATEGY STARTING ===")
 
 	// ===== STEP 2: Load Environment Variables =====
-	godotenv.Load()
+	_ = godotenv.Load()
 
 	// ===== STEP 3: Load Configuration =====
 	cfg := loadConfig(*configFile)
@@ -82,7 +82,6 @@ func main() {
 	// ===== STEP 4: Create Context =====
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	if cfg.Duration != "" && cfg.Duration != "infinite" {
 		if duration, err := time.ParseDuration(cfg.Duration); err == nil {
 			log.Printf("Will run for %s", duration)
@@ -97,16 +96,23 @@ func main() {
 	}
 	log.Println("Connected to database")
 
-	// ALSO open a plain sql.DB for quick quote/trade lookups (keeps strategy decoupled from store internals)
 	sqlDB, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer sqlDB.Close()
 
-	// ===== STEP 6: Initialize Paper Trading Framework =====
+	// ===== STEP 5.1: Ensure strategy + open session (set initial balance to 0 for bankroll-agnostic runs) =====
+	sess, err := strategy_persistence.EnsureOpenSession(ctx, sqlDB, "momentum", 0)
+	if err != nil {
+		log.Fatalf("EnsureOpenSession: %v", err)
+	}
+	log.Printf("Using session id=%d", sess.ID)
+
+	// ===== STEP 6: Initialize Paper Trading Framework (unlimited to avoid bankroll gating) =====
 	trader := paper_trading.New(store, paper_trading.Config{
-		UnlimitedFunds: true,
+		UnlimitedFunds: true, // strategy is bankroll-agnostic
+		InitialBalance: 0,    // local tracker only; DB is the source of truth
 		TrackMetrics:   true,
 	})
 	log.Println("Paper trading initialized")
@@ -145,12 +151,25 @@ func main() {
 			log.Println("Context cancelled, shutting down...")
 			for tokenID, pos := range positions {
 				if pos.Status == "open" {
-					_, err := trader.ExitPosition(ctx, tokenID, pos.CurrentPrice, "Strategy shutdown")
-					if err == nil {
-						log.Printf("Closed position %s on shutdown", truncateID(tokenID, 8))
+					exitPx := pos.CurrentPrice
+					if exitPx <= 0 {
+						exitPx = pos.EntryPrice
 					}
+					// Persist exit + credit cash (shares*price)
+					_ = strategy_persistence.RecordExit(ctx, sqlDB, strategy_persistence.ExitParams{
+						SessionID: sess.ID,
+						TokenID:   pos.TokenID,
+						ExitPrice: exitPx,
+						ExitSize:  0,
+						Reason:    "Strategy shutdown",
+						SideHint:  pos.Side,
+					})
+					_ = strategy_persistence.CreditSession(ctx, sqlDB, sess.ID, pos.Size*exitPx)
+
+					_, _ = trader.ExitPosition(ctx, tokenID, exitPx, "Strategy shutdown")
 				}
 			}
+			_ = strategy_persistence.EndSession(ctx, sqlDB, sess.ID)
 			metrics := trader.GetMetrics()
 			log.Printf("FINAL METRICS: %+v", metrics)
 			return
@@ -170,8 +189,6 @@ func main() {
 				continue
 			}
 
-			// Momentum events we care about (feature-driven) carry vol_1m_over_5m, ret_1m, spread_bps.
-			// If those are missing, we fall back to legacy percent_change.
 			volX, hasVolX := getFloat(event.Metadata, "vol_1m_over_5m")
 			ret1m, hasRet1m := getFloat(event.Metadata, "ret_1m")
 			spreadBps, hasSpread := getFloat(event.Metadata, "spread_bps")
@@ -180,7 +197,6 @@ func main() {
 			var dir string // "YES" for up, "NO" for down
 
 			if hasVolX && hasRet1m && hasSpread {
-				// ===== STEP 11: Apply feature gates (spread + volume surge + move direction) =====
 				if int(spreadBps) <= cfg.MaxSpreadBps && volX >= cfg.MinVolSurge && abs(ret1m) >= cfg.MinAbsRet1m {
 					passes = true
 					if ret1m > 0 {
@@ -190,11 +206,9 @@ func main() {
 					}
 				}
 			} else {
-				// ===== STEP 11 (fallback): legacy percent_change threshold =====
 				percentChange, ok := getFloat(event.Metadata, "percent_change")
 				if ok && (percentChange/100.0) >= cfg.MomentumThreshold {
 					passes = true
-					// Direction from legacy change
 					if percentChange >= 0 {
 						dir = "YES"
 					} else {
@@ -202,21 +216,19 @@ func main() {
 					}
 				}
 			}
-
 			if !passes {
 				continue
 			}
 			momentumHits++
 
 			// ===== STEP 12: Skip if already in position =====
-			if _, exists := positions[event.TokenID]; exists {
+			if p, exists := positions[event.TokenID]; exists && p.Status == "open" {
 				continue
 			}
 
 			// ===== STEP 13: Determine entry price =====
 			price := event.NewValue
 			if price <= 0 {
-				// For feature-driven events, NewValue is often 0 — fetch a live price.
 				if mid, ok := latestMidOrTrade(ctx, sqlDB, event.TokenID); ok {
 					price = mid
 				} else {
@@ -225,8 +237,12 @@ func main() {
 				}
 			}
 
-			// ===== STEP 14: Size based on strength =====
-			size := sizeFromMomentum(hasVolX, volX, hasRet1m, ret1m)
+			// ===== STEP 14: Size (NOTIONAL $) -> convert to shares =====
+			notional := sizeFromMomentum(hasVolX, volX, hasRet1m, ret1m)
+			if notional <= 0 {
+				continue
+			}
+			shares := notional / price
 
 			// ===== STEP 15: Compose reason & enter =====
 			reason := "Momentum"
@@ -243,10 +259,10 @@ func main() {
 			position, err := trader.EnterPosition(ctx, paper_trading.Entry{
 				TokenID:  event.TokenID,
 				Market:   strFromMeta(event.Metadata, "question", "Unknown market"),
-				Side:     dir,    // YES if up, NO if down
-				Size:     size,   // $
-				Price:    price,  // entry price we fetched
-				Reason:   reason, // audit
+				Side:     dir,
+				Size:     shares, // shares
+				Price:    price,
+				Reason:   reason,
 				Strategy: "momentum",
 			})
 			if err != nil {
@@ -254,17 +270,36 @@ func main() {
 				continue
 			}
 
+			positions[event.TokenID] = position
 			positionsEntered++
-			log.Printf("✓ ENTERED %s %s at %.4f (pos#%d) — %s",
-				truncateID(event.TokenID, 8), dir, price, positionsEntered, reason)
+
+			// Persist entry (orders + positions)
+			if err := strategy_persistence.RecordEntry(ctx, sqlDB, strategy_persistence.EntryParams{
+				SessionID: sess.ID,
+				TokenID:   event.TokenID,
+				Side:      dir,
+				Price:     price,
+				Size:      shares,
+				Reason:    reason,
+			}); err != nil {
+				log.Printf("RecordEntry failed: %v", err)
+			}
+
+			// Cash: debit notional
+			if err := strategy_persistence.DebitSession(ctx, sqlDB, sess.ID, notional); err != nil {
+				log.Printf("balance debit failed: %v", err)
+			}
+
+			log.Printf("✓ ENTERED %s %s @ %.4f (shares=%.2f, notional=%.2f) — %s",
+				truncateID(event.TokenID, 8), dir, price, shares, notional, reason)
 
 			// ===== STEP 16: Schedule Exit =====
-			go scheduleExit(ctx, trader, position, cfg.HoldPeriod)
+			go scheduleExit(ctx, trader, sqlDB, sess.ID, position, cfg.HoldPeriod)
 		}
 	}
 }
 
-// ===== STEP 17: Sizing helper =====
+// ===== STEP 17: Sizing helper (returns NOTIONAL $) =====
 func sizeFromMomentum(hasVolX bool, volX float64, hasRet1m bool, ret1m float64) float64 {
 	base := 100.0
 	boost := 1.0
@@ -290,8 +325,8 @@ func sizeFromMomentum(hasVolX bool, volX float64, hasRet1m bool, ret1m float64) 
 	return base * boost
 }
 
-// ===== STEP 18: Exit timer =====
-func scheduleExit(ctx context.Context, trader *paper_trading.Framework, position *paper_trading.Position, holdPeriod string) {
+// ===== STEP 18: Exit timer (uses persistence bridge) =====
+func scheduleExit(ctx context.Context, trader *paper_trading.Framework, sqlDB *sql.DB, sessionID int64, position *paper_trading.Position, holdPeriod string) {
 	dur, err := time.ParseDuration(holdPeriod)
 	if err != nil || dur <= 0 {
 		dur = 30 * time.Minute
@@ -301,21 +336,30 @@ func scheduleExit(ctx context.Context, trader *paper_trading.Framework, position
 	case <-ctx.Done():
 		return
 	case <-timer.C:
-		// simple take-profit placeholder (paper)
 		exitPrice := position.CurrentPrice
 		if exitPrice <= 0 {
 			exitPrice = position.EntryPrice
 		}
-		_, err := trader.ExitPosition(ctx, position.TokenID, exitPrice, "Hold period expired")
-		if err != nil {
-			log.Printf("Failed to exit %s: %v", truncateID(position.TokenID, 8), err)
+		// Persist + credit cash
+		_ = strategy_persistence.RecordExit(ctx, sqlDB, strategy_persistence.ExitParams{
+			SessionID: sessionID,
+			TokenID:   position.TokenID,
+			ExitPrice: exitPrice,
+			ExitSize:  0,
+			Reason:    "Hold period expired",
+			SideHint:  position.Side,
+		})
+		_ = strategy_persistence.CreditSession(ctx, sqlDB, sessionID, position.Size*exitPrice)
+
+		if _, err := trader.ExitPosition(ctx, position.TokenID, exitPrice, "Hold period expired"); err != nil {
+			log.Printf("framework exit failed: %v", err)
 		} else {
-			log.Printf("EXITED: %s at %.4f", truncateID(position.TokenID, 8), exitPrice)
+			log.Printf("EXITED: %s @ %.4f", truncateID(position.TokenID, 8), exitPrice)
 		}
 	}
 }
 
-// ===== STEP 19: Small helpers (shared pattern with MR) =====
+// ===== STEP 19: Small helpers =====
 func getFloat(meta map[string]interface{}, key string) (float64, bool) {
 	if v, ok := meta[key]; ok {
 		switch x := v.(type) {
@@ -326,7 +370,7 @@ func getFloat(meta map[string]interface{}, key string) (float64, bool) {
 				return f, true
 			}
 		case string:
-			if f, err := strconvParseFloat(x); err == nil {
+			if f, err := strconv.ParseFloat(x, 64); err == nil {
 				return f, true
 			}
 		}
@@ -377,9 +421,4 @@ func latestMidOrTrade(ctx context.Context, db *sql.DB, token string) (float64, b
 		return px.Float64, true
 	}
 	return 0, false
-}
-
-// parse string to float64 (no import clutter up top)
-func strconvParseFloat(s string) (float64, error) {
-	return strconv.ParseFloat(s, 64)
 }

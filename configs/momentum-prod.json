@@ -1,10 +1,10 @@
 {
-    "name": "momentum-test",
+    "name": "momentum-prod",
     "duration": "168h",
-    "momentum_threshold": 0.03,
-    "hold_period": "5m",
-    "max_spread_bps": 150,
-    "min_vol_surge": 1.5,
-    "min_abs_ret_1m": 0.005
+    "momentum_threshold": 0.02,
+    "hold_period": "10m",
+    "max_spread_bps": 200,
+    "min_vol_surge": 1.3,
+    "min_abs_ret_1m": 0.003
+  }
   
-}

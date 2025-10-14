@@ -18,6 +18,7 @@ import (
 	"github.com/OldEphraim/polymarket-go-connection/gatherer"
 	"github.com/OldEphraim/polymarket-go-connection/utils/gatherer_client"
 	"github.com/OldEphraim/polymarket-go-connection/utils/paper_trading"
+	"github.com/OldEphraim/polymarket-go-connection/utils/strategy_persistence"
 	"github.com/joho/godotenv"
 )
 
@@ -33,23 +34,22 @@ func truncateID(s string, length int) string {
 type MeanReversionConfig struct {
 	Name               string  `json:"name"`
 	Duration           string  `json:"duration"`
-	ReversionThreshold float64 `json:"reversion_threshold"` // legacy fallback: distance from 0.5 (e.g., 0.30)
+	ReversionThreshold float64 `json:"reversion_threshold"` // legacy fallback by distance from 0.5
 	HoldPeriod         string  `json:"hold_period"`
 
-	// NEW: feature-driven gates
+	// Feature-driven gates
 	MaxSpreadBps int     `json:"max_spread_bps"`
-	MinAbsZ      float64 `json:"min_abs_z"` // |zscore_5m| minimum (e.g., 2.5)
+	MinAbsZ      float64 `json:"min_abs_z"`
 }
 
 func loadConfig(filename string) *MeanReversionConfig {
 	cfg := &MeanReversionConfig{
 		Name:               "mean_reversion",
 		Duration:           "24h",
-		ReversionThreshold: 0.30, // legacy fallback
+		ReversionThreshold: 0.30,
 		HoldPeriod:         "2h",
-
-		MaxSpreadBps: 120,
-		MinAbsZ:      2.5,
+		MaxSpreadBps:       120,
+		MinAbsZ:            2.5,
 	}
 	data, err := ioutil.ReadFile(fmt.Sprintf("configs/%s", filename))
 	if err != nil {
@@ -57,7 +57,7 @@ func loadConfig(filename string) *MeanReversionConfig {
 		return cfg
 	}
 	if err := json.Unmarshal(data, cfg); err != nil {
-		log.Printf("Error parsing config: %v, using defaults", err)
+		log.Printf("Error parsing config: %v, using defaults")
 	}
 	return cfg
 }
@@ -70,17 +70,16 @@ func main() {
 	log.Println("=== MEAN REVERSION STRATEGY STARTING ===")
 
 	// ===== STEP 2: Load Environment Variables =====
-	godotenv.Load()
+	_ = godotenv.Load()
 
 	// ===== STEP 3: Load Configuration =====
 	cfg := loadConfig(*configFile)
-	log.Printf("Config loaded: legacy_thresh=%.2f, hold=%s, gates={max_spread_bps=%d,min_abs_z=%.2f}",
+	log.Printf("Config loaded: thresh=%.2f, hold=%s, gates={max_spread_bps=%d,min_abs_z=%.2f}",
 		cfg.ReversionThreshold, cfg.HoldPeriod, cfg.MaxSpreadBps, cfg.MinAbsZ)
 
 	// ===== STEP 4: Create Context =====
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	if cfg.Duration != "" && cfg.Duration != "infinite" {
 		if duration, err := time.ParseDuration(cfg.Duration); err == nil {
 			log.Printf("Will run for %s", duration)
@@ -101,9 +100,17 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	// ===== STEP 6: Initialize Paper Trading Framework =====
+	// Ensure strategy + open session (0 start to be bankroll-agnostic)
+	sess, err := strategy_persistence.EnsureOpenSession(ctx, sqlDB, "mean_reversion", 0)
+	if err != nil {
+		log.Fatalf("EnsureOpenSession: %v", err)
+	}
+	log.Printf("Using session id=%d", sess.ID)
+
+	// ===== STEP 6: Initialize Paper Trading Framework (unlimited funds) =====
 	trader := paper_trading.New(store, paper_trading.Config{
 		UnlimitedFunds: true,
+		InitialBalance: 0,
 		TrackMetrics:   true,
 	})
 	log.Println("Paper trading initialized")
@@ -134,19 +141,31 @@ func main() {
 	}()
 
 	// ===== STEP 9: Main Event Processing Loop =====
-	log.Println("Starting main event loop...")
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Context cancelled, shutting down...")
 			for tokenID, pos := range positions {
 				if pos.Status == "open" {
-					_, err := trader.ExitPosition(ctx, tokenID, pos.CurrentPrice, "Strategy shutdown")
-					if err == nil {
-						log.Printf("Closed position %s on shutdown", truncateID(tokenID, 8))
+					exitPx := pos.CurrentPrice
+					if exitPx <= 0 {
+						exitPx = pos.EntryPrice
 					}
+					// Persist exit + credit cash
+					_ = strategy_persistence.RecordExit(ctx, sqlDB, strategy_persistence.ExitParams{
+						SessionID: sess.ID,
+						TokenID:   pos.TokenID,
+						ExitPrice: exitPx,
+						ExitSize:  0,
+						Reason:    "Strategy shutdown",
+						SideHint:  pos.Side,
+					})
+					_ = strategy_persistence.CreditSession(ctx, sqlDB, sess.ID, pos.Size*exitPx)
+
+					_, _ = trader.ExitPosition(ctx, tokenID, exitPx, "Strategy shutdown")
 				}
 			}
+			_ = strategy_persistence.EndSession(ctx, sqlDB, sess.ID)
 			metrics := trader.GetMetrics()
 			log.Printf("FINAL METRICS: %+v", metrics)
 			return
@@ -166,18 +185,16 @@ func main() {
 				continue
 			}
 
-			// We target feature-driven "mean reversion hints" by looking for zscore_5m + spread_bps.
 			z, hasZ := getFloat(event.Metadata, "zscore_5m")
 			spreadBps, hasSpread := getFloat(event.Metadata, "spread_bps")
 
 			var passes bool
 			if hasZ && hasSpread {
-				// ===== STEP 11: Apply feature gates (z-score + spread) =====
 				if abs(z) >= cfg.MinAbsZ && int(spreadBps) <= cfg.MaxSpreadBps {
 					passes = true
 				}
 			} else {
-				// ===== STEP 11 (fallback): legacy extreme by price distance from 0.5 =====
+				// fallback: extreme distance from 0.5
 				px := event.NewValue
 				if px <= 0 {
 					if mid, ok := latestMidOrTrade(ctx, sqlDB, event.TokenID); ok {
@@ -193,12 +210,12 @@ func main() {
 			}
 			reversionHits++
 
-			// ===== STEP 12: If already in position, skip =====
-			if _, exists := positions[event.TokenID]; exists {
+			// ===== STEP 12: Skip if already in position =====
+			if p, exists := positions[event.TokenID]; exists && p.Status == "open" {
 				continue
 			}
 
-			// ===== STEP 13: Determine current price (mid preferred) =====
+			// ===== STEP 13: Determine current price =====
 			price := event.NewValue
 			if price <= 0 {
 				if mid, ok := latestMidOrTrade(ctx, sqlDB, event.TokenID); ok {
@@ -215,7 +232,14 @@ func main() {
 				side = "NO"
 			}
 
-			// ===== STEP 15: Compose reason & size =====
+			// ===== STEP 15: Size (NOTIONAL $) -> convert to shares =====
+			dist := abs(price - 0.5)
+			sizeNotional := sizeFromExtremeness(dist, abs(z), hasZ)
+			if sizeNotional <= 0 {
+				continue
+			}
+			shares := sizeNotional / price
+
 			reason := "MeanReversion"
 			if hasZ {
 				reason += fmt.Sprintf(" z=%.2f", z)
@@ -223,14 +247,12 @@ func main() {
 			if hasSpread {
 				reason += fmt.Sprintf(" spread=%.0fbps", spreadBps)
 			}
-			dist := abs(price - 0.5)
-			size := sizeFromExtremeness(dist, abs(z), hasZ)
 
 			position, err := trader.EnterPosition(ctx, paper_trading.Entry{
 				TokenID:  event.TokenID,
 				Market:   strFromMeta(event.Metadata, "question", "Unknown market"),
 				Side:     side,
-				Size:     size,
+				Size:     shares, // shares
 				Price:    price,
 				Reason:   reason,
 				Strategy: "mean_reversion",
@@ -240,21 +262,39 @@ func main() {
 				continue
 			}
 
+			positions[event.TokenID] = position
 			positionsEntered++
-			log.Printf("✓ ENTERED %s %s at %.4f (pos#%d) — %s",
-				truncateID(event.TokenID, 8), side, price, positionsEntered, reason)
+
+			// Persist entry
+			if err := strategy_persistence.RecordEntry(ctx, sqlDB, strategy_persistence.EntryParams{
+				SessionID: sess.ID,
+				TokenID:   event.TokenID,
+				Side:      side,
+				Price:     price,
+				Size:      shares,
+				Reason:    reason,
+			}); err != nil {
+				log.Printf("RecordEntry failed: %v", err)
+			}
+
+			// Cash: debit notional
+			if err := strategy_persistence.DebitSession(ctx, sqlDB, sess.ID, sizeNotional); err != nil {
+				log.Printf("balance debit failed: %v", err)
+			}
+
+			log.Printf("✓ ENTERED %s %s @ %.4f (shares=%.2f, notional=%.2f) — %s",
+				truncateID(event.TokenID, 8), side, price, shares, sizeNotional, reason)
 
 			// ===== STEP 16: Schedule Exit =====
-			go scheduleExit(ctx, trader, position, cfg.HoldPeriod)
+			go scheduleExit(ctx, trader, sqlDB, sess.ID, position, cfg.HoldPeriod)
 		}
 	}
 }
 
-// ===== STEP 17: Sizing helper =====
+// ===== STEP 17: Sizing helper (returns NOTIONAL $) =====
 func sizeFromExtremeness(distFromMid, absZ float64, hasZ bool) float64 {
 	base := 100.0
 	boost := 1.0
-	// by distance from 0.5 (price)
 	switch {
 	case distFromMid >= 0.45:
 		boost *= 3
@@ -263,7 +303,6 @@ func sizeFromExtremeness(distFromMid, absZ float64, hasZ bool) float64 {
 	case distFromMid >= 0.30:
 		boost *= 1.5
 	}
-	// by z-score if available
 	if hasZ {
 		switch {
 		case absZ >= 4.0:
@@ -275,8 +314,8 @@ func sizeFromExtremeness(distFromMid, absZ float64, hasZ bool) float64 {
 	return base * boost
 }
 
-// ===== STEP 18: Exit timer =====
-func scheduleExit(ctx context.Context, trader *paper_trading.Framework, position *paper_trading.Position, holdPeriod string) {
+// ===== STEP 18: Exit timer (uses persistence bridge) =====
+func scheduleExit(ctx context.Context, trader *paper_trading.Framework, sqlDB *sql.DB, sessionID int64, position *paper_trading.Position, holdPeriod string) {
 	dur, err := time.ParseDuration(holdPeriod)
 	if err != nil || dur <= 0 {
 		dur = 2 * time.Hour
@@ -286,21 +325,30 @@ func scheduleExit(ctx context.Context, trader *paper_trading.Framework, position
 	case <-ctx.Done():
 		return
 	case <-timer.C:
-		// simple partial reversion placeholder (paper)
 		exitPrice := position.CurrentPrice
 		if exitPrice <= 0 {
 			exitPrice = position.EntryPrice
 		}
-		_, err := trader.ExitPosition(ctx, position.TokenID, exitPrice, "Hold period expired")
-		if err != nil {
-			log.Printf("Failed to exit %s: %v", truncateID(position.TokenID, 8), err)
+		// Persist + credit cash
+		_ = strategy_persistence.RecordExit(ctx, sqlDB, strategy_persistence.ExitParams{
+			SessionID: sessionID,
+			TokenID:   position.TokenID,
+			ExitPrice: exitPrice,
+			ExitSize:  0,
+			Reason:    "Hold period expired",
+			SideHint:  position.Side,
+		})
+		_ = strategy_persistence.CreditSession(ctx, sqlDB, sessionID, position.Size*exitPrice)
+
+		if _, err := trader.ExitPosition(ctx, position.TokenID, exitPrice, "Hold period expired"); err != nil {
+			log.Printf("framework exit failed: %v", err)
 		} else {
-			log.Printf("EXITED: %s at %.4f", truncateID(position.TokenID, 8), exitPrice)
+			log.Printf("EXITED: %s @ %.4f", truncateID(position.TokenID, 8), exitPrice)
 		}
 	}
 }
 
-// ===== STEP 19: Small helpers (shared pattern with momentum) =====
+// ===== STEP 19: Small helpers =====
 func getFloat(meta map[string]interface{}, key string) (float64, bool) {
 	if v, ok := meta[key]; ok {
 		switch x := v.(type) {
@@ -311,7 +359,7 @@ func getFloat(meta map[string]interface{}, key string) (float64, bool) {
 				return f, true
 			}
 		case string:
-			if f, err := strconvParseFloat(x); err == nil {
+			if f, err := strconv.ParseFloat(x, 64); err == nil {
 				return f, true
 			}
 		}
@@ -335,9 +383,7 @@ func abs(x float64) float64 {
 	return x
 }
 
-// ===== STEP 20: Price resolution helpers =====
 func latestMidOrTrade(ctx context.Context, db *sql.DB, token string) (float64, bool) {
-	// Try mid from latest quote
 	var bid, ask sql.NullFloat64
 	err := db.QueryRowContext(ctx, `
 		SELECT best_bid, best_ask
@@ -349,7 +395,6 @@ func latestMidOrTrade(ctx context.Context, db *sql.DB, token string) (float64, b
 	if err == nil && bid.Valid && ask.Valid && bid.Float64 > 0 && ask.Float64 > 0 {
 		return (bid.Float64 + ask.Float64) / 2.0, true
 	}
-	// fallback to last trade price
 	var px sql.NullFloat64
 	err = db.QueryRowContext(ctx, `
 		SELECT price
@@ -362,9 +407,4 @@ func latestMidOrTrade(ctx context.Context, db *sql.DB, token string) (float64, b
 		return px.Float64, true
 	}
 	return 0, false
-}
-
-// parse string to float64 (no import clutter up top)
-func strconvParseFloat(s string) (float64, error) {
-	return strconv.ParseFloat(s, 64)
 }

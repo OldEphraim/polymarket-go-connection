@@ -1,8 +1,9 @@
 {
-    "name": "mean_reversion-test",
+    "name": "mean_reversion-prod",
     "duration": "168h",
-    "reversion_threshold": 0.25,
-    "hold_period": "2h",
-    "max_spread_bps": 150,
-    "min_abs_z": 2.0  
-}
+    "reversion_threshold": 0.20,
+    "hold_period": "60m",
+    "max_spread_bps": 200,
+    "min_abs_z": 2.0
+  }
+  

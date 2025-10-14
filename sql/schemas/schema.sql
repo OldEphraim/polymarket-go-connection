@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict kdVmzA19SGDoGvPQZLMf7Gt8VrvHUvVg1FbWa8ktEflTbmJQ9BfAaZzeBK1Ff3u
+\restrict 9NxEUftLtYVD4aGaeVtxc1AAYoKp3cNb0wnAgi5awQwJ1FCmCAbwOLM2IuaV25p
 
 -- Dumped from database version 14.19 (Homebrew)
 -- Dumped by pg_dump version 14.19 (Homebrew)
@@ -514,6 +514,42 @@ ALTER SEQUENCE public.paper_positions_id_seq OWNED BY public.paper_positions.id;
 
 
 --
+-- Name: paper_trades; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.paper_trades (
+    id bigint NOT NULL,
+    session_id integer NOT NULL,
+    token_id character varying(80) NOT NULL,
+    side character varying(10) NOT NULL,
+    price numeric(10,6) NOT NULL,
+    shares numeric(15,6) NOT NULL,
+    notional numeric(15,6) NOT NULL,
+    realized_pnl numeric(15,6) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: paper_trades_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.paper_trades_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: paper_trades_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.paper_trades_id_seq OWNED BY public.paper_trades.id;
+
+
+--
 -- Name: strategies; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -557,7 +593,8 @@ CREATE TABLE public.trading_sessions (
     start_balance numeric(15,6),
     current_balance numeric(15,6),
     started_at timestamp without time zone DEFAULT now(),
-    ended_at timestamp without time zone
+    ended_at timestamp without time zone,
+    realized_pnl numeric(15,6) DEFAULT 0 NOT NULL
 );
 
 
@@ -642,6 +679,13 @@ ALTER TABLE ONLY public.paper_orders ALTER COLUMN id SET DEFAULT nextval('public
 --
 
 ALTER TABLE ONLY public.paper_positions ALTER COLUMN id SET DEFAULT nextval('public.paper_positions_id_seq'::regclass);
+
+
+--
+-- Name: paper_trades id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_trades ALTER COLUMN id SET DEFAULT nextval('public.paper_trades_id_seq'::regclass);
 
 
 --
@@ -776,6 +820,14 @@ ALTER TABLE ONLY public.paper_positions
 
 ALTER TABLE ONLY public.paper_positions
     ADD CONSTRAINT paper_positions_session_id_token_id_key UNIQUE (session_id, token_id);
+
+
+--
+-- Name: paper_trades paper_trades_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_trades
+    ADD CONSTRAINT paper_trades_pkey PRIMARY KEY (id);
 
 
 --
@@ -922,6 +974,20 @@ CREATE INDEX idx_market_trades_ts ON public.market_trades USING btree (ts DESC);
 
 
 --
+-- Name: idx_paper_trades_session_time; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_paper_trades_session_time ON public.paper_trades USING btree (session_id, created_at DESC);
+
+
+--
+-- Name: idx_paper_trades_token_time; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_paper_trades_token_time ON public.paper_trades USING btree (token_id, created_at DESC);
+
+
+--
 -- Name: uq_market_trades_trade_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -961,6 +1027,14 @@ ALTER TABLE ONLY public.paper_positions
 
 
 --
+-- Name: paper_trades paper_trades_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paper_trades
+    ADD CONSTRAINT paper_trades_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.trading_sessions(id);
+
+
+--
 -- Name: trading_sessions trading_sessions_strategy_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -972,5 +1046,5 @@ ALTER TABLE ONLY public.trading_sessions
 -- PostgreSQL database dump complete
 --
 
-\unrestrict kdVmzA19SGDoGvPQZLMf7Gt8VrvHUvVg1FbWa8ktEflTbmJQ9BfAaZzeBK1Ff3u
+\unrestrict 9NxEUftLtYVD4aGaeVtxc1AAYoKp3cNb0wnAgi5awQwJ1FCmCAbwOLM2IuaV25p
 

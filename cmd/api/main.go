@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/db"
@@ -65,7 +65,7 @@ func parseLimitOffset(r *http.Request, defLimit int) (limit, offset int) {
 func (s *APIServer) reqCtx(r *http.Request) (context.Context, context.CancelFunc) {
 	timeout := 8000
 	if ms := os.Getenv("API_TIMEOUT_MS"); ms != "" {
-		if v, err := strconv.Atoi(ms); err == nil && v > 0 && v <= 10000 {
+		if v, err := strconv.Atoi(ms); err == nil && v > 0 && v <= 20000 {
 			timeout = v
 		}
 	}
@@ -96,10 +96,12 @@ func (s *APIServer) authenticate(next http.HandlerFunc) http.HandlerFunc {
 
 // ---------- endpoints ----------
 
+// /api/stats — high-level system & trading stats
 func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
+	// total_pnl = realized (sessions) + sum unrealized (open positions)
 	const q = `
 WITH
   active_markets AS (
@@ -108,16 +110,19 @@ WITH
   events_24h AS (
     SELECT COUNT(*) AS n FROM market_events WHERE detected_at > NOW() - INTERVAL '24 hours'
   ),
-  positions AS (
-    SELECT
-      COALESCE(COUNT(*),0) AS open_positions,
-      COALESCE(SUM(unrealized_pnl),0) AS total_pnl
-    FROM paper_positions
+  open_positions AS (
+    SELECT COUNT(*) AS n, COALESCE(SUM(unrealized_pnl),0) AS unreal
+    FROM paper_positions WHERE shares > 0
+  ),
+  realized AS (
+    SELECT COALESCE(SUM(realized_pnl),0) AS r
+    FROM trading_sessions
   ),
   strategies_active AS (
-    SELECT COUNT(DISTINCT po.session_id) AS n
-    FROM paper_orders po
-    WHERE po.created_at > NOW() - INTERVAL '24 hours'
+    SELECT COUNT(DISTINCT ts.id) AS n
+    FROM paper_trades t
+    JOIN trading_sessions ts ON ts.id = t.session_id
+    WHERE t.created_at > NOW() - INTERVAL '24 hours'
   ),
   quotes_lag AS (
     SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_quotes
@@ -131,23 +136,19 @@ WITH
   db_size AS (
     SELECT pg_size_pretty(pg_database_size(current_database())) AS size
   ),
-  total_rows AS (
-    SELECT COUNT(*) AS n FROM market_features
-  ),
   features_per_min AS (
     SELECT COUNT(*) AS n FROM market_features WHERE ts > NOW() - INTERVAL '1 minute'
   )
 SELECT
   (SELECT n FROM active_markets) AS active_markets,
   (SELECT n FROM events_24h) AS events_24h,
-  (SELECT open_positions FROM positions) AS open_positions,
-  (SELECT total_pnl FROM positions) AS total_pnl,
+  (SELECT n FROM open_positions) AS open_positions,
+  (SELECT r FROM realized) + (SELECT unreal FROM open_positions) AS total_pnl,
   (SELECT n FROM strategies_active) AS strategies_count,
   (SELECT sec FROM quotes_lag) AS quotes_lag_sec,
   (SELECT sec FROM trades_lag) AS trades_lag_sec,
   (SELECT sec FROM features_lag) AS features_lag_sec,
   (SELECT size FROM db_size) AS db_size,
-  (SELECT n FROM total_rows) AS total_rows,
   (SELECT n FROM features_per_min) AS features_per_minute
 ;`
 
@@ -161,7 +162,6 @@ SELECT
 		TradesLagSec   int64   `json:"trades_lag_sec"`
 		FeaturesLagSec int64   `json:"features_lag_sec"`
 		DBSize         string  `json:"db_size"`
-		TotalRows      int64   `json:"total_rows"`
 		FeaturesPerMin int64   `json:"features_per_minute"`
 	}
 
@@ -176,18 +176,17 @@ SELECT
 		&out.TradesLagSec,
 		&out.FeaturesLagSec,
 		&out.DBSize,
-		&out.TotalRows,
 		&out.FeaturesPerMin,
 	); err != nil {
-		slog.Error("getStats", "err", err)
+		s.log.Error("getStats", "err", err)
 		http.Error(w, "stats error", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+	writeJSON(w, http.StatusOK, out)
 }
 
+// /api/market-events — live event feed
 func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
@@ -205,7 +204,7 @@ SELECT
   me.old_value,
   me.new_value,
   me.detected_at,
-  ms.question,
+  COALESCE(ms.question, me.token_id) AS question,
   me.metadata
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
@@ -222,221 +221,226 @@ LIMIT $1 OFFSET $2;
 	defer rows.Close()
 
 	type ev struct {
-		TokenID    string          `json:"token_id"`
-		EventType  string          `json:"event_type"`
-		OldValue   *float64        `json:"old_value,omitempty"`
-		NewValue   *float64        `json:"new_value,omitempty"`
-		DetectedAt time.Time       `json:"detected_at"`
-		Question   string          `json:"question"`
-		Metadata   map[string]any  `json:"metadata,omitempty"`
-		RawMeta    json.RawMessage `json:"-"`
+		TokenID    string                 `json:"token_id"`
+		EventType  string                 `json:"event_type"`
+		OldValue   *float64               `json:"old_value,omitempty"`
+		NewValue   *float64               `json:"new_value,omitempty"`
+		DetectedAt time.Time              `json:"detected_at"`
+		Question   string                 `json:"question"`
+		Metadata   map[string]interface{} `json:"metadata,omitempty"`
 	}
 	out := make([]ev, 0, limit)
 
 	for rows.Next() {
 		var e ev
 		var evType sql.NullString
-		var oldV, newV sql.NullString
+		var oldV, newV sql.NullFloat64
 		var qn sql.NullString
-		if err := rows.Scan(&e.TokenID, &evType, &oldV, &newV, &e.DetectedAt, &qn, &e.RawMeta); err != nil {
+		var raw json.RawMessage
+		if err := rows.Scan(&e.TokenID, &evType, &oldV, &newV, &e.DetectedAt, &qn, &raw); err != nil {
 			continue
 		}
 		e.EventType = evType.String
 		if oldV.Valid {
-			if v, err := strconv.ParseFloat(oldV.String, 64); err == nil {
-				e.OldValue = &v
-			}
+			val := oldV.Float64
+			e.OldValue = &val
 		}
 		if newV.Valid {
-			if v, err := strconv.ParseFloat(newV.String, 64); err == nil {
-				e.NewValue = &v
-			}
+			val := newV.Float64
+			e.NewValue = &val
 		}
 		if qn.Valid {
 			e.Question = qn.String
+		} else {
+			e.Question = e.TokenID
 		}
-		if len(e.RawMeta) > 0 {
-			_ = json.Unmarshal(e.RawMeta, &e.Metadata)
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &e.Metadata)
 		}
 		out = append(out, e)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *APIServer) getTrades(w http.ResponseWriter, r *http.Request) {
+// /api/fills — recent paper fills across all strategies (from paper_trades)
+func (s *APIServer) getFills(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
-	limit := atoiDefault(r.URL.Query().Get("limit"), 50)
+	limit := atoiDefault(r.URL.Query().Get("limit"), 100)
 
 	const q = `
-SELECT 
-  po.id,
-  po.token_id,
+SELECT
+  t.id,
+  t.token_id,
   COALESCE(s.name,'unknown') AS strategy,
-  po.side,
-  po.price AS entry_price,
-  po.size,
-  po.status,
-  po.created_at AS entry_time,
-  po.filled_at  AS exit_time,
-  COALESCE(ms.question, po.token_id) AS market_id,
-  COALESCE(pp.unrealized_pnl, 0) AS pnl
-FROM paper_orders po
-LEFT JOIN trading_sessions ts ON po.session_id = ts.id
-LEFT JOIN strategies s ON ts.strategy_id = s.id
-LEFT JOIN market_scans ms ON po.token_id = ms.token_id
-LEFT JOIN paper_positions pp ON pp.session_id = po.session_id AND pp.token_id = po.token_id
-ORDER BY po.created_at DESC
+  t.side,
+  t.price,
+  t.shares,
+  t.notional,
+  t.realized_pnl,
+  t.created_at,
+  COALESCE(ms.question, t.token_id) AS market
+FROM paper_trades t
+JOIN trading_sessions ts ON ts.id = t.session_id
+LEFT JOIN strategies s ON s.id = ts.strategy_id
+LEFT JOIN market_scans ms ON ms.token_id = t.token_id
+ORDER BY t.created_at DESC
 LIMIT $1;
 `
 	rows, err := s.db.QueryContext(ctx, q, limit)
 	if err != nil {
-		s.log.Error("getTrades", "err", err)
+		s.log.Error("getFills", "err", err)
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
 	defer rows.Close()
 
-	type trade struct {
-		ID         int        `json:"id"`
-		TokenID    string     `json:"token_id"`
-		Strategy   string     `json:"strategy"`
-		MarketID   string     `json:"market_id"`
-		Side       string     `json:"side"`
-		EntryPrice float64    `json:"entry_price"`
-		Size       float64    `json:"size"`
-		Status     string     `json:"status"`
-		EntryTime  time.Time  `json:"entry_time"`
-		ExitTime   *time.Time `json:"exit_time,omitempty"`
-		ExitPrice  *float64   `json:"exit_price,omitempty"`
-		PnL        float64    `json:"pnl"`
+	type fill struct {
+		ID          int64     `json:"id"`
+		TokenID     string    `json:"token_id"`
+		Market      string    `json:"market"`
+		Strategy    string    `json:"strategy"`
+		Side        string    `json:"side"`
+		Price       float64   `json:"price"`
+		Shares      float64   `json:"shares"`
+		Notional    float64   `json:"notional"`
+		RealizedPnL float64   `json:"realized_pnl"`
+		CreatedAt   time.Time `json:"created_at"`
 	}
-
-	var out []trade
+	var out []fill
 	for rows.Next() {
-		var t trade
-		var marketID sql.NullString
-		var exitTime sql.NullTime
-		if err := rows.Scan(&t.ID, &t.TokenID, &t.Strategy, &t.Side, &t.EntryPrice, &t.Size, &t.Status, &t.EntryTime, &exitTime, &marketID, &t.PnL); err != nil {
+		var f fill
+		if err := rows.Scan(&f.ID, &f.TokenID, &f.Strategy, &f.Side, &f.Price, &f.Shares, &f.Notional, &f.RealizedPnL, &f.CreatedAt, &f.Market); err != nil {
 			continue
 		}
-		if marketID.Valid {
-			t.MarketID = marketID.String
-		} else {
-			t.MarketID = t.TokenID
-		}
-		if exitTime.Valid {
-			t.ExitTime = &exitTime.Time
-			if t.Size > 0 {
-				ep := t.EntryPrice + (t.PnL / t.Size)
-				t.ExitPrice = &ep
-			}
-		}
-		out = append(out, t)
+		out = append(out, f)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-// Strategy-specific endpoints
-func (s *APIServer) getStrategyPerformanceDetail(w http.ResponseWriter, r *http.Request) {
+// /api/strategies — per-strategy summary (for cards/leaderboard)
+func (s *APIServer) listStrategies(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	vars := mux.Vars(r)
-	strategy := vars["name"]
-
-	// Get overall metrics
-	var metrics struct {
-		TotalPnL    float64 `json:"total_pnl"`
-		Wins        int     `json:"wins"`
-		Losses      int     `json:"losses"`
-		TotalTrades int     `json:"total_trades"`
-		AvgWin      float64 `json:"avg_win"`
-		AvgLoss     float64 `json:"avg_loss"`
-	}
-
-	err := s.db.QueryRowContext(ctx, `
-		SELECT 
-			COALESCE(SUM(pnl), 0) as total_pnl,
-			COUNT(CASE WHEN pnl > 0 THEN 1 END) as wins,
-			COUNT(CASE WHEN pnl < 0 THEN 1 END) as losses,
-			COUNT(*) as total_trades,
-			COALESCE(AVG(CASE WHEN pnl > 0 THEN pnl END), 0) as avg_win,
-			COALESCE(AVG(CASE WHEN pnl < 0 THEN pnl END), 0) as avg_loss
-		FROM paper_positions
-		WHERE strategy = $1 AND status = 'closed'
-	`, strategy).Scan(&metrics.TotalPnL, &metrics.Wins, &metrics.Losses,
-		&metrics.TotalTrades, &metrics.AvgWin, &metrics.AvgLoss)
-
+	const q = `
+WITH
+  sess AS (
+    SELECT ts.id, ts.strategy_id, ts.current_balance, ts.realized_pnl
+    FROM trading_sessions ts
+  ),
+  unreal AS (
+    SELECT ts.strategy_id, COALESCE(SUM(pp.unrealized_pnl),0) AS unreal
+    FROM paper_positions pp
+    JOIN trading_sessions ts ON ts.id = pp.session_id
+    WHERE pp.shares > 0
+    GROUP BY ts.strategy_id
+  ),
+  recent AS (
+    SELECT ts.strategy_id, COUNT(*) AS fills_24h, MAX(t.created_at) AS last_trade_at
+    FROM paper_trades t
+    JOIN trading_sessions ts ON ts.id = t.session_id
+    WHERE t.created_at > NOW() - INTERVAL '24 hours'
+    GROUP BY ts.strategy_id
+  )
+SELECT
+  s.name,
+  COALESCE(SUM(sess.realized_pnl),0) AS realized_pnl,
+  COALESCE(u.unreal,0) AS unrealized_pnl,
+  COALESCE(r.fills_24h,0) AS fills_24h,
+  r.last_trade_at
+FROM strategies s
+LEFT JOIN sess ON sess.strategy_id = s.id
+LEFT JOIN unreal u ON u.strategy_id = s.id
+LEFT JOIN recent r ON r.strategy_id = s.id
+GROUP BY s.name, u.unreal, r.fills_24h, r.last_trade_at
+ORDER BY (COALESCE(SUM(sess.realized_pnl),0) + COALESCE(u.unreal,0)) DESC, s.name;
+`
+	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
-		s.log.Error("getStrategyPerformanceDetail", "err", err)
+		s.log.Error("listStrategies", "err", err)
+		writeJSON(w, http.StatusOK, []any{})
+		return
 	}
+	defer rows.Close()
 
-	// Get daily P&L for chart
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT 
-			DATE(exited_at) as date,
-			SUM(pnl) as daily_pnl,
-			SUM(SUM(pnl)) OVER (ORDER BY DATE(exited_at)) as cumulative_pnl
-		FROM paper_positions
-		WHERE strategy = $1 AND status = 'closed' AND exited_at > NOW() - INTERVAL '30 days'
-		GROUP BY DATE(exited_at)
-		ORDER BY date
-	`, strategy)
-
-	var dailyPnL []map[string]interface{}
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var date time.Time
-			var daily, cumulative float64
-			if err := rows.Scan(&date, &daily, &cumulative); err == nil {
-				dailyPnL = append(dailyPnL, map[string]interface{}{
-					"date":           date.Format("Jan 2"),
-					"daily_pnl":      daily,
-					"cumulative_pnl": cumulative,
-				})
-			}
+	type row struct {
+		Name          string     `json:"name"`
+		RealizedPnL   float64    `json:"realized_pnl"`
+		UnrealizedPnL float64    `json:"unrealized_pnl"`
+		Fills24h      int64      `json:"fills_24h"`
+		LastTradeAt   *time.Time `json:"last_trade_at,omitempty"`
+		TotalPnL      float64    `json:"total_pnl"`
+	}
+	var out []row
+	for rows.Next() {
+		var r row
+		var lta sql.NullTime
+		if err := rows.Scan(&r.Name, &r.RealizedPnL, &r.UnrealizedPnL, &r.Fills24h, &lta); err != nil {
+			continue
 		}
+		if lta.Valid {
+			r.LastTradeAt = &lta.Time
+		}
+		r.TotalPnL = r.RealizedPnL + r.UnrealizedPnL
+		out = append(out, r)
 	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"total_pnl":    metrics.TotalPnL,
-		"wins":         metrics.Wins,
-		"losses":       metrics.Losses,
-		"total_trades": metrics.TotalTrades,
-		"avg_win":      metrics.AvgWin,
-		"avg_loss":     metrics.AvgLoss,
-		"daily_pnl":    dailyPnL,
-	})
+	writeJSON(w, http.StatusOK, out)
 }
 
+// /api/strategies/{name}/positions — open positions for a strategy (with correct unrealized P&L)
 func (s *APIServer) getStrategyPositions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	vars := mux.Vars(r)
-	strategy := vars["name"]
+	strategy := mux.Vars(r)["name"]
 
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT 
-			p.token_id,
-			COALESCE(m.question, p.market, 'Unknown') as market,
-			p.side,
-			p.size,
-			p.entry_price,
-			COALESCE(
-				(SELECT (best_bid + best_ask) / 2.0 FROM market_quotes WHERE token_id = p.token_id ORDER BY ts DESC LIMIT 1),
-				p.entry_price
-			) as current_price,
-			p.entered_at,
-			EXTRACT(EPOCH FROM (NOW() - p.entered_at))/3600 as hours_held
-		FROM paper_positions p
-		LEFT JOIN markets m ON m.token_id = p.token_id
-		WHERE p.strategy = $1 AND p.status = 'open'
-		ORDER BY p.entered_at DESC
-	`, strategy)
-
+	// Derive "side" from the most recent non-EXIT trade per (session, token).
+	// Compute current_price from latest mid; fall back to stored current_price/avg_entry_price.
+	const q = `
+WITH strat AS (
+  SELECT id FROM strategies WHERE name = $1
+),
+sess AS (
+  SELECT id FROM trading_sessions WHERE strategy_id IN (SELECT id FROM strat)
+),
+latest_side AS (
+  SELECT t.session_id, t.token_id,
+         FIRST_VALUE(t.side) OVER (PARTITION BY t.session_id, t.token_id ORDER BY t.created_at DESC) AS side
+  FROM paper_trades t
+  WHERE t.side IN ('YES','NO') AND t.session_id IN (SELECT id FROM sess)
+),
+pos AS (
+  SELECT pp.session_id, pp.token_id, pp.shares, pp.avg_entry_price,
+         COALESCE(
+           (SELECT (mq.best_bid + mq.best_ask)/2.0 FROM market_quotes mq WHERE mq.token_id = pp.token_id ORDER BY mq.ts DESC LIMIT 1),
+           pp.current_price,
+           pp.avg_entry_price
+         ) AS current_price,
+         COALESCE(ms.question, pp.token_id) AS market,
+         ls.side,
+         pp.updated_at
+  FROM paper_positions pp
+  LEFT JOIN latest_side ls ON ls.session_id = pp.session_id AND ls.token_id = pp.token_id
+  LEFT JOIN market_scans ms ON ms.token_id = pp.token_id
+  WHERE pp.shares > 0 AND pp.session_id IN (SELECT id FROM sess)
+)
+SELECT
+  token_id,
+  market,
+  COALESCE(side,'YES') AS side, -- default optimistic if unknown
+  shares,
+  avg_entry_price,
+  current_price,
+  CASE WHEN COALESCE(side,'YES') = 'YES'
+       THEN (current_price - avg_entry_price) * shares
+       ELSE (avg_entry_price - current_price) * shares
+  END AS unrealized_pnl,
+  updated_at
+FROM pos
+ORDER BY updated_at DESC, market, token_id;
+`
+	rows, err := s.db.QueryContext(ctx, q, strategy)
 	if err != nil {
 		s.log.Error("getStrategyPositions", "err", err)
 		writeJSON(w, http.StatusOK, []map[string]interface{}{})
@@ -444,96 +448,180 @@ func (s *APIServer) getStrategyPositions(w http.ResponseWriter, r *http.Request)
 	}
 	defer rows.Close()
 
-	var positions []map[string]interface{}
+	var out []map[string]interface{}
 	for rows.Next() {
 		var tokenID, market, side string
-		var size, entryPrice, currentPrice, hoursHeld float64
-		var enteredAt time.Time
-
-		if err := rows.Scan(&tokenID, &market, &side, &size, &entryPrice, &currentPrice, &enteredAt, &hoursHeld); err != nil {
+		var shares, entry, current, upnl float64
+		var updatedAt time.Time
+		if err := rows.Scan(&tokenID, &market, &side, &shares, &entry, &current, &upnl, &updatedAt); err != nil {
 			continue
 		}
-
-		unrealizedPnL := (currentPrice - entryPrice) * size
-		if side == "NO" {
-			unrealizedPnL = (entryPrice - currentPrice) * size
-		}
-
-		duration := fmt.Sprintf("%.1fh", hoursHeld)
-		if hoursHeld < 1 {
-			duration = fmt.Sprintf("%dm", int(hoursHeld*60))
-		}
-
-		positions = append(positions, map[string]interface{}{
+		out = append(out, map[string]interface{}{
 			"token_id":       tokenID,
 			"market":         market,
 			"side":           side,
-			"size":           size,
-			"entry_price":    entryPrice,
-			"current_price":  currentPrice,
-			"unrealized_pnl": unrealizedPnL,
-			"duration":       duration,
+			"shares":         shares,
+			"avg_entry":      entry,
+			"current_price":  current,
+			"unrealized_pnl": upnl,
+			"updated_at":     updatedAt,
 		})
 	}
-
-	writeJSON(w, http.StatusOK, positions)
+	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *APIServer) getStrategyTrades(w http.ResponseWriter, r *http.Request) {
+// /api/strategies/{name}/fills — recent fills for a single strategy
+func (s *APIServer) getStrategyFills(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	vars := mux.Vars(r)
-	strategy := vars["name"]
-	limit := atoiDefault(r.URL.Query().Get("limit"), 20)
+	strategy := mux.Vars(r)["name"]
+	limit := atoiDefault(r.URL.Query().Get("limit"), 100)
 
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT 
-			p.token_id,
-			COALESCE(m.question, p.market, 'Unknown') as market,
-			p.side,
-			p.entry_price,
-			p.exit_price,
-			p.pnl,
-			p.exit_reason,
-			p.exited_at
-		FROM paper_positions p
-		LEFT JOIN markets m ON m.token_id = p.token_id
-		WHERE p.strategy = $1 AND p.status = 'closed'
-		ORDER BY p.exited_at DESC
-		LIMIT $2
-	`, strategy, limit)
-
+	const q = `
+SELECT
+  t.id,
+  t.token_id,
+  t.side,
+  t.price,
+  t.shares,
+  t.notional,
+  t.realized_pnl,
+  t.created_at,
+  COALESCE(ms.question, t.token_id) AS market
+FROM paper_trades t
+JOIN trading_sessions ts ON ts.id = t.session_id
+JOIN strategies s ON s.id = ts.strategy_id
+LEFT JOIN market_scans ms ON ms.token_id = t.token_id
+WHERE s.name = $1
+ORDER BY t.created_at DESC
+LIMIT $2;
+`
+	rows, err := s.db.QueryContext(ctx, q, strategy, limit)
 	if err != nil {
-		s.log.Error("getStrategyTrades", "err", err)
+		s.log.Error("getStrategyFills", "err", err)
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	defer rows.Close()
+
+	type fill struct {
+		ID          int64     `json:"id"`
+		TokenID     string    `json:"token_id"`
+		Market      string    `json:"market"`
+		Side        string    `json:"side"`
+		Price       float64   `json:"price"`
+		Shares      float64   `json:"shares"`
+		Notional    float64   `json:"notional"`
+		RealizedPnL float64   `json:"realized_pnl"`
+		CreatedAt   time.Time `json:"created_at"`
+	}
+	var out []fill
+	for rows.Next() {
+		var f fill
+		if err := rows.Scan(&f.ID, &f.TokenID, &f.Side, &f.Price, &f.Shares, &f.Notional, &f.RealizedPnL, &f.CreatedAt, &f.Market); err != nil {
+			continue
+		}
+		out = append(out, f)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// /api/strategies/{name}/pnl — daily realized/unrealized + cumulative (default 30 days)
+func (s *APIServer) getStrategyPnL(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.reqCtx(r)
+	defer cancel()
+
+	strategy := mux.Vars(r)["name"]
+	days := atoiDefault(r.URL.Query().Get("days"), 30)
+	if days < 1 || days > 365 {
+		days = 30
+	}
+
+	const q = `
+WITH strat AS (
+  SELECT id FROM strategies WHERE name = $1
+),
+sess AS (
+  SELECT id FROM trading_sessions WHERE strategy_id IN (SELECT id FROM strat)
+),
+realized AS (
+  SELECT DATE(t.created_at) AS d, COALESCE(SUM(t.realized_pnl),0) AS r
+  FROM paper_trades t
+  WHERE t.session_id IN (SELECT id FROM sess)
+    AND t.created_at > NOW() - ($2::text || ' days')::interval
+  GROUP BY 1
+),
+unreal AS (
+  -- snapshot unrealized by day using latest price per day
+  SELECT d::date AS d,
+         COALESCE(SUM(
+           CASE WHEN ls.side = 'NO'
+                THEN (coalesce_price(d, pp.token_id) * 0 + (pp.avg_entry_price - coalesce_price(d, pp.token_id))) * pp.shares
+                ELSE (coalesce_price(d, pp.token_id) - pp.avg_entry_price) * pp.shares
+           END
+         ),0) AS u
+  FROM generate_series((NOW() - ($2::text || ' days')::interval)::date, NOW()::date, '1 day') AS d
+  JOIN paper_positions pp ON pp.session_id IN (SELECT id FROM sess) AND pp.shares > 0
+  LEFT JOIN LATERAL (
+     SELECT FIRST_VALUE(t.side) OVER (PARTITION BY t.session_id, t.token_id ORDER BY t.created_at DESC) AS side
+     FROM paper_trades t
+     WHERE t.session_id = pp.session_id AND t.token_id = pp.token_id AND t.side IN ('YES','NO')
+     LIMIT 1
+  ) ls ON true
+  GROUP BY 1
+)
+SELECT
+  COALESCE(r.d, u.d) AS date,
+  COALESCE(r.r, 0) AS realized,
+  COALESCE(u.u, 0) AS unrealized
+FROM realized r
+FULL OUTER JOIN unreal u USING (d)
+ORDER BY date;
+`
+	// Note: coalesce_price() is not a DB function; we synthesize current price via inline subselects below.
+	// Because PostgreSQL can’t call a Go helper inside SQL, we’ll expand the expression using a subquery in code:
+	// Replace coalesce_price(d, token) with:
+	//   COALESCE(
+	//     (SELECT (best_bid+best_ask)/2.0 FROM market_quotes mq WHERE mq.token_id = pp.token_id AND mq.ts::date <= d ORDER BY mq.ts DESC LIMIT 1),
+	//     pp.current_price,
+	//     pp.avg_entry_price
+	//   )
+	// We’ll do this by string replacing before query, to keep the CTE structure readable above.
+	coalesceExpr := `
+COALESCE(
+ (SELECT (mq.best_bid+mq.best_ask)/2.0 FROM market_quotes mq WHERE mq.token_id = pp.token_id AND mq.ts::date <= d ORDER BY mq.ts DESC LIMIT 1),
+ pp.current_price,
+ pp.avg_entry_price
+)`
+	finalQ := strings.ReplaceAll(q, "coalesce_price(d, pp.token_id)", coalesceExpr)
+
+	rows, err := s.db.QueryContext(ctx, finalQ, strategy, strconv.Itoa(days))
+	if err != nil {
+		s.log.Error("getStrategyPnL", "err", err)
 		writeJSON(w, http.StatusOK, []map[string]interface{}{})
 		return
 	}
 	defer rows.Close()
 
-	var trades []map[string]interface{}
+	type row struct {
+		Date       time.Time `json:"date"`
+		Realized   float64   `json:"realized"`
+		Unrealized float64   `json:"unrealized"`
+		Cumulative float64   `json:"cumulative"`
+	}
+	var out []row
+	var cumulative float64
 	for rows.Next() {
-		var tokenID, market, side, exitReason string
-		var entryPrice, exitPrice, pnl float64
-		var exitedAt time.Time
-
-		if err := rows.Scan(&tokenID, &market, &side, &entryPrice, &exitPrice, &pnl, &exitReason, &exitedAt); err != nil {
+		var r row
+		if err := rows.Scan(&r.Date, &r.Realized, &r.Unrealized); err != nil {
 			continue
 		}
-
-		trades = append(trades, map[string]interface{}{
-			"token_id":    tokenID,
-			"market":      market,
-			"side":        side,
-			"entry_price": entryPrice,
-			"exit_price":  exitPrice,
-			"pnl":         pnl,
-			"exit_reason": exitReason,
-			"exited_at":   exitedAt,
-		})
+		cumulative += r.Realized + r.Unrealized
+		r.Cumulative = cumulative
+		out = append(out, r)
 	}
-
-	writeJSON(w, http.StatusOK, trades)
+	writeJSON(w, http.StatusOK, out)
 }
 
 // --------- main ---------
@@ -579,15 +667,16 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}).Methods("GET")
 
-	// Protected
+	// Protected (frontend)
 	r.HandleFunc("/api/stats", server.authenticate(server.getStats)).Methods("GET")
-	r.HandleFunc("/api/trades", server.authenticate(server.getTrades)).Methods("GET")
 	r.HandleFunc("/api/market-events", server.authenticate(server.getMarketEvents)).Methods("GET")
+	r.HandleFunc("/api/fills", server.authenticate(server.getFills)).Methods("GET")
 
-	// Strategy-specific endpoints
-	r.HandleFunc("/api/strategies/{name}/performance", server.authenticate(server.getStrategyPerformanceDetail)).Methods("GET")
+	// Strategy lists & details
+	r.HandleFunc("/api/strategies", server.authenticate(server.listStrategies)).Methods("GET")
 	r.HandleFunc("/api/strategies/{name}/positions", server.authenticate(server.getStrategyPositions)).Methods("GET")
-	r.HandleFunc("/api/strategies/{name}/trades", server.authenticate(server.getStrategyTrades)).Methods("GET")
+	r.HandleFunc("/api/strategies/{name}/fills", server.authenticate(server.getStrategyFills)).Methods("GET")
+	r.HandleFunc("/api/strategies/{name}/pnl", server.authenticate(server.getStrategyPnL)).Methods("GET")
 
 	// CORS + logging + recover
 	cors := handlers.CORS(
