@@ -40,3 +40,5 @@ func (s *Store) ExecTx(ctx context.Context, fn func(*database.Queries) error) er
 
 	return tx.Commit()
 }
+
+func (s *Store) DB() *sql.DB { return s.db }

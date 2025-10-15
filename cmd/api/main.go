@@ -138,31 +138,42 @@ WITH
   ),
   features_per_min AS (
     SELECT COUNT(*) AS n FROM market_features WHERE ts > NOW() - INTERVAL '1 minute'
+  ),
+  quotes_5m AS (
+    SELECT COALESCE(COUNT(*),0)::bigint AS n FROM market_quotes WHERE ts > NOW() - INTERVAL '5 minutes'
+  ),
+  trades_5m AS (
+    SELECT COALESCE(COUNT(*),0)::bigint AS n FROM market_trades WHERE ts > NOW() - INTERVAL '5 minutes'
   )
 SELECT
-  (SELECT n FROM active_markets) AS active_markets,
-  (SELECT n FROM events_24h) AS events_24h,
-  (SELECT n FROM open_positions) AS open_positions,
-  (SELECT r FROM realized) + (SELECT unreal FROM open_positions) AS total_pnl,
-  (SELECT n FROM strategies_active) AS strategies_count,
-  (SELECT sec FROM quotes_lag) AS quotes_lag_sec,
-  (SELECT sec FROM trades_lag) AS trades_lag_sec,
-  (SELECT sec FROM features_lag) AS features_lag_sec,
-  (SELECT size FROM db_size) AS db_size,
-  (SELECT n FROM features_per_min) AS features_per_minute
+  (SELECT n FROM active_markets)                                        AS active_markets,
+  (SELECT n FROM events_24h)                                            AS events_24h,
+  (SELECT n FROM open_positions)                                        AS open_positions,
+  (SELECT r FROM realized) + (SELECT unreal FROM open_positions)        AS total_pnl,
+  (SELECT n FROM strategies_active)                                     AS strategies_count,
+  (SELECT sec FROM quotes_lag)                                          AS quotes_lag_sec,
+  (SELECT sec FROM trades_lag)                                          AS trades_lag_sec,
+  (SELECT sec FROM features_lag)                                        AS features_lag_sec,
+  (SELECT size FROM db_size)                                            AS db_size,
+  (SELECT n FROM features_per_min)                                      AS features_per_minute,
+  (SELECT (n / 5.0) FROM quotes_5m)                                     AS ingest_quotes_per_min,
+  (SELECT (n / 5.0) FROM trades_5m)                                     AS ingest_trades_per_min
 ;`
 
 	var out struct {
-		ActiveMarkets  int64   `json:"active_markets"`
-		Events24h      int64   `json:"events_24h"`
-		OpenPositions  int64   `json:"open_positions"`
-		TotalPnL       float64 `json:"total_pnl"`
-		Strategies     int64   `json:"strategies_count"`
-		QuotesLagSec   int64   `json:"quotes_lag_sec"`
-		TradesLagSec   int64   `json:"trades_lag_sec"`
-		FeaturesLagSec int64   `json:"features_lag_sec"`
-		DBSize         string  `json:"db_size"`
-		FeaturesPerMin int64   `json:"features_per_minute"`
+		ActiveMarkets      int64            `json:"active_markets"`
+		Events24h          int64            `json:"events_24h"`
+		OpenPositions      int64            `json:"open_positions"`
+		TotalPnL           float64          `json:"total_pnl"`
+		Strategies         int64            `json:"strategies_count"`
+		QuotesLagSec       int64            `json:"quotes_lag_sec"`
+		TradesLagSec       int64            `json:"trades_lag_sec"`
+		FeaturesLagSec     int64            `json:"features_lag_sec"`
+		DBSize             string           `json:"db_size"`
+		FeaturesPerMin     int64            `json:"features_per_minute"`
+		IngestQuotesPerMin float64          `json:"ingest_quotes_per_min"`
+		IngestTradesPerMin float64          `json:"ingest_trades_per_min"`
+		WriterQueueDepths  map[string]int64 `json:"writer_queue_depths,omitempty"`
 	}
 
 	row := s.db.QueryRowContext(ctx, q)
@@ -177,10 +188,28 @@ SELECT
 		&out.FeaturesLagSec,
 		&out.DBSize,
 		&out.FeaturesPerMin,
+		&out.IngestQuotesPerMin,
+		&out.IngestTradesPerMin,
 	); err != nil {
 		s.log.Error("getStats", "err", err)
 		http.Error(w, "stats error", http.StatusInternalServerError)
 		return
+	}
+
+	// Optional: fetch writer queue depths from the gatherer’s internal debug endpoint.
+	// Set GATHERER_DEBUG_URL (e.g., http://gatherer:6060). If unset or fails, we omit the field.
+	if base := os.Getenv("GATHERER_DEBUG_URL"); base != "" {
+		reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(base, "/")+"/debug/queues", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil && resp != nil && resp.Body != nil {
+			defer resp.Body.Close()
+			var qd map[string]int64
+			if json.NewDecoder(resp.Body).Decode(&qd) == nil {
+				out.WriterQueueDepths = qd
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, out)

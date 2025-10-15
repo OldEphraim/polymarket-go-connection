@@ -34,6 +34,7 @@ services:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       API_KEY: ${API_KEY}
       RUN_TYPE: prod
+      GATHERER_DEBUG_ADDR: ":6060"
       GATHERER_USE_WS: ${GATHERER_USE_WS:-true}
       GATHERER_WS_URL: ${GATHERER_WS_URL:-wss://ws-subscriptions-clob.polymarket.com/ws/market}
       GATHERER_SCAN_INTERVAL: ${GATHERER_SCAN_INTERVAL:-30s}

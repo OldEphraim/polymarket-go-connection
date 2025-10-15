@@ -2,15 +2,17 @@ package gatherer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"database/sql"
+	_ "net/http/pprof" // optional pprof endpoints
 
 	"github.com/sqlc-dev/pqtype"
 )
@@ -27,7 +29,7 @@ type Gatherer struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// Channels
+	// Channels (ingest → feature engine)
 	eventChan  chan MarketEvent
 	quotesCh   chan Quote
 	tradesCh   chan Trade
@@ -44,6 +46,12 @@ type Gatherer struct {
 
 	assetToToken map[string]string // clob asset_id -> market token_id
 	assetMu      sync.RWMutex
+
+	// COPY batcher
+	p *Persister
+
+	// internal debug HTTP
+	debugSrv *http.Server
 }
 
 // NOTE: WSClient removed from signature; the gatherer owns WS in ingest_ws.go
@@ -84,16 +92,34 @@ func (g *Gatherer) Start() error {
 		"scan_interval", g.config.ScanInterval,
 		"use_ws", g.config.UseWebsocket)
 
+	// Start internal debug HTTP (opt-in)
+	if addr := os.Getenv("GATHERER_DEBUG_ADDR"); addr != "" {
+		g.startDebugHTTP(addr)
+	}
+
 	// Warm cache
 	if err := g.loadMarketCache(); err != nil {
 		g.logger.Error("load market cache", "err", err)
+	}
+
+	// Initialize COPY persister (uses db.Store.DB())
+	// We lazy-cast to the minimal interface the persister expects.
+	type rawDB interface{ DB() *sql.DB }
+	if rdb, ok := any(g.store).(rawDB); ok {
+		g.p = NewPersister(rdb, defaultBatchSize, defaultFlushInterval)
+		g.p.Start()
+		g.logger.Info("persister started",
+			"batch_size", defaultBatchSize,
+			"flush_interval_ms", int(defaultFlushInterval/time.Millisecond))
+	} else {
+		g.logger.Error("store does not expose DB(); COPY batching disabled")
 	}
 
 	// Feature engine
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		runFeatureEngine(g.ctx, g.logger, g.config, g.store, g.featuresCh, g.quotesCh, g.tradesCh)
+		runFeatureEngine(g.ctx, g.logger, g.config, g.p, g.featuresCh, g.quotesCh, g.tradesCh)
 	}()
 
 	// Detector loop
@@ -128,9 +154,23 @@ func (g *Gatherer) Start() error {
 
 func (g *Gatherer) Stop() {
 	g.logger.Info("stopping gatherer")
+
+	// stop debug HTTP first so probes don't keep poking during shutdown
+	if g.debugSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = g.debugSrv.Shutdown(ctx)
+		cancel()
+	}
+
 	g.cancel()
 	g.wg.Wait()
 	close(g.eventChan)
+
+	// stop persister last so any final feature flush can enqueue safely
+	if g.p != nil {
+		_ = g.p.Stop(context.Background())
+	}
+
 	g.logger.Info("stopped",
 		"total_scans", g.scansPerformed,
 		"total_markets", g.marketsFound,
@@ -138,6 +178,55 @@ func (g *Gatherer) Stop() {
 }
 
 func (g *Gatherer) EventChannel() <-chan MarketEvent { return g.eventChan }
+
+// ===== Internal debug HTTP =====
+
+func (g *Gatherer) startDebugHTTP(addr string) {
+	mux := http.NewServeMux()
+
+	// Health
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Queue depths (cheap instantaneous gauges)
+	mux.HandleFunc("/debug/queues", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]int{
+			"events":   len(g.eventChan),
+			"quotes":   len(g.quotesCh),
+			"trades":   len(g.tradesCh),
+			"features": len(g.featuresCh),
+		})
+	})
+
+	// Optional: pprof under /debug/pprof/*
+	// The handlers are registered on DefaultServeMux; mount them here.
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
+
+	g.debugSrv = &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+
+	go func() {
+		g.logger.Info("gatherer debug http listening", "addr", addr)
+		if err := g.debugSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			g.logger.Warn("debug http server stopped", "err", err)
+		}
+	}()
+}
+
+// tiny JSON helper (local to gatherer)
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
 
 // ===== Shared helpers =====
 
@@ -324,7 +413,7 @@ func (g *Gatherer) runWSIngest() {
 				TS:        ts,
 				Price:     price,
 				Size:      size,
-				Aggressor: side, // "buy"/"sell"
+				Aggressor: side, // "buy"/"sell" — matches persister’s Trade.Side
 			}:
 			default:
 			}

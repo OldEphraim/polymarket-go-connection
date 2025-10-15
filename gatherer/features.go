@@ -11,9 +11,9 @@ import (
 
 // A small rolling window engine (per token)
 type featureEngine struct {
-	cfg   *Config
-	log   *slog.Logger
-	store Store
+	cfg *Config
+	log *slog.Logger
+	p   *Persister // COPY batcher (quotes/trades/features)
 
 	// input
 	quotes <-chan Quote
@@ -47,11 +47,11 @@ type traded struct {
 	signed float64
 } // signed +buy/-sell
 
-func runFeatureEngine(ctx context.Context, log *slog.Logger, cfg *Config, store Store,
+func runFeatureEngine(ctx context.Context, log *slog.Logger, cfg *Config, p *Persister,
 	out chan<- FeatureUpdate, quotes <-chan Quote, trades <-chan Trade) {
 
 	fe := &featureEngine{
-		cfg: cfg, log: log, store: store,
+		cfg: cfg, log: log, p: p,
 		out: out, quotes: quotes, trades: trades,
 		state: map[string]*rollState{},
 	}
@@ -84,7 +84,10 @@ func (fe *featureEngine) st(token string) *rollState {
 }
 
 func (fe *featureEngine) onQuote(q Quote) {
-	persistQuote(context.Background(), fe.store, q) // persist every top-of-book snapshot
+	// persist every top-of-book snapshot (COPY-batched)
+	if fe.p != nil {
+		fe.p.EnqueueQuote(q)
+	}
 	st := fe.st(q.TokenID)
 	st.lastMid.PushBack(priced{ts: q.TS, mid: q.Mid})
 	fe.gcPrices(st, q.TS)
@@ -100,7 +103,10 @@ func (fe *featureEngine) onQuote(q Quote) {
 }
 
 func (fe *featureEngine) onTrade(t Trade) {
-	persistTrade(context.Background(), fe.store, t) // persist every print
+	// persist every print (COPY-batched)
+	if fe.p != nil {
+		fe.p.EnqueueTrade(t)
+	}
 	st := fe.st(t.TokenID)
 	sign := 0.0
 	if t.Aggressor == "buy" {
@@ -176,8 +182,11 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, signed
 	}
 
 	st.lastEmit = ts
-	// persist (optional but recommended)
-	persistFeatures(context.Background(), fe.store, fu)
+
+	// persist features (COPY-batched via stage+upsert)
+	if fe.p != nil {
+		fe.p.EnqueueFeatures(fu)
+	}
 
 	select {
 	case fe.out <- fu:
