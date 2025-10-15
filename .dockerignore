@@ -1,0 +1,21 @@
+# VCS & editor junk
+.git
+.gitignore
+**/.DS_Store
+**/*.swp
+**/*.swo
+.vscode
+.idea
+
+# Build artifacts & temp
+bin/
+build/
+dist/
+tmp/
+*.log
+
+# Local data
+postgres_data/
+**/*.sqlite*
+.env
+.env.*
