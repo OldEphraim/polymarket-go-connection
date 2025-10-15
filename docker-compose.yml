@@ -40,6 +40,8 @@ services:
       GATHERER_SCAN_INTERVAL: ${GATHERER_SCAN_INTERVAL:-30s}
       POLY_WS_DEBUG: ${POLY_WS_DEBUG:-0}
       POLY_WS_LOG_UNKNOWN: ${POLY_WS_LOG_UNKNOWN:-0}
+    ports:
+      - "6060:6060"
     command: ["/usr/local/bin/gatherer"]
     restart: unless-stopped
 
