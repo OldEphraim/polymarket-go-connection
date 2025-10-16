@@ -122,6 +122,9 @@ func (g *Gatherer) Start() error {
 		runFeatureEngine(g.ctx, g.logger, g.config, g.p, g.featuresCh, g.quotesCh, g.tradesCh)
 	}()
 
+	// start channel writers to persist quotes/trades/features
+	g.startWriters()
+
 	// Detector loop
 	g.wg.Add(1)
 	go func() {
@@ -191,13 +194,21 @@ func (g *Gatherer) startDebugHTTP(addr string) {
 	})
 
 	// Queue depths (cheap instantaneous gauges)
-	mux.HandleFunc("/debug/queues", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]int{
-			"events":   len(g.eventChan),
-			"quotes":   len(g.quotesCh),
-			"trades":   len(g.tradesCh),
-			"features": len(g.featuresCh),
-		})
+	mux.HandleFunc("/queues", func(w http.ResponseWriter, r *http.Request) {
+		type Q struct {
+			EventQueue    int `json:"event_queue"`
+			QuotesQueue   int `json:"quotes_queue"`
+			TradesQueue   int `json:"trades_queue"`
+			FeaturesQueue int `json:"features_queue"`
+		}
+		out := Q{
+			EventQueue:    len(g.eventChan),
+			QuotesQueue:   len(g.quotesCh),
+			TradesQueue:   len(g.tradesCh),
+			FeaturesQueue: len(g.featuresCh),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
 	})
 
 	// Optional: pprof under /debug/pprof/*
@@ -432,4 +443,65 @@ func (g *Gatherer) runWSIngest() {
 		}
 		return
 	}
+}
+
+// startWriters drains quotes/trades/features to storage.
+// If COPY persister is present, enqueue there; otherwise call Store methods.
+func (g *Gatherer) startWriters() {
+	// Quotes
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		for {
+			select {
+			case <-g.ctx.Done():
+				return
+			case q := <-g.quotesCh:
+				if g.p != nil {
+					g.p.EnqueueQuote(q) // implement in persister OR fall back below
+					continue
+				}
+				if err := g.store.InsertQuote(g.ctx, q); err != nil {
+					g.logger.Error("insert quote", "token_id", q.TokenID, "err", err)
+				}
+			}
+		}
+	}()
+
+	// Trades
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		for {
+			select {
+			case <-g.ctx.Done():
+				return
+			case t := <-g.tradesCh:
+				if g.p != nil {
+					g.p.EnqueueTrade(t) // implement in persister OR fall back below
+					continue
+				}
+				if err := g.store.InsertTrade(g.ctx, t); err != nil {
+					g.logger.Error("insert trade", "token_id", t.TokenID, "err", err)
+				}
+			}
+		}
+	}()
+
+	// Features (in case your feature engine publishes snapshots here)
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		for {
+			select {
+			case <-g.ctx.Done():
+				return
+			case f := <-g.featuresCh:
+				// If you later add COPY support for features, mirror the pattern.
+				if err := g.store.UpsertFeatures(g.ctx, f); err != nil {
+					g.logger.Error("upsert features", "token_id", f.TokenID, "err", err)
+				}
+			}
+		}
+	}()
 }
