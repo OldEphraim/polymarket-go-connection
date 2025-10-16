@@ -394,20 +394,25 @@ func (g *Gatherer) tokenForAsset(assetID string) string {
 
 func (g *Gatherer) runWSIngest() {
 	backoff := time.Second
+	var qCount, tCount int64
+	lastReport := time.Now()
+
 	for {
 		if g.ctx.Err() != nil {
 			return
 		}
+
 		assets := g.wsAssetList()
 		if len(assets) == 0 {
-			time.Sleep(2 * time.Second) // wait for first REST scan to fill assetToToken
+			// No assets yet — first REST scan hasn’t filled the clob map.
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
+		g.logger.Info("ws subscribing", "assets", len(assets))
+
 		onQuote := func(assetID string, bestBid, bestAsk float64, ts time.Time) {
-			g.assetMu.RLock()
 			tokenID := g.tokenForAsset(assetID)
-			g.assetMu.RUnlock()
 			if tokenID == "" {
 				return
 			}
@@ -425,14 +430,19 @@ func (g *Gatherer) runWSIngest() {
 				SpreadBps: spreadBps,
 				Mid:       mid,
 			}:
+				qCount++
 			default:
+			}
+
+			// lightweight periodic report (once per 10s)
+			if time.Since(lastReport) > 10*time.Second {
+				g.logger.Info("ws traffic", "quotes", qCount, "trades", tCount)
+				lastReport = time.Now()
 			}
 		}
 
 		onTrade := func(assetID string, price float64, side string, size float64, ts time.Time) {
-			g.assetMu.RLock()
 			tokenID := g.tokenForAsset(assetID)
-			g.assetMu.RUnlock()
 			if tokenID == "" {
 				return
 			}
@@ -442,13 +452,17 @@ func (g *Gatherer) runWSIngest() {
 				TS:        ts,
 				Price:     price,
 				Size:      size,
-				Aggressor: side, // "buy"/"sell" — matches persister’s Trade.Side
+				Aggressor: side,
 			}:
+				tCount++
 			default:
+			}
+			if time.Since(lastReport) > 10*time.Second {
+				g.logger.Info("ws traffic", "quotes", qCount, "trades", tCount)
+				lastReport = time.Now()
 			}
 		}
 
-		// 👇 create the client here (no g.ws field needed)
 		ws := NewPolymarketWSClient(g.logger)
 		err := ws.Run(g.ctx, g.config.WebsocketURL, assets, onQuote, onTrade)
 		if err != nil && g.ctx.Err() == nil {
