@@ -32,15 +32,26 @@ func main() {
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL environment variable not set")
 	}
-	sqlDB, err := sql.Open("postgres", dbURL)
+
+	sqlDB, err := sql.Open("postgres", dbURL) // requires: _ "github.com/lib/pq"
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
+
+	// (optional but recommended) sane pool settings
+	sqlDB.SetMaxOpenConns(20)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+
 	if err := sqlDB.Ping(); err != nil {
 		log.Fatalf("ping db: %v", err)
 	}
+
+	// sqlc queries handle
 	q := database.New(sqlDB)
-	store := gatherer.NewSQLCStore(q)
+
+	// ⬅️ Pass BOTH the queries and the raw *sql.DB so the COPY persister can use it
+	store := gatherer.NewSQLCStore(q, sqlDB)
 
 	// Config
 	cfg := gatherer.DefaultConfig()

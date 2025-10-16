@@ -11,10 +11,16 @@ import (
 )
 
 type SQLCStore struct {
-	q *database.Queries
+	q  *database.Queries
+	db *sql.DB
 }
 
-func NewSQLCStore(q *database.Queries) *SQLCStore { return &SQLCStore{q: q} }
+func NewSQLCStore(q *database.Queries, db *sql.DB) *SQLCStore {
+	return &SQLCStore{q: q, db: db}
+}
+
+// Expose the raw DB so the Persister can COPY
+func (s *SQLCStore) DB() *sql.DB { return s.db }
 
 // ---- Helpers ----
 func nff(v float64) sql.NullFloat64 { return sql.NullFloat64{Float64: v, Valid: !math.IsNaN(v)} }
