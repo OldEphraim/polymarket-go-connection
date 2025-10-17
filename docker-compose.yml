@@ -8,6 +8,7 @@ services:
   postgres:
     logging: *default-logging
     image: postgres:14
+    shm_size: "1g"              # <-- add this
     command:
       - postgres
       - -c
