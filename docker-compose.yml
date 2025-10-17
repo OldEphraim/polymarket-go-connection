@@ -9,18 +9,29 @@ services:
     logging: *default-logging
     image: postgres:14
     command:
-      - "postgres"
-      - "-c" "wal_compression=on"
-      - "-c" "max_wal_size=4GB"
-      - "-c" "min_wal_size=1GB"
-      - "-c" "shared_buffers=512MB"
-      - "-c" "checkpoint_timeout=15min"
-      - "-c" "checkpoint_completion_target=0.9"
-      - "-c" "autovacuum_vacuum_cost_limit=1000"
-      - "-c" "autovacuum_max_workers=5"
-      - "-c" "autovacuum_naptime=1min"
-      - "-c" "effective_io_concurrency=200"
-      - "-c" "maintenance_work_mem=512MB"
+      - postgres
+      - -c
+      - wal_compression=on
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - autovacuum_vacuum_cost_limit=1000
+      - -c
+      - autovacuum_max_workers=5
+      - -c
+      - autovacuum_naptime=1min
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - maintenance_work_mem=512MB
     environment:
       POSTGRES_DB: polymarket_dev
       POSTGRES_USER: a8garber
