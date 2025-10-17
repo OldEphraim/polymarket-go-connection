@@ -1,6 +1,26 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   postgres:
+    logging: *default-logging
     image: postgres:14
+    command:
+      - "postgres"
+      - "-c" "wal_compression=on"
+      - "-c" "max_wal_size=4GB"
+      - "-c" "min_wal_size=1GB"
+      - "-c" "shared_buffers=512MB"
+      - "-c" "checkpoint_timeout=15min"
+      - "-c" "checkpoint_completion_target=0.9"
+      - "-c" "autovacuum_vacuum_cost_limit=1000"
+      - "-c" "autovacuum_max_workers=5"
+      - "-c" "autovacuum_naptime=1min"
+      - "-c" "effective_io_concurrency=200"
+      - "-c" "maintenance_work_mem=512MB"
     environment:
       POSTGRES_DB: polymarket_dev
       POSTGRES_USER: a8garber
@@ -10,12 +30,14 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U a8garber -d polymarket_dev"]
+      test: ["CMD-SHELL", "pg_isready -U a8garber -d polymarket_dev || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+      start_period: 20s
 
   migrator:
+    logging: *default-logging
     build: .
     depends_on:
       postgres:
@@ -26,6 +48,7 @@ services:
     restart: "no"
 
   gatherer:
+    logging: *default-logging
     build: .
     depends_on:
       migrator:
@@ -46,6 +69,7 @@ services:
     restart: unless-stopped
 
   api:
+    logging: *default-logging
     build: .
     depends_on:
       migrator:
@@ -65,6 +89,7 @@ services:
     restart: unless-stopped
 
   strategies:
+    logging: *default-logging
     build: .
     depends_on:
       migrator:
@@ -78,22 +103,34 @@ services:
     restart: unless-stopped
 
   archiver:
+    logging: *default-logging
     build: .
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
       AWS_REGION: ${AWS_REGION}
-    command: ["/bin/sh", "-c", "while true; do /usr/local/bin/archiver -table market_features -backfill || /usr/local/bin/archiver -table market_features || true; /usr/local/bin/archiver -table market_trades -backfill || /usr/local/bin/archiver -table market_trades || true; /usr/local/bin/archiver -table market_quotes -backfill || /usr/local/bin/archiver -table market_quotes || true; sleep 300; done"]
+    command: ["/bin/sh", "-c", "\
+      while true; do \
+        /usr/local/bin/archiver -table market_features -backfill || /usr/local/bin/archiver -table market_features || true; \
+        /usr/local/bin/archiver -table market_trades   -backfill || /usr/local/bin/archiver -table market_trades   || true; \
+        /usr/local/bin/archiver -table market_quotes   -backfill || /usr/local/bin/archiver -table market_quotes   || true; \
+        sleep 60; \
+      done"]
     restart: unless-stopped
 
   janitor:
+    logging: *default-logging
     build: .
     depends_on:
       migrator:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-    command: ["/bin/sh", "-c", "while true; do /usr/local/bin/janitor -tables features,trades,quotes; sleep 600; done"]
+    command: ["/bin/sh", "-c", "\
+      while true; do \
+        /usr/local/bin/janitor -tables features,trades,quotes -window '2 hours'; \
+        sleep 120; \
+      done"]
     restart: unless-stopped
 
 volumes:

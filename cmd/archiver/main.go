@@ -207,51 +207,56 @@ func s3KeyExists(ctx context.Context, c *s3.Client, bucket, key string) (bool, e
 	return false, err
 }
 
+type dumpResult struct {
+	rows int64
+	err  error
+}
+
 func streamHourToS3(ctx context.Context, db *sql.DB, c *s3.Client, bucket, key, table string, win HourWindow) (int64, int64, error) {
-	// Create temp file to write compressed data and track size
-	tmpFile, err := os.CreateTemp("", "archive-*.json.gz")
-	if err != nil {
-		return 0, 0, fmt.Errorf("create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
+	pr, pw := io.Pipe()
+	gw := gzip.NewWriter(pw)
 
-	// Write compressed data to temp file
-	gw := gzip.NewWriter(tmpFile)
-	rowCount, err := dumpTableHour(ctx, db, table, win, gw)
-	if err != nil {
-		gw.Close()
-		return 0, 0, fmt.Errorf("dump table: %w", err)
-	}
-	if err := gw.Close(); err != nil {
-		return 0, 0, fmt.Errorf("close gzip: %w", err)
-	}
+	// count bytes written (compressed)
+	var byteCount int64
+	mw := io.MultiWriter(gw, countWriter{&byteCount})
 
-	// Get file size
-	stat, err := tmpFile.Stat()
-	if err != nil {
-		return 0, 0, fmt.Errorf("stat temp file: %w", err)
-	}
-	byteSize := stat.Size()
+	resCh := make(chan dumpResult, 1)
 
-	// Rewind file for reading
-	if _, err := tmpFile.Seek(0, 0); err != nil {
-		return 0, 0, fmt.Errorf("seek temp file: %w", err)
-	}
+	go func() {
+		defer gw.Close()
+		rows, err := dumpTableHour(ctx, db, table, win, mw)
+		// Close the pipe writer after gzip is closed, so the reader sees EOF
+		_ = pw.CloseWithError(err)
+		resCh <- dumpResult{rows: rows, err: err}
+	}()
 
-	// Upload to S3
-	_, err = c.PutObject(ctx, &s3.PutObjectInput{
+	// stream upload
+	if _, err := c.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:          aws.String(bucket),
 		Key:             aws.String(key),
-		Body:            tmpFile,
+		Body:            pr,
 		ContentType:     aws.String("application/json"),
 		ContentEncoding: aws.String("gzip"),
-	})
-	if err != nil {
+	}); err != nil {
+		// ensure the goroutine unblocks
+		_ = pr.CloseWithError(err)
+		<-resCh // drain
 		return 0, 0, fmt.Errorf("s3 put: %w", err)
 	}
 
-	return rowCount, byteSize, nil
+	// wait for dump to finish and get rows
+	r := <-resCh
+	if r.err != nil {
+		return 0, 0, r.err
+	}
+	return r.rows, byteCount, nil
+}
+
+type countWriter struct{ n *int64 }
+
+func (c countWriter) Write(p []byte) (int, error) {
+	*c.n += int64(len(p))
+	return len(p), nil
 }
 
 func dumpTableHour(ctx context.Context, db *sql.DB, table string, win HourWindow, w io.Writer) (int64, error) {
