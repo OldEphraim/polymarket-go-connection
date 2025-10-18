@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Make sure the generic is alongside this file
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PURGER="${ROOT_DIR}/scripts/purge_chunks.sh"
+PURGER="${ROOT_DIR}/purge_scripts/purge_chunks.sh"
 
 # Features: keep ~36h, biggish batch (they’re heavy)
 "${PURGER}" market_features "36 hours" 200000

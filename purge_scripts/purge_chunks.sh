@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Usage:
-#   ./scripts/purge_chunks.sh <TABLE> <INTERVAL> <BATCH_SIZE>
+#   ./purge_scripts/purge_chunks.sh <TABLE> <INTERVAL> <BATCH_SIZE>
 # Example:
-#   ./scripts/purge_chunks.sh market_features "36 hours" 200000
+#   ./purge_scripts/purge_chunks.sh market_features "36 hours" 200000
 #
 # Requires: docker compose, psql inside your postgres container service
 # Stops when a batch DELETE affects 0 rows.
