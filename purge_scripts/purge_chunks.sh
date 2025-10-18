@@ -6,7 +6,7 @@ set -euo pipefail
 # Example:
 #   ./purge_scripts/purge_chunks.sh market_features "36 hours" 200000
 #
-# Requires: docker compose, psql inside your postgres container service
+# Requires: docker-compose, psql inside your postgres container service
 # Stops when a batch DELETE affects 0 rows.
 
 TABLE="${1:?table required}"
@@ -22,7 +22,7 @@ while true; do
   ITER=$((ITER+1))
   # Return one line per deleted row so we can count quickly
   OUT=$(
-    docker compose exec -T postgres psql -X -A -t \
+    docker-compose exec -T postgres psql -X -A -t \
       -U a8garber -d polymarket_dev \
       -v "ON_ERROR_STOP=1" \
       -c "WITH doomed AS (
