@@ -18,6 +18,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -70,6 +71,7 @@ func main() {
 		log.Fatalf("aws cfg: %v", err)
 	}
 	s3c := s3.NewFromConfig(awsCfg)
+	up := manager.NewUploader(s3c)
 
 	var win HourWindow
 
@@ -130,7 +132,7 @@ func main() {
 	_ = markArchiveStarted(ctx, db, *table, win, key)
 
 	// Stream query → gzip → S3
-	n, byteSize, err := streamHourToS3(ctx, db, s3c, bucket, key, *table, win)
+	n, byteSize, err := streamHourToS3(ctx, db, up, bucket, key, *table, win)
 	if err != nil {
 		log.Printf("archive error: %v", err)
 		// mark failed
@@ -212,7 +214,7 @@ type dumpResult struct {
 	err  error
 }
 
-func streamHourToS3(ctx context.Context, db *sql.DB, c *s3.Client, bucket, key, table string, win HourWindow) (int64, int64, error) {
+func streamHourToS3(ctx context.Context, db *sql.DB, up *manager.Uploader, bucket, key, table string, win HourWindow) (int64, int64, error) {
 	pr, pw := io.Pipe()
 	gw := gzip.NewWriter(pw)
 
@@ -231,7 +233,7 @@ func streamHourToS3(ctx context.Context, db *sql.DB, c *s3.Client, bucket, key, 
 	}()
 
 	// stream upload
-	if _, err := c.PutObject(ctx, &s3.PutObjectInput{
+	if _, err := up.Upload(ctx, &s3.PutObjectInput{
 		Bucket:          aws.String(bucket),
 		Key:             aws.String(key),
 		Body:            pr,
