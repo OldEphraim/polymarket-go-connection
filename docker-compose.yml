@@ -8,7 +8,7 @@ services:
   postgres:
     logging: *default-logging
     image: postgres:14
-    shm_size: "1g"              # <-- add this
+    shm_size: "1g"
     command:
       - postgres
       - -c
@@ -138,9 +138,16 @@ services:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-    command: ["/bin/sh", "-c", "\
+    command: ["/bin/sh","-c", "\
       while true; do \
-        /usr/local/bin/janitor -tables features,trades,quotes -window '2 hours'; \
+        /usr/local/bin/janitor \
+          -tables features,trades,quotes \
+          -window '2 hours' \
+          -trades_window '24 hours' \
+          -features_window '7 days' \
+          -features_keep_days 3 \
+          -precreate_back_days 1 \
+          -precreate_fwd_days 1; \
         sleep 120; \
       done"]
     restart: unless-stopped
