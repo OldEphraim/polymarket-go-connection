@@ -16,16 +16,23 @@ import (
 
 func main() {
 	var (
+		// normal mode windows
 		window         = flag.String("window", "6 hours", "hot window for quotes when not in emergency")
 		tradesWindow   = flag.String("trades_window", "24 hours", "hot window for trades")
 		featuresWindow = flag.String("features_window", "7 days", "hot window for features")
 		tables         = flag.String("tables", "features,trades,quotes", "comma list: features,trades,quotes")
 
+		// emergency settings
 		minFreeMB      = flag.Int("min_free_mb", 1500, "emergency threshold (MB) for free space")
 		batchQuotes    = flag.Int("batch_quotes", 100000, "delete batch size for quotes in emergency")
 		batchTrades    = flag.Int("batch_trades", 50000, "delete batch size for trades in emergency")
 		batchFeatures  = flag.Int("batch_features", 50000, "delete batch size for features in emergency")
 		emergencyGrace = flag.Duration("emergency_sleep", 5*time.Second, "sleep between emergency batches")
+
+		// partition housekeeping
+		retention     = flag.Int("features_keep_days", 3, "keep this many whole days of features")
+		precreateBack = flag.Int("precreate_back_days", 1, "precreate partitions back (days)")
+		precreateFwd  = flag.Int("precreate_fwd_days", 1, "precreate partitions forward (days)")
 	)
 	flag.Parse()
 
@@ -40,13 +47,22 @@ func main() {
 	}
 	defer db.Close()
 
+	// Short context for one-off calls
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+
+	// Always ensure near-term partitions exist (yesterday/today/tomorrow by default).
+	if _, err := db.ExecContext(ctx,
+		"SELECT ensure_features_partitions($1,$2)",
+		*precreateBack, *precreateFwd,
+	); err != nil {
+		log.Printf("[janitor] ensure_features_partitions failed: %v", err)
+	}
 
 	free := freeMB("/")
 	log.Printf("[janitor] free_mb=%d min_free_mb=%d", free, *minFreeMB)
 
-	// Emergency mode: ignore archive markers; delete by ts in chunks until we’re above water
+	// Emergency mode: ignore archive markers; delete by ts in chunks until we’re above water.
 	if free < *minFreeMB {
 		log.Printf("[janitor] EMERGENCY MODE: low disk")
 		emergencyDelete(ctx, db, "market_quotes", "6 hours", *batchQuotes, *emergencyGrace)  // quotes are cheapest to drop
@@ -55,7 +71,7 @@ func main() {
 		return
 	}
 
-	// Normal mode: respect archive markers
+	// Normal mode: respect archive markers (only delete hours confirmed archived).
 	for _, t := range splitCSV(*tables) {
 		switch t {
 		case "features":
@@ -67,6 +83,16 @@ func main() {
 		default:
 			log.Printf("skip unknown table: %s", t)
 		}
+	}
+
+	// Now that rows are gone, see if any *whole-day* feature partitions can be dropped.
+	var dropped int
+	if err := db.QueryRowContext(ctx,
+		"SELECT drop_archived_market_features_partitions($1)", *retention,
+	).Scan(&dropped); err != nil {
+		log.Printf("[janitor] drop_archived_market_features_partitions failed: %v", err)
+	} else if dropped > 0 {
+		log.Printf("[janitor] dropped %d market_features day-partitions", dropped)
 	}
 }
 
@@ -135,8 +161,7 @@ func vacuumTable(ctx context.Context, db *sql.DB, table string) {
 	if table == "" {
 		return
 	}
-	_, err := db.ExecContext(ctx, fmt.Sprintf("VACUUM (ANALYZE) %s", table))
-	if err != nil {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("VACUUM (ANALYZE) %s", table)); err != nil {
 		log.Printf("vacuum failed for %s: %v", table, err)
 	} else {
 		log.Printf("vacuumed %s successfully", table)
