@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
@@ -475,38 +474,41 @@ func markArchiveFailed(ctx context.Context, db *sql.DB, table string, win HourWi
 }
 
 // Drops empty (zero-row) day partitions older than current_date - keepDays.
-// Returns the number of partitions dropped.
+// Returns the number of partitions dropped (best-effort).
 func dropEmptyFeaturePartitions(ctx context.Context, db *sql.DB, keepDays int) (int, error) {
-	// We use a DO block so we can dynamically count rows in each child safely.
-	// keepDays is embedded as a literal (int) to keep the block simple.
 	sql := `
 DO $$
 DECLARE
-  part regclass;
-  keep_before date := current_date - ` + strconv.Itoa(keepDays) + `;
+  r RECORD;
+  keep_before date := current_date - $1::int;
   nrows bigint;
-  day date;
   dropped int := 0;
 BEGIN
-  FOR part IN
-    SELECT c.oid::regclass
+  FOR r IN
+    SELECT n.nspname, c.relname
     FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_inherits i ON i.inhrelid = c.oid
     JOIN pg_class p ON p.oid = i.inhparent
     WHERE p.relname = 'market_features'
   LOOP
+    -- Parse YYYYMMDD from *relname* (no schema prefix)
+    DECLARE ymd text := regexp_replace(r.relname, '^market_features_p', '');
+    DECLARE day date;
     BEGIN
-      day := to_date(regexp_replace(part::text, '^market_features_p', ''), 'YYYYMMDD');
+      day := to_date(ymd, 'YYYYMMDD');
     EXCEPTION WHEN others THEN
       CONTINUE;
     END;
+
     IF day >= keep_before THEN
       CONTINUE;
     END IF;
 
-    EXECUTE format('SELECT count(*) FROM %s', part) INTO nrows;
+    EXECUTE format('SELECT count(*) FROM %I.%I', r.nspname, r.relname) INTO nrows;
+
     IF nrows = 0 THEN
-      EXECUTE format('DROP TABLE %s', part);
+      EXECUTE format('DROP TABLE %I.%I', r.nspname, r.relname);
       dropped := dropped + 1;
     END IF;
   END LOOP;
@@ -514,37 +516,10 @@ BEGIN
   RAISE NOTICE 'dropped_empty=%', dropped;
 END$$;
 `
-	// We can’t get the integer out of a DO easily; parse the NOTICE isn’t worth it.
-	// So we re-count immediately after:
-	if _, err := db.ExecContext(ctx, sql); err != nil {
+	if _, err := db.ExecContext(ctx, sql, keepDays); err != nil {
 		return 0, err
 	}
-
-	// Quick recount: how many empty partitions remain older than keep?
-	q := `
-WITH parts AS (
-  SELECT c.oid::regclass AS part, c.relname
-  FROM pg_class c
-  JOIN pg_inherits i ON i.inhrelid = c.oid
-  JOIN pg_class p ON p.oid = i.inhparent
-  WHERE p.relname = 'market_features'
-),
-older AS (
-  SELECT part, relname
-  FROM parts
-  WHERE to_date(regexp_replace(relname, '^market_features_p',''), 'YYYYMMDD') < current_date - $1::int
-),
-empty AS (
-  SELECT relname
-  FROM older
-  WHERE (SELECT count(*) FROM pg_catalog.pg_class WHERE oid = older.part) IS NOT NULL
-  AND   (SELECT count(*) FROM older.part) IS NULL -- dummy; we can't reference like this
-)
-SELECT 0; -- we can’t reliably compute after-the-fact without dynamic SQL; return 0
-`
-	// We’ll just return 0 here and rely on the log NOTICE above; or, simpler: return a sentinel like -1.
-	// To keep things simple for now:
-	_ = q
+	// We don’t parse the NOTICE; just return 0 (logs will show actual count).
 	return 0, nil
 }
 
