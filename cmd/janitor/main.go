@@ -65,11 +65,39 @@ func main() {
 	// Emergency mode: ignore archive markers; delete by ts in chunks until we’re above water.
 	if free < *minFreeMB {
 		log.Printf("[janitor] EMERGENCY MODE: low disk")
-		emergencyDelete(ctx, db, "market_quotes", "6 hours", *batchQuotes, *emergencyGrace)  // quotes are cheapest to drop
-		emergencyDelete(ctx, db, "market_trades", "24 hours", *batchTrades, *emergencyGrace) // then trades
-		emergencyDelete(ctx, db, "market_features", "7 days", *batchFeatures, *emergencyGrace)
-		dbCheckpoint(ctx, db) // << ensure WAL + FSM cleared promptly
-		return
+		deadline := time.Now().Add(5 * time.Minute) // hard cap
+		round := 0
+
+		for {
+			round++
+			var total int64
+
+			del, _ := emergencyDelete(ctx, db, "market_quotes", "6 hours", *batchQuotes, *emergencyGrace)
+			total += del
+			del, _ = emergencyDelete(ctx, db, "market_trades", "24 hours", *batchTrades, *emergencyGrace)
+			total += del
+			del, _ = emergencyDelete(ctx, db, "market_features", "7 days", *batchFeatures, *emergencyGrace)
+			total += del
+
+			dbCheckpoint(ctx, db)
+
+			free = freeMB("/")
+			log.Printf("[janitor] round=%d total_deleted=%d free_mb=%d", round, total, free)
+
+			if free >= *minFreeMB {
+				break
+			} // target reached
+			if total == 0 {
+				break
+			} // no progress — don’t spin
+			if time.Now().After(deadline) {
+				break
+			} // time cap
+			if round >= 10 {
+				break
+			} // round cap
+		}
+		// no return — fall through to housekeeping
 	}
 
 	// Normal mode: respect archive markers (only delete hours confirmed archived).
@@ -130,9 +158,9 @@ func callWindowed(ctx context.Context, db *sql.DB, sqlstmt, window, table string
 	}
 }
 
-func emergencyDelete(ctx context.Context, db *sql.DB, table, keep string, batch int, pause time.Duration) {
+func emergencyDelete(ctx context.Context, db *sql.DB, table, keep string, batch int, pause time.Duration) (int64, error) {
 	log.Printf("[janitor] emergency deleting from %s older than %s", table, keep)
-	var sinceVacuum int64
+	var sinceVacuum, total int64
 
 	for {
 		q := fmt.Sprintf(`
@@ -150,15 +178,16 @@ WHERE t.ctid = d.ctid
 		res, err := db.ExecContext(ctx, q, keep)
 		if err != nil {
 			log.Printf("[janitor] emergency delete failed on %s: %v", table, err)
-			break
+			return total, err
 		}
 		deleted, _ := res.RowsAffected()
 		if deleted == 0 {
 			break
 		}
-
+		total += deleted
 		sinceVacuum += deleted
-		log.Printf("[janitor] %s emergency batch deleted=%d (since vacuum=%d)", table, deleted, sinceVacuum)
+
+		log.Printf("[janitor] %s emergency batch deleted=%d (since vacuum=%d, total=%d)", table, deleted, sinceVacuum, total)
 
 		if sinceVacuum > 10000 {
 			vacuumTable(ctx, db, table)
@@ -166,6 +195,7 @@ WHERE t.ctid = d.ctid
 		}
 		time.Sleep(pause)
 	}
+	return total, nil
 }
 
 func vacuumTable(ctx context.Context, db *sql.DB, table string) {
@@ -191,13 +221,15 @@ func freeMB(path string) int {
 // Drops empty (zero-row) day partitions older than current_date - keepDays.
 // Returns the number of partitions dropped (best-effort).
 func dropEmptyFeaturePartitions(ctx context.Context, db *sql.DB, keepDays int) (int, error) {
-	sql := `
+	sql := fmt.Sprintf(`
 DO $$
 DECLARE
   r RECORD;
-  keep_before date := current_date - $1::int;
+  keep_before date := current_date - %d;
   nrows bigint;
   dropped int := 0;
+  ymd text;
+  day date;
 BEGIN
   FOR r IN
     SELECT n.nspname, c.relname
@@ -207,9 +239,7 @@ BEGIN
     JOIN pg_class p ON p.oid = i.inhparent
     WHERE p.relname = 'market_features'
   LOOP
-    -- Parse YYYYMMDD from *relname* (no schema prefix)
-    DECLARE ymd text := regexp_replace(r.relname, '^market_features_p', '');
-    DECLARE day date;
+    ymd := regexp_replace(r.relname, '^market_features_p', '');
     BEGIN
       day := to_date(ymd, 'YYYYMMDD');
     EXCEPTION WHEN others THEN
@@ -220,21 +250,22 @@ BEGIN
       CONTINUE;
     END IF;
 
-    EXECUTE format('SELECT count(*) FROM %I.%I', r.nspname, r.relname) INTO nrows;
+    EXECUTE format('SELECT count(*) FROM %%I.%%I', r.nspname, r.relname) INTO nrows;
 
     IF nrows = 0 THEN
-      EXECUTE format('DROP TABLE %I.%I', r.nspname, r.relname);
+      EXECUTE format('DROP TABLE %%I.%%I', r.nspname, r.relname);
       dropped := dropped + 1;
     END IF;
   END LOOP;
 
-  RAISE NOTICE 'dropped_empty=%', dropped;
+  RAISE NOTICE 'dropped_empty=%%', dropped;
 END$$;
-`
-	if _, err := db.ExecContext(ctx, sql, keepDays); err != nil {
+`, keepDays)
+
+	if _, err := db.ExecContext(ctx, sql); err != nil {
 		return 0, err
 	}
-	// We don’t parse the NOTICE; just return 0 (logs will show actual count).
+	// We don’t parse the NOTICE; just return 0 and rely on logs.
 	return 0, nil
 }
 

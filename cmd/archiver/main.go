@@ -476,13 +476,15 @@ func markArchiveFailed(ctx context.Context, db *sql.DB, table string, win HourWi
 // Drops empty (zero-row) day partitions older than current_date - keepDays.
 // Returns the number of partitions dropped (best-effort).
 func dropEmptyFeaturePartitions(ctx context.Context, db *sql.DB, keepDays int) (int, error) {
-	sql := `
+	sql := fmt.Sprintf(`
 DO $$
 DECLARE
   r RECORD;
-  keep_before date := current_date - $1::int;
+  keep_before date := current_date - %d;
   nrows bigint;
   dropped int := 0;
+  ymd text;
+  day date;
 BEGIN
   FOR r IN
     SELECT n.nspname, c.relname
@@ -492,9 +494,7 @@ BEGIN
     JOIN pg_class p ON p.oid = i.inhparent
     WHERE p.relname = 'market_features'
   LOOP
-    -- Parse YYYYMMDD from *relname* (no schema prefix)
-    DECLARE ymd text := regexp_replace(r.relname, '^market_features_p', '');
-    DECLARE day date;
+    ymd := regexp_replace(r.relname, '^market_features_p', '');
     BEGIN
       day := to_date(ymd, 'YYYYMMDD');
     EXCEPTION WHEN others THEN
@@ -505,21 +505,22 @@ BEGIN
       CONTINUE;
     END IF;
 
-    EXECUTE format('SELECT count(*) FROM %I.%I', r.nspname, r.relname) INTO nrows;
+    EXECUTE format('SELECT count(*) FROM %%I.%%I', r.nspname, r.relname) INTO nrows;
 
     IF nrows = 0 THEN
-      EXECUTE format('DROP TABLE %I.%I', r.nspname, r.relname);
+      EXECUTE format('DROP TABLE %%I.%%I', r.nspname, r.relname);
       dropped := dropped + 1;
     END IF;
   END LOOP;
 
-  RAISE NOTICE 'dropped_empty=%', dropped;
+  RAISE NOTICE 'dropped_empty=%%', dropped;
 END$$;
-`
-	if _, err := db.ExecContext(ctx, sql, keepDays); err != nil {
+`, keepDays)
+
+	if _, err := db.ExecContext(ctx, sql); err != nil {
 		return 0, err
 	}
-	// We don’t parse the NOTICE; just return 0 (logs will show actual count).
+	// We don’t parse the NOTICE; just return 0 and rely on logs.
 	return 0, nil
 }
 
