@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 9NxEUftLtYVD4aGaeVtxc1AAYoKp3cNb0wnAgi5awQwJ1FCmCAbwOLM2IuaV25p
+\restrict NjBaMTzlKhA0fYpfWI12mwsgERbygVzuvp559dpQ9dbcNZSdEFEikGSZOS45hIr
 
 -- Dumped from database version 14.19 (Homebrew)
 -- Dumped by pg_dump version 14.19 (Homebrew)
@@ -17,6 +17,38 @@ SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
+
+--
+-- Name: create_market_features_partition(date); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.create_market_features_partition(p_date date) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  part_name text := format('market_features_p%s', to_char(p_date, 'YYYYMMDD'));
+  start_ts  timestamptz := date_trunc('day', p_date)::timestamptz;
+  end_ts    timestamptz := (date_trunc('day', p_date) + interval '1 day')::timestamptz;
+
+  idx_ts    text := part_name || '_ts';
+  idx_tokts text := part_name || '_tok_ts';
+  idx_brin  text := part_name || '_brin_ts';
+BEGIN
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS %I PARTITION OF market_features
+       FOR VALUES FROM (%L) TO (%L)
+       WITH (autovacuum_vacuum_scale_factor=0.05,
+             autovacuum_analyze_scale_factor=0.02)',
+    part_name, start_ts, end_ts
+  );
+
+  -- Local indexes mirroring old access paths
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (ts DESC)',                       idx_ts,    part_name);
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (token_id, ts DESC)',              idx_tokts, part_name);
+  EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING brin (ts) WITH (pages_per_range=64)', idx_brin, part_name);
+END
+$$;
+
 
 --
 -- Name: delete_exported_hours_features(text); Type: FUNCTION; Schema: public; Owner: -
@@ -119,6 +151,89 @@ BEGIN
   );
 
   RETURN n;
+END
+$$;
+
+
+--
+-- Name: drop_archived_market_features_partitions(integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.drop_archived_market_features_partitions(p_keep_days integer) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  drop_before date := (current_date - p_keep_days);
+  part RECORD;
+  dropped int := 0;
+  day_start timestamptz;
+  day_end   timestamptz;
+  hours_missing int;
+BEGIN
+  FOR part IN
+    SELECT c.relname AS child_name,
+           regexp_replace(c.relname, '^market_features_p', '') AS ymd
+    FROM pg_class c
+    JOIN pg_inherits i ON i.inhrelid = c.oid
+    JOIN pg_class p ON p.oid = i.inhparent
+    WHERE p.relname = 'market_features'
+  LOOP
+    -- parse partition day; skip unexpected names
+    BEGIN
+      day_start := to_timestamp(part.ymd, 'YYYYMMDD')::date;
+    EXCEPTION WHEN others THEN
+      CONTINUE;
+    END;
+
+    IF day_start::date >= drop_before THEN
+      CONTINUE; -- within retention
+    END IF;
+    day_end := (day_start + interval '1 day');
+
+    -- Require full 24h coverage by archive_jobs(done)
+    WITH hours AS (
+      SELECT generate_series(day_start, day_end - interval '1 hour', interval '1 hour') AS h
+    )
+    SELECT COUNT(*) INTO hours_missing
+    FROM hours hh
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM archive_jobs aj
+      WHERE aj.table_name = 'market_features'
+        AND aj.status = 'done'
+        AND aj.ts_start <= hh.h
+        AND aj.ts_end   >  hh.h
+    );
+
+    IF hours_missing = 0 THEN
+      EXECUTE format('DROP TABLE IF EXISTS %I', part.child_name);
+      dropped := dropped + 1;
+    END IF;
+  END LOOP;
+
+  RETURN dropped;
+END
+$$;
+
+
+--
+-- Name: ensure_features_partitions(integer, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ensure_features_partitions(p_days_back integer DEFAULT 1, p_days_forward integer DEFAULT 1) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  d date;
+BEGIN
+  FOR d IN
+    SELECT gs::date
+    FROM generate_series(current_date - p_days_back,
+                         current_date + p_days_forward,
+                         interval '1 day') AS gs
+  LOOP
+    PERFORM create_market_features_partition(d);
+  END LOOP;
 END
 $$;
 
@@ -230,6 +345,120 @@ ALTER SEQUENCE public.market_events_id_seq OWNED BY public.market_events.id;
 --
 
 CREATE TABLE public.market_features (
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    ret_1m double precision,
+    ret_5m double precision,
+    vol_1m double precision,
+    avg_vol_5m double precision,
+    sigma_5m double precision,
+    zscore_5m double precision,
+    imbalance_top double precision,
+    spread_bps double precision,
+    broke_high_15m boolean,
+    broke_low_15m boolean,
+    time_to_resolve_h double precision,
+    signed_flow_1m double precision
+)
+PARTITION BY RANGE (ts);
+
+
+--
+-- Name: market_features_old; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_features_old (
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    ret_1m double precision,
+    ret_5m double precision,
+    vol_1m double precision,
+    avg_vol_5m double precision,
+    sigma_5m double precision,
+    zscore_5m double precision,
+    imbalance_top double precision,
+    spread_bps double precision,
+    broke_high_15m boolean,
+    broke_low_15m boolean,
+    time_to_resolve_h double precision,
+    signed_flow_1m double precision
+)
+WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02');
+
+
+--
+-- Name: market_features_old_view; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.market_features_old_view AS
+ SELECT market_features_old.token_id,
+    market_features_old.ts,
+    market_features_old.ret_1m,
+    market_features_old.ret_5m,
+    market_features_old.vol_1m,
+    market_features_old.avg_vol_5m,
+    market_features_old.sigma_5m,
+    market_features_old.zscore_5m,
+    market_features_old.imbalance_top,
+    market_features_old.spread_bps,
+    market_features_old.broke_high_15m,
+    market_features_old.broke_low_15m,
+    market_features_old.time_to_resolve_h,
+    market_features_old.signed_flow_1m
+   FROM public.market_features_old;
+
+
+--
+-- Name: market_features_p20251018; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_features_p20251018 (
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    ret_1m double precision,
+    ret_5m double precision,
+    vol_1m double precision,
+    avg_vol_5m double precision,
+    sigma_5m double precision,
+    zscore_5m double precision,
+    imbalance_top double precision,
+    spread_bps double precision,
+    broke_high_15m boolean,
+    broke_low_15m boolean,
+    time_to_resolve_h double precision,
+    signed_flow_1m double precision
+)
+WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02');
+
+
+--
+-- Name: market_features_p20251019; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_features_p20251019 (
+    token_id character varying(80) NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    ret_1m double precision,
+    ret_5m double precision,
+    vol_1m double precision,
+    avg_vol_5m double precision,
+    sigma_5m double precision,
+    zscore_5m double precision,
+    imbalance_top double precision,
+    spread_bps double precision,
+    broke_high_15m boolean,
+    broke_low_15m boolean,
+    time_to_resolve_h double precision,
+    signed_flow_1m double precision
+)
+WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02');
+
+
+--
+-- Name: market_features_p20251020; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_features_p20251020 (
     token_id character varying(80) NOT NULL,
     ts timestamp with time zone NOT NULL,
     ret_1m double precision,
@@ -619,6 +848,27 @@ ALTER SEQUENCE public.trading_sessions_id_seq OWNED BY public.trading_sessions.i
 
 
 --
+-- Name: market_features_p20251018; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features ATTACH PARTITION public.market_features_p20251018 FOR VALUES FROM ('2025-10-18 00:00:00-04') TO ('2025-10-19 00:00:00-04');
+
+
+--
+-- Name: market_features_p20251019; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features ATTACH PARTITION public.market_features_p20251019 FOR VALUES FROM ('2025-10-19 00:00:00-04') TO ('2025-10-20 00:00:00-04');
+
+
+--
+-- Name: market_features_p20251020; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features ATTACH PARTITION public.market_features_p20251020 FOR VALUES FROM ('2025-10-20 00:00:00-04') TO ('2025-10-21 00:00:00-04');
+
+
+--
 -- Name: archive_jobs id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -735,10 +985,42 @@ ALTER TABLE ONLY public.market_events
 
 
 --
--- Name: market_features market_features_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: market_features market_features_pkey1; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.market_features
+    ADD CONSTRAINT market_features_pkey1 PRIMARY KEY (token_id, ts);
+
+
+--
+-- Name: market_features_p20251018 market_features_p20251018_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features_p20251018
+    ADD CONSTRAINT market_features_p20251018_pkey PRIMARY KEY (token_id, ts);
+
+
+--
+-- Name: market_features_p20251019 market_features_p20251019_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features_p20251019
+    ADD CONSTRAINT market_features_p20251019_pkey PRIMARY KEY (token_id, ts);
+
+
+--
+-- Name: market_features_p20251020 market_features_p20251020_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features_p20251020
+    ADD CONSTRAINT market_features_p20251020_pkey PRIMARY KEY (token_id, ts);
+
+
+--
+-- Name: market_features_old market_features_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_features_old
     ADD CONSTRAINT market_features_pkey PRIMARY KEY (token_id, ts);
 
 
@@ -865,7 +1147,7 @@ CREATE INDEX brin_market_events_detected ON public.market_events USING brin (det
 -- Name: brin_market_features_ts; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX brin_market_features_ts ON public.market_features USING brin (ts) WITH (pages_per_range='64');
+CREATE INDEX brin_market_features_ts ON public.market_features_old USING brin (ts) WITH (pages_per_range='64');
 
 
 --
@@ -921,14 +1203,14 @@ CREATE INDEX idx_market_events_type ON public.market_events USING btree (event_t
 -- Name: idx_market_features_token_ts; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_market_features_token_ts ON public.market_features USING btree (token_id, ts DESC);
+CREATE INDEX idx_market_features_token_ts ON public.market_features_old USING btree (token_id, ts DESC);
 
 
 --
 -- Name: idx_market_features_ts; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_market_features_ts ON public.market_features USING btree (ts DESC);
+CREATE INDEX idx_market_features_ts ON public.market_features_old USING btree (ts DESC);
 
 
 --
@@ -988,10 +1270,94 @@ CREATE INDEX idx_paper_trades_token_time ON public.paper_trades USING btree (tok
 
 
 --
+-- Name: market_features_p20251018_brin_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251018_brin_ts ON public.market_features_p20251018 USING brin (ts) WITH (pages_per_range='64');
+
+
+--
+-- Name: market_features_p20251018_tok_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251018_tok_ts ON public.market_features_p20251018 USING btree (token_id, ts DESC);
+
+
+--
+-- Name: market_features_p20251018_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251018_ts ON public.market_features_p20251018 USING btree (ts DESC);
+
+
+--
+-- Name: market_features_p20251019_brin_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251019_brin_ts ON public.market_features_p20251019 USING brin (ts) WITH (pages_per_range='64');
+
+
+--
+-- Name: market_features_p20251019_tok_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251019_tok_ts ON public.market_features_p20251019 USING btree (token_id, ts DESC);
+
+
+--
+-- Name: market_features_p20251019_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251019_ts ON public.market_features_p20251019 USING btree (ts DESC);
+
+
+--
+-- Name: market_features_p20251020_brin_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251020_brin_ts ON public.market_features_p20251020 USING brin (ts) WITH (pages_per_range='64');
+
+
+--
+-- Name: market_features_p20251020_tok_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251020_tok_ts ON public.market_features_p20251020 USING btree (token_id, ts DESC);
+
+
+--
+-- Name: market_features_p20251020_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX market_features_p20251020_ts ON public.market_features_p20251020 USING btree (ts DESC);
+
+
+--
 -- Name: uq_market_trades_trade_id; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX uq_market_trades_trade_id ON public.market_trades USING btree (trade_id) WHERE (trade_id IS NOT NULL);
+
+
+--
+-- Name: market_features_p20251018_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.market_features_pkey1 ATTACH PARTITION public.market_features_p20251018_pkey;
+
+
+--
+-- Name: market_features_p20251019_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.market_features_pkey1 ATTACH PARTITION public.market_features_p20251019_pkey;
+
+
+--
+-- Name: market_features_p20251020_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+--
+
+ALTER INDEX public.market_features_pkey1 ATTACH PARTITION public.market_features_p20251020_pkey;
 
 
 --
@@ -1046,5 +1412,5 @@ ALTER TABLE ONLY public.trading_sessions
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 9NxEUftLtYVD4aGaeVtxc1AAYoKp3cNb0wnAgi5awQwJ1FCmCAbwOLM2IuaV25p
+\unrestrict NjBaMTzlKhA0fYpfWI12mwsgERbygVzuvp559dpQ9dbcNZSdEFEikGSZOS45hIr
 

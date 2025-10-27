@@ -4,7 +4,7 @@
 FROM golang:1.23.5-alpine AS go-builder
 WORKDIR /app
 
-# minimal toolchain for some deps (git); build-base helps if a dep needs cgo later
+# minimal toolchain for some deps (git)
 RUN apk add --no-cache git
 
 # 1) Prime module cache without copying full repo (keeps cache stable)
@@ -72,7 +72,3 @@ COPY --from=go-builder /app/bin/* /usr/local/bin/
 COPY configs/ /app/configs/
 
 ENV RUN_TYPE=prod
-
-# Optionally set a default healthcheck (container-level)
-# HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-#   CMD curl -fsS http://localhost:8080/health || exit 1

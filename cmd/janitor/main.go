@@ -48,7 +48,7 @@ func main() {
 	defer db.Close()
 
 	// Short context for one-off calls
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	// Always ensure near-term partitions exist (yesterday/today/tomorrow by default).
