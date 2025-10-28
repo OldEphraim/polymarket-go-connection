@@ -144,8 +144,8 @@ services:
           -tables features,trades,quotes \
           -window '2 hours' \
           -trades_window '24 hours' \
-          -features_window '7 days' \
-          -features_keep_days 3 \
+          -features_window '2 days' \
+          -features_keep_days 1 \
           -precreate_back_days 1 \
           -precreate_fwd_days 1; \
         sleep 120; \
