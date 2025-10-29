@@ -30,9 +30,9 @@ func main() {
 		emergencyGrace = flag.Duration("emergency_sleep", 5*time.Second, "sleep between emergency batches")
 
 		// partition housekeeping
-		retention     = flag.Int("features_keep_days", 3, "keep this many whole days of features")
-		precreateBack = flag.Int("precreate_back_days", 1, "precreate partitions back (days)")
-		precreateFwd  = flag.Int("precreate_fwd_days", 1, "precreate partitions forward (days)")
+		featuresKeepHours  = flag.Int("features_keep_hours", 6, "keep this many hours of features")
+		precreateHoursBack = flag.Int("precreate_hours_back", 2, "precreate partitions hours back")
+		precreateHoursFwd  = flag.Int("precreate_hours_fwd", 2, "precreate partitions hours forward")
 	)
 	flag.Parse()
 
@@ -51,12 +51,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// Always ensure near-term partitions exist (yesterday/today/tomorrow by default).
+	// Always ensure near-term partitions exist.
 	if _, err := db.ExecContext(ctx,
-		"SELECT ensure_features_partitions($1,$2)",
-		*precreateBack, *precreateFwd,
+		"SELECT ensure_features_partitions_hourly($1,$2)",
+		*precreateHoursBack, *precreateHoursFwd,
 	); err != nil {
-		log.Printf("[janitor] ensure_features_partitions failed: %v", err)
+		log.Printf("[janitor] ensure_features_partitions_hourly failed: %v", err)
 	}
 
 	free := freeMB("/")
@@ -114,8 +114,8 @@ func main() {
 		}
 	}
 
-	// (A) Drop zero-row partitions older than retention (fast bloat reclaim).
-	droppedEmpty, err := dropEmptyFeaturePartitions(ctx, db, *retention)
+	// (A) Drop zero-row partitions older than featuresKeepHours (fast bloat reclaim).
+	droppedEmpty, err := dropEmptyFeaturePartitions(ctx, db, *featuresKeepHours)
 	if err != nil {
 		log.Printf("[janitor] dropEmptyFeaturePartitions failed: %v", err)
 	} else if droppedEmpty > 0 {
@@ -123,14 +123,15 @@ func main() {
 		dbCheckpoint(ctx, db)
 	}
 
-	// (B) Drop archived whole days (the existing archive-aware function).
+	// (B) Drop archived hourly partitions
 	var dropped int
 	if err := db.QueryRowContext(ctx,
-		"SELECT drop_archived_market_features_partitions($1)", *retention,
+		"SELECT drop_archived_market_features_partitions_hourly($1)",
+		*featuresKeepHours,
 	).Scan(&dropped); err != nil {
-		log.Printf("[janitor] drop_archived_market_features_partitions failed: %v", err)
+		log.Printf("[janitor] drop_archived_market_features_partitions_hourly failed: %v", err)
 	} else if dropped > 0 {
-		log.Printf("[janitor] dropped %d market_features day-partitions", dropped)
+		log.Printf("[janitor] dropped %d market_features hourly partitions", dropped)
 		dbCheckpoint(ctx, db)
 	}
 }

@@ -121,12 +121,11 @@ services:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
       AWS_REGION: ${AWS_REGION}
-    command: ["/bin/sh", "-c", "\
-      while true; do \
-        /usr/local/bin/archiver -table market_features -backfill || /usr/local/bin/archiver -table market_features || true; \
-        /usr/local/bin/archiver -table market_trades   -backfill || /usr/local/bin/archiver -table market_trades   || true; \
-        /usr/local/bin/archiver -table market_quotes   -backfill || /usr/local/bin/archiver -table market_quotes   || true; \
-        sleep 60; \
+    command: ["/bin/sh", "-c", "
+      while true; do 
+        /usr/local/bin/archiver -table market_features -backfill || true;
+        /usr/local/bin/archiver -table market_features || true;
+        sleep 10; 
       done"]
     restart: unless-stopped
 
@@ -138,17 +137,17 @@ services:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-    command: ["/bin/sh","-c", "\
-      while true; do \
+    command: ["/bin/sh","-c", "
+      while true; do 
         /usr/local/bin/janitor \
           -tables features,trades,quotes \
           -window '2 hours' \
-          -trades_window '24 hours' \
-          -features_window '2 days' \
-          -features_keep_days 1 \
-          -precreate_back_days 1 \
-          -precreate_fwd_days 1; \
-        sleep 120; \
+          -trades_window '12 hours' \
+          -features_window '6 hours' \
+          -features_keep_hours 6 \
+          -precreate_hours_back 2 \
+          -precreate_hours_fwd 2; 
+        sleep 300; 
       done"]
     restart: unless-stopped
 

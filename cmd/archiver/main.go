@@ -29,14 +29,12 @@ type HourWindow struct {
 
 func main() {
 	var (
-		table         = flag.String("table", "", "Table to export: market_features | market_trades | market_quotes (required)")
-		prefix        = flag.String("prefix", "", "S3 prefix (defaults to table name)")
-		hourStr       = flag.String("hour", "", "UTC hour to export (e.g. 2025-10-12T00). Default = last closed hour")
-		backfill      = flag.Bool("backfill", false, "Backfill mode: process oldest unarchived hour")
-		timeout       = flag.Duration("timeout", 10*time.Minute, "Overall timeout per export")
-		keepDays      = flag.Int("features_keep_days", 3, "For features: drop empty day-partitions older than this many days after successful archives")
-		precreateBack = flag.Int("precreate_back_days", 1, "Precreate features partitions back (days)")
-		precreateFwd  = flag.Int("precreate_fwd_days", 1, "Precreate features partitions forward (days)")
+		table    = flag.String("table", "", "Table to export: market_features | market_trades | market_quotes (required)")
+		prefix   = flag.String("prefix", "", "S3 prefix (defaults to table name)")
+		hourStr  = flag.String("hour", "", "UTC hour to export (e.g. 2025-10-12T00). Default = last closed hour")
+		backfill = flag.Bool("backfill", false, "Backfill mode: process oldest unarchived hour")
+		timeout  = flag.Duration("timeout", 10*time.Minute, "Overall timeout per export")
+		keepDays = flag.Int("features_keep_days", 3, "For features: drop empty day-partitions older than this many days after successful archives")
 	)
 	flag.Parse()
 
@@ -153,8 +151,10 @@ func main() {
 	// Post-archive housekeeping (features only): precreate near-term partitions,
 	// drop empty old partitions, and gently rotate WAL.
 	if *table == "market_features" {
-		// Best-effort; failures are non-fatal
-		_, _ = db.ExecContext(ctx, "SELECT ensure_features_partitions($1,$2)", *precreateBack, *precreateFwd)
+		// Create hourly partitions instead of daily
+		_, _ = db.ExecContext(ctx, "SELECT ensure_features_partitions_hourly($1,$2)", 2, 2)
+
+		// The dropEmptyFeaturePartitions function can stay but won't find much with hourly partitions
 		_, _ = dropEmptyFeaturePartitions(ctx, db, *keepDays)
 		dbCheckpoint(ctx, db)
 	}
