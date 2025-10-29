@@ -124,10 +124,15 @@ services:
     command: ["/bin/sh", "-c", "
       while true; do 
         /usr/local/bin/archiver -table market_features -backfill || true;
+        /usr/local/bin/archiver -table market_trades -backfill || true;
+        /usr/local/bin/archiver -table market_quotes -backfill || true;
         /usr/local/bin/archiver -table market_features || true;
-        sleep 10; 
+        /usr/local/bin/archiver -table market_trades || true;
+        /usr/local/bin/archiver -table market_quotes || true;
+        sleep 300; 
       done"]
     restart: unless-stopped
+
 
   janitor:
     logging: *default-logging
@@ -146,7 +151,8 @@ services:
           -features_window '6 hours' \
           -features_keep_hours 6 \
           -precreate_hours_back 2 \
-          -precreate_hours_fwd 2; 
+          -precreate_hours_fwd 2 \
+          -min_free_mb 3000; 
         sleep 300; 
       done"]
     restart: unless-stopped

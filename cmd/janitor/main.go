@@ -134,6 +134,45 @@ func main() {
 		log.Printf("[janitor] dropped %d market_features hourly partitions", dropped)
 		dbCheckpoint(ctx, db)
 	}
+
+	// (C) Drop archived trades hourly partitions
+	var droppedTrades int
+	if err := db.QueryRowContext(ctx,
+		"SELECT drop_archived_market_trades_partitions_hourly($1)",
+		12, // keep 12 hours for trades
+	).Scan(&droppedTrades); err != nil {
+		log.Printf("[janitor] drop_archived_market_trades_partitions_hourly failed: %v", err)
+	} else if droppedTrades > 0 {
+		log.Printf("[janitor] dropped %d market_trades hourly partitions", droppedTrades)
+		dbCheckpoint(ctx, db)
+	}
+
+	// (D) Drop archived quotes hourly partitions
+	var droppedQuotes int
+	if err := db.QueryRowContext(ctx,
+		"SELECT drop_archived_market_quotes_partitions_hourly($1)",
+		2, // keep only 2 hours for quotes
+	).Scan(&droppedQuotes); err != nil {
+		log.Printf("[janitor] drop_archived_market_quotes_partitions_hourly failed: %v", err)
+	} else if droppedQuotes > 0 {
+		log.Printf("[janitor] dropped %d market_quotes hourly partitions", droppedQuotes)
+		dbCheckpoint(ctx, db)
+	}
+
+	// Also ensure partitions exist for all tables
+	if _, err := db.ExecContext(ctx,
+		"SELECT ensure_trades_partitions_hourly($1,$2)",
+		*precreateHoursBack, *precreateHoursFwd,
+	); err != nil {
+		log.Printf("[janitor] ensure_trades_partitions_hourly failed: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		"SELECT ensure_quotes_partitions_hourly($1,$2)",
+		*precreateHoursBack, *precreateHoursFwd,
+	); err != nil {
+		log.Printf("[janitor] ensure_quotes_partitions_hourly failed: %v", err)
+	}
 }
 
 func splitCSV(s string) []string {
