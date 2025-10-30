@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -14,25 +15,68 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// TableConfig holds configuration for each table's cleanup
+type TableConfig struct {
+	window            string // retention window
+	deleteFn          string // SQL function to delete archived data
+	dropPartitionFn   string // SQL function to drop partitions
+	ensurePartitionFn string // SQL function to ensure partitions exist
+	emergencyWindow   string // retention during emergency
+	emergencyBatch    int    // batch size for emergency deletes
+	keepHours         int    // hours to keep for partition dropping
+}
+
+func loadDynamicPolicy(defaultWindow, defaultTradesWindow, defaultFeaturesWindow string) (string, string, string, int) {
+	policyFile := "/tmp/retention_policy.json"
+	data, err := os.ReadFile(policyFile)
+	if err != nil {
+		log.Printf("[janitor] Using defaults, no policy file: %v", err)
+		return defaultWindow, defaultTradesWindow, defaultFeaturesWindow, 3000
+	}
+
+	var policy struct {
+		QuotesHours        float64 `json:"quotes_hours"`
+		TradesHours        float64 `json:"trades_hours"`
+		FeaturesHours      float64 `json:"features_hours"`
+		EmergencyThreshold int     `json:"emergency_threshold_mb"`
+	}
+
+	if err := json.Unmarshal(data, &policy); err != nil {
+		log.Printf("[janitor] Using defaults, bad policy file: %v", err)
+		return defaultWindow, defaultTradesWindow, defaultFeaturesWindow, 3000
+	}
+
+	// Convert hours to interval strings
+	quotesWindow := fmt.Sprintf("%.1f hours", policy.QuotesHours)
+	tradesWindow := fmt.Sprintf("%.1f hours", policy.TradesHours)
+	featuresWindow := fmt.Sprintf("%.1f hours", policy.FeaturesHours)
+
+	log.Printf("[janitor] Loaded dynamic policy: quotes=%s trades=%s features=%s emergency=%dMB",
+		quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold)
+
+	return quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold
+}
+
 func main() {
 	var (
-		// normal mode windows
-		window         = flag.String("window", "6 hours", "hot window for quotes when not in emergency")
-		tradesWindow   = flag.String("trades_window", "24 hours", "hot window for trades")
-		featuresWindow = flag.String("features_window", "7 days", "hot window for features")
-		tables         = flag.String("tables", "features,trades,quotes", "comma list: features,trades,quotes")
+		// Default windows (used only if no policy file exists)
+		quotesWindow   = flag.String("quotes_window", "2 hours", "default hot window for quotes")
+		tradesWindow   = flag.String("trades_window", "12 hours", "default hot window for trades")
+		featuresWindow = flag.String("features_window", "6 hours", "default hot window for features")
+		tables         = flag.String("tables", "market_features,market_trades,market_quotes", "comma list of table names")
 
 		// emergency settings
-		minFreeMB      = flag.Int("min_free_mb", 1500, "emergency threshold (MB) for free space")
 		batchQuotes    = flag.Int("batch_quotes", 100000, "delete batch size for quotes in emergency")
 		batchTrades    = flag.Int("batch_trades", 50000, "delete batch size for trades in emergency")
 		batchFeatures  = flag.Int("batch_features", 50000, "delete batch size for features in emergency")
 		emergencyGrace = flag.Duration("emergency_sleep", 5*time.Second, "sleep between emergency batches")
 
 		// partition housekeeping
-		featuresKeepHours  = flag.Int("features_keep_hours", 6, "keep this many hours of features")
 		precreateHoursBack = flag.Int("precreate_hours_back", 2, "precreate partitions hours back")
 		precreateHoursFwd  = flag.Int("precreate_hours_fwd", 2, "precreate partitions hours forward")
+
+		// How often to check for new policy
+		checkInterval = flag.Duration("check_interval", 5*time.Minute, "how often to reload policy and run cleanup")
 	)
 	flag.Parse()
 
@@ -47,134 +91,145 @@ func main() {
 	}
 	defer db.Close()
 
-	// Short context for one-off calls
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
+	// Main loop - reload config each iteration
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 
-	// Always ensure near-term partitions exist.
-	if _, err := db.ExecContext(ctx,
-		"SELECT ensure_features_partitions_hourly($1,$2)",
-		*precreateHoursBack, *precreateHoursFwd,
-	); err != nil {
-		log.Printf("[janitor] ensure_features_partitions_hourly failed: %v", err)
+		// Load dynamic policy (includes emergency threshold)
+		dynamicQuotesWindow, dynamicTradesWindow, dynamicFeaturesWindow, dynamicEmergencyMB :=
+			loadDynamicPolicy(*quotesWindow, *tradesWindow, *featuresWindow)
+
+		// Update table configs with dynamic values
+		tableConfigs := map[string]*TableConfig{
+			"market_features": {
+				window:            dynamicFeaturesWindow,
+				deleteFn:          "delete_exported_hours_features",
+				dropPartitionFn:   "drop_archived_market_features_partitions_hourly",
+				ensurePartitionFn: "ensure_features_partitions_hourly",
+				emergencyWindow:   dynamicFeaturesWindow, // Use same as regular window
+				emergencyBatch:    *batchFeatures,
+				keepHours:         int(parseHours(dynamicFeaturesWindow)),
+			},
+			"market_trades": {
+				window:            dynamicTradesWindow,
+				deleteFn:          "delete_exported_hours_trades",
+				dropPartitionFn:   "drop_archived_market_trades_partitions_hourly",
+				ensurePartitionFn: "ensure_trades_partitions_hourly",
+				emergencyWindow:   dynamicTradesWindow, // Use same as regular window
+				emergencyBatch:    *batchTrades,
+				keepHours:         int(parseHours(dynamicTradesWindow)),
+			},
+			"market_quotes": {
+				window:            dynamicQuotesWindow,
+				deleteFn:          "delete_exported_hours_quotes",
+				dropPartitionFn:   "drop_archived_market_quotes_partitions_hourly",
+				ensurePartitionFn: "ensure_quotes_partitions_hourly",
+				emergencyWindow:   dynamicQuotesWindow, // Use same as regular window
+				emergencyBatch:    *batchQuotes,
+				keepHours:         int(parseHours(dynamicQuotesWindow)),
+			},
+		}
+
+		// Run cleanup with dynamic config
+		runJanitorCycle(ctx, db, tableConfigs, *tables, dynamicEmergencyMB,
+			*emergencyGrace, *precreateHoursBack, *precreateHoursFwd)
+
+		cancel()
+
+		// Sleep before next iteration
+		time.Sleep(*checkInterval)
+	}
+}
+
+// Helper to parse "X.Y hours" into float
+func parseHours(window string) float64 {
+	var hours float64
+	fmt.Sscanf(window, "%f hours", &hours)
+	if hours == 0 {
+		hours = 1 // Default to 1 hour minimum
+	}
+	return hours
+}
+
+// Extract the janitor logic into a function
+func runJanitorCycle(ctx context.Context, db *sql.DB, tableConfigs map[string]*TableConfig,
+	tables string, minFreeMB int, emergencyGrace time.Duration,
+	precreateHoursBack, precreateHoursFwd int) {
+
+	// Ensure partitions exist
+	for tableName, config := range tableConfigs {
+		if config.ensurePartitionFn != "" {
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf("SELECT %s($1,$2)", config.ensurePartitionFn),
+				precreateHoursBack, precreateHoursFwd,
+			); err != nil {
+				log.Printf("[janitor] %s failed for %s: %v", config.ensurePartitionFn, tableName, err)
+			}
+		}
 	}
 
 	free := freeMB("/")
-	log.Printf("[janitor] free_mb=%d min_free_mb=%d", free, *minFreeMB)
+	log.Printf("[janitor] free_mb=%d min_free_mb=%d", free, minFreeMB)
 
-	// Emergency mode: ignore archive markers; delete by ts in chunks until we’re above water.
-	if free < *minFreeMB {
+	// Emergency mode
+	if free < minFreeMB {
 		log.Printf("[janitor] EMERGENCY MODE: low disk")
-		deadline := time.Now().Add(5 * time.Minute) // hard cap
+		deadline := time.Now().Add(5 * time.Minute)
 		round := 0
 
 		for {
 			round++
 			var total int64
 
-			del, _ := emergencyDelete(ctx, db, "market_quotes", "6 hours", *batchQuotes, *emergencyGrace)
-			total += del
-			del, _ = emergencyDelete(ctx, db, "market_trades", "24 hours", *batchTrades, *emergencyGrace)
-			total += del
-			del, _ = emergencyDelete(ctx, db, "market_features", "7 days", *batchFeatures, *emergencyGrace)
-			total += del
+			emergencyOrder := []string{"market_quotes", "market_trades", "market_features"}
+			for _, tableName := range emergencyOrder {
+				if config, ok := tableConfigs[tableName]; ok {
+					del, _ := emergencyDelete(ctx, db, tableName, config.emergencyWindow,
+						config.emergencyBatch, emergencyGrace)
+					total += del
+				}
+			}
 
 			dbCheckpoint(ctx, db)
-
 			free = freeMB("/")
 			log.Printf("[janitor] round=%d total_deleted=%d free_mb=%d", round, total, free)
 
-			if free >= *minFreeMB {
+			if free >= minFreeMB || total == 0 || time.Now().After(deadline) || round >= 10 {
 				break
-			} // target reached
-			if total == 0 {
-				break
-			} // no progress — don’t spin
-			if time.Now().After(deadline) {
-				break
-			} // time cap
-			if round >= 10 {
-				break
-			} // round cap
-		}
-		// no return — fall through to housekeeping
-	}
-
-	// Normal mode: respect archive markers (only delete hours confirmed archived).
-	for _, t := range splitCSV(*tables) {
-		switch t {
-		case "features":
-			callWindowed(ctx, db, "SELECT delete_exported_hours_features($1)", *featuresWindow, "market_features")
-		case "trades":
-			callWindowed(ctx, db, "SELECT delete_exported_hours_trades($1)", *tradesWindow, "market_trades")
-		case "quotes":
-			callWindowed(ctx, db, "SELECT delete_exported_hours_quotes($1)", *window, "market_quotes")
-		default:
-			log.Printf("skip unknown table: %s", t)
+			}
 		}
 	}
 
-	// (A) Drop zero-row partitions older than featuresKeepHours (fast bloat reclaim).
-	droppedEmpty, err := dropEmptyFeaturePartitions(ctx, db, *featuresKeepHours)
-	if err != nil {
-		log.Printf("[janitor] dropEmptyFeaturePartitions failed: %v", err)
-	} else if droppedEmpty > 0 {
-		log.Printf("[janitor] dropped %d EMPTY market_features day-partitions", droppedEmpty)
-		dbCheckpoint(ctx, db)
-	}
+	// Normal mode
+	for _, tableName := range splitCSV(tables) {
+		config, ok := tableConfigs[tableName]
+		if !ok {
+			log.Printf("skip unknown table: %s", tableName)
+			continue
+		}
 
-	// (B) Drop archived hourly partitions
-	var dropped int
-	if err := db.QueryRowContext(ctx,
-		"SELECT drop_archived_market_features_partitions_hourly($1)",
-		*featuresKeepHours,
-	).Scan(&dropped); err != nil {
-		log.Printf("[janitor] drop_archived_market_features_partitions_hourly failed: %v", err)
-	} else if dropped > 0 {
-		log.Printf("[janitor] dropped %d market_features hourly partitions", dropped)
-		dbCheckpoint(ctx, db)
-	}
+		if config.deleteFn != "" {
+			callWindowed(ctx, db,
+				fmt.Sprintf("SELECT %s($1)", config.deleteFn),
+				config.window, tableName)
+		}
 
-	// (C) Drop archived trades hourly partitions
-	var droppedTrades int
-	if err := db.QueryRowContext(ctx,
-		"SELECT drop_archived_market_trades_partitions_hourly($1)",
-		12, // keep 12 hours for trades
-	).Scan(&droppedTrades); err != nil {
-		log.Printf("[janitor] drop_archived_market_trades_partitions_hourly failed: %v", err)
-	} else if droppedTrades > 0 {
-		log.Printf("[janitor] dropped %d market_trades hourly partitions", droppedTrades)
-		dbCheckpoint(ctx, db)
-	}
-
-	// (D) Drop archived quotes hourly partitions
-	var droppedQuotes int
-	if err := db.QueryRowContext(ctx,
-		"SELECT drop_archived_market_quotes_partitions_hourly($1)",
-		2, // keep only 2 hours for quotes
-	).Scan(&droppedQuotes); err != nil {
-		log.Printf("[janitor] drop_archived_market_quotes_partitions_hourly failed: %v", err)
-	} else if droppedQuotes > 0 {
-		log.Printf("[janitor] dropped %d market_quotes hourly partitions", droppedQuotes)
-		dbCheckpoint(ctx, db)
-	}
-
-	// Also ensure partitions exist for all tables
-	if _, err := db.ExecContext(ctx,
-		"SELECT ensure_trades_partitions_hourly($1,$2)",
-		*precreateHoursBack, *precreateHoursFwd,
-	); err != nil {
-		log.Printf("[janitor] ensure_trades_partitions_hourly failed: %v", err)
-	}
-
-	if _, err := db.ExecContext(ctx,
-		"SELECT ensure_quotes_partitions_hourly($1,$2)",
-		*precreateHoursBack, *precreateHoursFwd,
-	); err != nil {
-		log.Printf("[janitor] ensure_quotes_partitions_hourly failed: %v", err)
+		if config.dropPartitionFn != "" {
+			var dropped int
+			if err := db.QueryRowContext(ctx,
+				fmt.Sprintf("SELECT %s($1)", config.dropPartitionFn),
+				config.keepHours,
+			).Scan(&dropped); err != nil {
+				log.Printf("[janitor] %s failed: %v", config.dropPartitionFn, err)
+			} else if dropped > 0 {
+				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
+				dbCheckpoint(ctx, db)
+			}
+		}
 	}
 }
 
+// [Rest of the helper functions remain the same...]
 func splitCSV(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
@@ -254,13 +309,11 @@ func freeMB(path string) int {
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return 0
 	}
-	// available blocks * size / 1024 / 1024
 	return int((stat.Bavail * uint64(stat.Bsize)) / (1024 * 1024))
 }
 
-// Drops empty (zero-row) day partitions older than current_date - keepDays.
-// Returns the number of partitions dropped (best-effort).
 func dropEmptyFeaturePartitions(ctx context.Context, db *sql.DB, keepDays int) (int, error) {
+	// [Keep the same implementation as before]
 	sql := fmt.Sprintf(`
 DO $$
 DECLARE
@@ -305,11 +358,9 @@ END$$;
 	if _, err := db.ExecContext(ctx, sql); err != nil {
 		return 0, err
 	}
-	// We don’t parse the NOTICE; just return 0 and rely on logs.
 	return 0, nil
 }
 
-// Run a checkpoint and force a WAL segment switch (best-effort).
 func dbCheckpoint(ctx context.Context, db *sql.DB) {
 	if _, err := db.ExecContext(ctx, "CHECKPOINT"); err != nil {
 		log.Printf("[janitor] CHECKPOINT failed: %v", err)

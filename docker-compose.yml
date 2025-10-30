@@ -14,9 +14,9 @@ services:
       - -c
       - wal_compression=on
       - -c
-      - max_wal_size=4GB
+      - max_wal_size=1GB
       - -c
-      - min_wal_size=1GB
+      - min_wal_size=256MB
       - -c
       - shared_buffers=256MB
       - -c
@@ -113,6 +113,19 @@ services:
     volumes:
       - ./configs:/app/configs:ro
     restart: unless-stopped
+  
+  healthmonitor:
+    logging: *default-logging
+    build: .
+    environment:
+      DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
+    command: ["/usr/local/bin/healthmonitor", "-target", "70", "-interval", "30s"]
+    volumes:
+      - retention_policy:/tmp
+    restart: unless-stopped
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
 
   archiver:
     logging: *default-logging
@@ -123,16 +136,22 @@ services:
       AWS_REGION: ${AWS_REGION}
     command: ["/bin/sh", "-c", "
       while true; do 
+        echo '[archiver] Starting archive cycle';
         /usr/local/bin/archiver -table market_features -backfill || true;
         /usr/local/bin/archiver -table market_trades -backfill || true;
         /usr/local/bin/archiver -table market_quotes -backfill || true;
         /usr/local/bin/archiver -table market_features || true;
         /usr/local/bin/archiver -table market_trades || true;
         /usr/local/bin/archiver -table market_quotes || true;
-        sleep 300; 
+        echo '[archiver] Sleeping 60 seconds';
+        sleep 60;
       done"]
+    volumes:
+      - retention_policy:/tmp:ro
     restart: unless-stopped
-
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
 
   janitor:
     logging: *default-logging
@@ -140,22 +159,15 @@ services:
     depends_on:
       migrator:
         condition: service_completed_successfully
+      healthmonitor:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
-    command: ["/bin/sh","-c", "
-      while true; do 
-        /usr/local/bin/janitor \
-          -tables features,trades,quotes \
-          -window '2 hours' \
-          -trades_window '12 hours' \
-          -features_window '6 hours' \
-          -features_keep_hours 6 \
-          -precreate_hours_back 2 \
-          -precreate_hours_fwd 2 \
-          -min_free_mb 3000; 
-        sleep 300; 
-      done"]
+    command: ["/usr/local/bin/janitor"]
+    volumes:
+      - retention_policy:/tmp:ro
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  retention_policy:

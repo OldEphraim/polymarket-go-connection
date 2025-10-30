@@ -33,6 +33,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -ldflags="-s -w" -o /app/bin/healthmonitor ./cmd/healthmonitor/main.go
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /app/bin/archiver  ./cmd/archiver/main.go
 
 RUN --mount=type=cache,target=/go/pkg/mod \
