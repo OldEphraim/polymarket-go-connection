@@ -65,6 +65,8 @@ services:
     depends_on:
       migrator:
         condition: service_completed_successfully
+      healthmonitor:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       API_KEY: ${API_KEY}
@@ -78,6 +80,8 @@ services:
     ports:
       - "6060:6060"
     command: ["/usr/local/bin/gatherer"]
+    volumes:
+      - retention_policy:/tmp:ro
     restart: unless-stopped
 
   api:
@@ -128,30 +132,24 @@ services:
         condition: service_completed_successfully
 
   archiver:
-    logging: *default-logging
     build: .
     environment:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
       AWS_REGION: ${AWS_REGION}
-    command: ["/bin/sh", "-c", "
-      while true; do 
-        echo '[archiver] Starting archive cycle';
-        /usr/local/bin/archiver -table market_features -backfill || true;
-        /usr/local/bin/archiver -table market_trades -backfill || true;
-        /usr/local/bin/archiver -table market_quotes -backfill || true;
-        /usr/local/bin/archiver -table market_features || true;
-        /usr/local/bin/archiver -table market_trades || true;
-        /usr/local/bin/archiver -table market_quotes || true;
-        echo '[archiver] Sleeping 60 seconds';
-        sleep 60;
-      done"]
+      TABLES: ${ARCHIVER_TABLES:-market_features,market_trades,market_quotes}
+    command: ["/usr/local/bin/archiver",
+              "-tables", "${TABLES}",
+              "-concurrency", "3",
+              "-backfill"]
     volumes:
       - retention_policy:/tmp:ro
-    restart: unless-stopped
     depends_on:
       migrator:
         condition: service_completed_successfully
+      healthmonitor:
+        condition: service_started
+    restart: unless-stopped
 
   janitor:
     logging: *default-logging

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,6 +18,24 @@ import (
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 	"github.com/joho/godotenv"
 )
+
+type retentionPolicy struct {
+	PauseGatherer      bool `json:"pause_gatherer"`
+	BackpressureFreeMB int  `json:"backpressure_free_mb"` // available if you want it later
+}
+
+func readPolicy(path string) (retentionPolicy, error) {
+	var p retentionPolicy
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return p, err
+	}
+	if len(b) == 0 {
+		return p, nil
+	}
+	err = json.Unmarshal(b, &p)
+	return p, err
+}
 
 func main() {
 	// Load env
@@ -33,10 +54,11 @@ func main() {
 		log.Fatal("DATABASE_URL environment variable not set")
 	}
 
-	sqlDB, err := sql.Open("postgres", dbURL) // requires: _ "github.com/lib/pq"
+	sqlDB, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
+	defer sqlDB.Close()
 
 	// (optional but recommended) sane pool settings
 	sqlDB.SetMaxOpenConns(20)
@@ -50,7 +72,7 @@ func main() {
 	// sqlc queries handle
 	q := database.New(sqlDB)
 
-	// ⬅️ Pass BOTH the queries and the raw *sql.DB so the COPY persister can use it
+	// Store for gatherer
 	store := gatherer.NewSQLCStore(q, sqlDB)
 
 	// Config
@@ -61,18 +83,83 @@ func main() {
 			cfg.ScanInterval = d
 		}
 	}
-	// Make sure this is true to enable WS:
-	// cfg.UseWebsocket = true
+	// If you have a debug server, keep it as-is (cfg.UseWebsocket etc.)
 
-	// Start
+	// Gatherer instance
 	g := gatherer.New(store, cfg, logger)
-	if err := g.Start(); err != nil {
-		log.Fatalf("start gatherer: %v", err)
+
+	// Lifecycle management
+	var mu sync.Mutex
+	running := false
+	start := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if running {
+			return
+		}
+		if err := g.Start(); err != nil {
+			logger.Error("start gatherer failed", "err", err)
+			return
+		}
+		running = true
+		logger.Info("Gatherer started",
+			"scan_interval", cfg.ScanInterval,
+			"base_url", cfg.BaseURL)
+	}
+	stop := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !running {
+			return
+		}
+		g.Stop()
+		running = false
+		logger.Info("Gatherer stopped")
 	}
 
-	logger.Info("Gatherer service started",
-		"scan_interval", cfg.ScanInterval,
-		"base_url", cfg.BaseURL)
+	// Start initially unless paused by policy
+	policyPath := "/tmp/retention_policy.json"
+	initialPolicy, _ := readPolicy(policyPath)
+	if initialPolicy.PauseGatherer {
+		logger.Warn("Gatherer paused by policy at startup")
+	} else {
+		start()
+	}
+
+	// Watch policy and honor PauseGatherer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+
+		pausedLast := initialPolicy.PauseGatherer
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				p, err := readPolicy(policyPath)
+				if err != nil {
+					// Not fatal—just log and continue
+					logger.Debug("policy read error", "err", err)
+					continue
+				}
+				paused := p.PauseGatherer
+				if paused != pausedLast {
+					pausedLast = paused
+					if paused {
+						logger.Warn("Policy set PauseGatherer=true; stopping gatherer")
+						stop()
+					} else {
+						logger.Info("Policy cleared PauseGatherer; starting gatherer")
+						start()
+					}
+				}
+			}
+		}
+	}()
 
 	// Wait for signal
 	sig := make(chan os.Signal, 1)
@@ -80,6 +167,6 @@ func main() {
 	<-sig
 
 	logger.Info("Shutdown signal received")
-	g.Stop()
-	logger.Info("Gatherer service stopped")
+	stop()
+	logger.Info("Gatherer service exited")
 }

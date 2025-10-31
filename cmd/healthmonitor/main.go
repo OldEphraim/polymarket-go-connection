@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"math"
 	"os"
 	"syscall"
 	"time"
@@ -32,7 +33,28 @@ type RetentionPolicy struct {
 	ArchiveSleepSecs   int       `json:"archive_sleep_secs"`
 	JanitorSleepSecs   int       `json:"janitor_sleep_secs"`
 	EmergencyThreshold int       `json:"emergency_threshold_mb"`
+
+	// NEW: dynamic pacing / backpressure signals
+	BackpressureFreeMB int  `json:"backpressure_free_mb"`
+	PauseGatherer      bool `json:"pause_gatherer"`
 }
+
+// Hysteresis thresholds (tweak as you like)
+const (
+	// gatherer pause/resume bands
+	pauseUsedPctOn  = 90.0 // pause when used% >= 90
+	pauseUsedPctOff = 85.0 // resume when used% <= 85
+
+	// emergency free space bands (MB)
+	emergencyFreeMBOn  = 1_500 // enter emergency if free < 1.5 GB
+	emergencyFreeMBOff = 3_000 // exit emergency if free > 3.0 GB
+
+	// default backpressure free space for writers (MB)
+	defaultBackpressureFreeMB = 3_000
+
+	minSafeguardWriteRate = 1.0 // MB/hour (avoid division by zero)
+	minRetentionHours     = 0.1 // never go below this when clamping
+)
 
 func main() {
 	var (
@@ -61,8 +83,10 @@ func main() {
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
+		prev := readPrevPolicy(*policyFile)
+
 		metrics := collectMetrics(ctx, db)
-		policy := calculatePolicy(metrics, *targetUsedPct, *minRetention, *maxRetention)
+		policy := calculatePolicyStable(metrics, prev, *targetUsedPct, *minRetention, *maxRetention)
 
 		// Write policy to file for other services to read
 		if err := writePolicy(*policyFile, policy); err != nil {
@@ -71,8 +95,10 @@ func main() {
 
 		log.Printf("Metrics: FreeMB=%d UsedPct=%.1f%% WriteRate=%.1fMB/hr Partitions=%d",
 			metrics.FreeSpaceMB, metrics.UsedPercent, metrics.WriteRateMBHour, metrics.PartitionCount)
-		log.Printf("Policy: Features=%.1fh Trades=%.1fh Quotes=%.1fh ArchiveSleep=%ds",
-			policy.FeaturesHours, policy.TradesHours, policy.QuotesHours, policy.ArchiveSleepSecs)
+		log.Printf("Policy: PauseGatherer=%v BackpressureFreeMB=%d Features=%.1fh Trades=%.1fh Quotes=%.1fh ArchiveSleep=%ds JanitorSleep=%ds EmergencyFreeMB=%d",
+			policy.PauseGatherer, policy.BackpressureFreeMB,
+			policy.FeaturesHours, policy.TradesHours, policy.QuotesHours,
+			policy.ArchiveSleepSecs, policy.JanitorSleepSecs, policy.EmergencyThreshold)
 
 		cancel()
 		time.Sleep(*checkInterval)
@@ -86,10 +112,22 @@ func collectMetrics(ctx context.Context, db *sql.DB) HealthMetrics {
 
 	// Get disk space
 	var stat syscall.Statfs_t
-	if err := syscall.Statfs("/", &stat); err == nil {
-		m.TotalSpaceMB = int(stat.Blocks * uint64(stat.Bsize) / 1024 / 1024)
-		m.FreeSpaceMB = int(stat.Bavail * uint64(stat.Bsize) / 1024 / 1024)
-		m.UsedPercent = float64(m.TotalSpaceMB-m.FreeSpaceMB) / float64(m.TotalSpaceMB) * 100
+	if err := syscall.Statfs("/", &stat); err == nil && stat.Bsize > 0 {
+		total := int(stat.Blocks * uint64(stat.Bsize) / 1024 / 1024)
+		free := int(stat.Bavail * uint64(stat.Bsize) / 1024 / 1024)
+		if total < 0 {
+			total = 0
+		}
+		if free < 0 {
+			free = 0
+		}
+		m.TotalSpaceMB = total
+		m.FreeSpaceMB = free
+		if total > 0 {
+			usedPct := float64(total-free) / float64(total) * 100
+			// clamp to [0,100]
+			m.UsedPercent = math.Max(0, math.Min(100, usedPct))
+		}
 	}
 
 	// Get partition info
@@ -122,18 +160,17 @@ func collectMetrics(ctx context.Context, db *sql.DB) HealthMetrics {
 		m.NewestPartition = newest
 	}
 
-	// Estimate write rate from recent partitions
+	// Estimate write rate from recent partitions (clamped)
 	if !oldest.IsZero() && !newest.IsZero() {
 		hoursDiff := newest.Sub(oldest).Hours()
 		if hoursDiff > 0 {
-			// Rough estimate: assume each partition is ~100MB when full
 			m.WriteRateMBHour = float64(partitionCount) * 100 / hoursDiff
 		}
 	}
 
-	// Better write rate from actual sizes
+	// Better write rate from actual sizes (clamped)
 	var totalSizeMB float64
-	db.QueryRowContext(ctx, `
+	_ = db.QueryRowContext(ctx, `
 		SELECT COALESCE(SUM(pg_total_relation_size(schemaname||'.'||tablename))::float / 1024 / 1024, 0)
 		FROM pg_tables 
 		WHERE tablename LIKE 'market_%_p2025%'
@@ -146,22 +183,50 @@ func collectMetrics(ctx context.Context, db *sql.DB) HealthMetrics {
 		}
 	}
 
+	// Final clamp on write rate
+	if m.WriteRateMBHour <= 0 || math.IsNaN(m.WriteRateMBHour) || math.IsInf(m.WriteRateMBHour, 0) {
+		m.WriteRateMBHour = minSafeguardWriteRate
+	}
+
 	return m
 }
 
-func calculatePolicy(m HealthMetrics, targetPct, minHours, maxHours float64) RetentionPolicy {
+// Stable policy with hysteresis & clamped math
+func calculatePolicyStable(m HealthMetrics, prev RetentionPolicy, targetPct, minHours, maxHours float64) RetentionPolicy {
+	now := time.Now()
+	if minHours < minRetentionHours {
+		minHours = minRetentionHours
+	}
+	if maxHours < minHours {
+		maxHours = minHours
+	}
+
 	p := RetentionPolicy{
-		Timestamp: time.Now(),
+		Timestamp: now,
 	}
 
 	// Calculate how much space we want to use
-	targetSpaceMB := float64(m.TotalSpaceMB) * (targetPct / 100)
-	currentSpaceMB := float64(m.TotalSpaceMB - m.FreeSpaceMB)
+	var targetSpaceMB, currentSpaceMB, spaceAvailable float64
+	if m.TotalSpaceMB > 0 {
+		targetSpaceMB = float64(m.TotalSpaceMB) * (targetPct / 100.0)
+		currentSpaceMB = float64(m.TotalSpaceMB - m.FreeSpaceMB)
+		// +10% buffer
+		spaceAvailable = (targetSpaceMB - currentSpaceMB) + (float64(m.TotalSpaceMB) * 0.10)
+	}
+	if spaceAvailable < 0 {
+		spaceAvailable = 0
+	}
 
-	// Calculate hours of data we can afford
-	spaceAvailable := targetSpaceMB - currentSpaceMB + (float64(m.TotalSpaceMB) * 0.1) // 10% buffer
-	hoursWeCanKeep := spaceAvailable / m.WriteRateMBHour
+	// Guard against 0 write-rate
+	wr := m.WriteRateMBHour
+	if wr < minSafeguardWriteRate {
+		wr = minSafeguardWriteRate
+	}
 
+	hoursWeCanKeep := spaceAvailable / wr
+	if math.IsNaN(hoursWeCanKeep) || math.IsInf(hoursWeCanKeep, 0) {
+		hoursWeCanKeep = minHours
+	}
 	// Clamp to bounds
 	if hoursWeCanKeep < minHours {
 		hoursWeCanKeep = minHours
@@ -170,37 +235,81 @@ func calculatePolicy(m HealthMetrics, targetPct, minHours, maxHours float64) Ret
 	}
 
 	// Distribute retention across tables (quotes most aggressive, features least)
-	p.QuotesHours = hoursWeCanKeep * 0.2   // 20% for quotes
-	p.TradesHours = hoursWeCanKeep * 0.3   // 30% for trades
-	p.FeaturesHours = hoursWeCanKeep * 0.5 // 50% for features
+	p.QuotesHours = clamp(hoursWeCanKeep*0.2, minHours, maxHours)
+	p.TradesHours = clamp(hoursWeCanKeep*0.3, minHours, maxHours)
+	p.FeaturesHours = clamp(hoursWeCanKeep*0.5, minHours, maxHours)
 
-	// Ensure minimums
-	if p.QuotesHours < minHours {
-		p.QuotesHours = minHours
-	}
-	if p.TradesHours < minHours {
-		p.TradesHours = minHours
-	}
-	if p.FeaturesHours < minHours {
-		p.FeaturesHours = minHours
-	}
-
-	// Adjust service frequencies based on pressure
-	if m.UsedPercent > 80 {
-		p.ArchiveSleepSecs = 30                     // Archive aggressively
-		p.JanitorSleepSecs = 60                     // Clean aggressively
-		p.EmergencyThreshold = m.FreeSpaceMB + 1000 // Force emergency mode
-	} else if m.UsedPercent > 70 {
+	// Base sleep intervals by utilization
+	switch {
+	case m.UsedPercent >= 85:
+		p.ArchiveSleepSecs = 30
+		p.JanitorSleepSecs = 60
+	case m.UsedPercent >= 70:
 		p.ArchiveSleepSecs = 60
 		p.JanitorSleepSecs = 120
-		p.EmergencyThreshold = 3000
-	} else {
+	default:
 		p.ArchiveSleepSecs = 300
 		p.JanitorSleepSecs = 300
-		p.EmergencyThreshold = 2000
+	}
+
+	// Backpressure signal for writers (archiver/janitor already consume; gatherer will also read it)
+	// If we have very little free space, tell writers to slow down aggressively.
+	switch {
+	case m.FreeSpaceMB < 1_000:
+		p.BackpressureFreeMB = 4_000
+	case m.FreeSpaceMB < 2_000:
+		p.BackpressureFreeMB = 3_500
+	case m.FreeSpaceMB < 3_000:
+		p.BackpressureFreeMB = 3_000
+	default:
+		p.BackpressureFreeMB = defaultBackpressureFreeMB
+	}
+
+	// Stable emergency threshold with hysteresis (encode "are we in emergency?")
+	wasEmergency := prev.EmergencyThreshold > 0 && m.FreeSpaceMB < prev.EmergencyThreshold
+	inEmergency := wasEmergency
+
+	// Enter emergency if we drop below ON band; exit only after OFF band
+	if !wasEmergency && m.FreeSpaceMB < emergencyFreeMBOn {
+		inEmergency = true
+	}
+	if wasEmergency && m.FreeSpaceMB > emergencyFreeMBOff {
+		inEmergency = false
+	}
+
+	if inEmergency {
+		p.EmergencyThreshold = emergencyFreeMBOff // keep a stable, higher target to exit emergency
+		// Pausing gatherer at the same time reduces incoming pressure
+		p.PauseGatherer = true
+		// While in emergency, tighten service pacing a bit too
+		if p.ArchiveSleepSecs > 60 {
+			p.ArchiveSleepSecs = 60
+		}
+		if p.JanitorSleepSecs > 120 {
+			p.JanitorSleepSecs = 120
+		}
+	} else {
+		p.EmergencyThreshold = emergencyFreeMBOn // when healthy, lower bound to trigger emergency next time
+		// Consider pausing gatherer if %used is extremely high, even if not emergency by freeMB
+		if prev.PauseGatherer {
+			// Apply hysteresis on utilization as well
+			p.PauseGatherer = m.UsedPercent >= pauseUsedPctOff
+		} else {
+			p.PauseGatherer = m.UsedPercent >= pauseUsedPctOn
+		}
 	}
 
 	return p
+}
+
+func clamp(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func writePolicy(filename string, policy RetentionPolicy) error {
@@ -209,4 +318,14 @@ func writePolicy(filename string, policy RetentionPolicy) error {
 		return err
 	}
 	return os.WriteFile(filename, data, 0644)
+}
+
+func readPrevPolicy(filename string) RetentionPolicy {
+	var prev RetentionPolicy
+	b, err := os.ReadFile(filename)
+	if err != nil || len(b) == 0 {
+		return prev
+	}
+	_ = json.Unmarshal(b, &prev)
+	return prev
 }
