@@ -223,12 +223,6 @@ func (c *polyWS) Run(
 					if onQuote != nil && bid > 0 && ask > 0 {
 						onQuote(ch.AssetID, bid, ask, ts)
 					}
-					// Opportunistic trade from price_change if present
-					price := f64s(ch.Price)
-					size := f64s(ch.Size)
-					if onTrade != nil && price > 0 && size > 0 {
-						onTrade(ch.AssetID, price, normSide(strings.ToLower(ch.Side)), size, ts)
-					}
 				}
 				break
 			}
@@ -266,10 +260,7 @@ func (c *polyWS) Run(
 				}
 			}
 			if len(raw) == 0 {
-				if wsLogUnknown {
-					writeUnknown("trade_no_payload", data)
-				}
-				continue
+				raw = data
 			}
 
 			// Extract a fallback frame timestamp (if present)
