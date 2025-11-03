@@ -25,19 +25,24 @@ func NewStore(connStr string) (*Store, error) {
 	}, nil
 }
 
-func (s *Store) ExecTx(ctx context.Context, fn func(*database.Queries) error) error {
-	tx, err := s.db.Begin()
+func (s *Store) ExecTx(ctx context.Context, fn func(*database.Queries) error) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
 	q := s.Queries.WithTx(tx)
-	err = fn(q)
-	if err != nil {
-		tx.Rollback()
+	if err = fn(q); err != nil {
 		return err
 	}
-
 	return tx.Commit()
 }
 
