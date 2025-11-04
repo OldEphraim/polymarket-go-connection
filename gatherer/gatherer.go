@@ -3,18 +3,16 @@ package gatherer
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"log/slog"
-	"math"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
 	_ "net/http/pprof" // optional pprof endpoints
 
-	"github.com/sqlc-dev/pqtype"
+	ws "github.com/OldEphraim/polymarket-go-connection/gatherer/ws"
 )
 
 type Gatherer struct {
@@ -112,7 +110,9 @@ func (g *Gatherer) Start() error {
 			"batch_size", defaultBatchSize,
 			"flush_interval_ms", int(defaultFlushInterval/time.Millisecond))
 	} else {
-		g.logger.Error("store does not expose DB(); COPY batching disabled")
+		// Persister is required so the feature engine can be the sole consumer
+		// of quotes/trades without risking data loss.
+		return errors.New("gatherer: store does not expose DB(); persister required")
 	}
 
 	// Feature engine
@@ -182,215 +182,7 @@ func (g *Gatherer) Stop() {
 
 func (g *Gatherer) EventChannel() <-chan MarketEvent { return g.eventChan }
 
-// ===== Internal debug HTTP =====
-
-func (g *Gatherer) startDebugHTTP(addr string) {
-	mux := http.NewServeMux()
-
-	// Health
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	// Queue depths (cheap instantaneous gauges)
-	mux.HandleFunc("/queues", func(w http.ResponseWriter, r *http.Request) {
-		type Q struct {
-			EventQueue    int `json:"event_queue"`
-			QuotesQueue   int `json:"quotes_queue"`
-			TradesQueue   int `json:"trades_queue"`
-			FeaturesQueue int `json:"features_queue"`
-		}
-		out := Q{
-			EventQueue:    len(g.eventChan),
-			QuotesQueue:   len(g.quotesCh),
-			TradesQueue:   len(g.tradesCh),
-			FeaturesQueue: len(g.featuresCh),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
-	})
-
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		out := struct {
-			AssetsCount int      `json:"assets_count"`
-			Sample      []string `json:"sample"`
-		}{
-			AssetsCount: len(g.wsAssetList()),
-		}
-		// include up to 5 examples to sanity check
-		all := g.wsAssetList()
-		if len(all) > 5 {
-			out.Sample = all[:5]
-		} else {
-			out.Sample = all
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
-	})
-
-	// Optional: pprof under /debug/pprof/*
-	// The handlers are registered on DefaultServeMux; mount them here.
-	mux.Handle("/debug/pprof/", http.DefaultServeMux)
-
-	g.debugSrv = &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 2 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
-
-	go func() {
-		g.logger.Info("gatherer debug http listening", "addr", addr)
-		if err := g.debugSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			g.logger.Warn("debug http server stopped", "err", err)
-		}
-	}()
-}
-
-// tiny JSON helper (local to gatherer)
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
 // ===== Shared helpers =====
-
-func (g *Gatherer) emitEvent(event MarketEvent) {
-	g.eventsEmitted++
-
-	// 1) Persist to DB
-	meta, _ := json.Marshal(event.Metadata)
-	_, err := g.store.RecordMarketEvent(g.ctx, RecordMarketEventParams{
-		TokenID:   event.TokenID,
-		EventType: sql.NullString{String: string(event.Type), Valid: true},
-		OldValue:  sql.NullFloat64{Float64: event.OldValue, Valid: true},
-		NewValue:  sql.NullFloat64{Float64: event.NewValue, Valid: true},
-		Metadata:  pqtype.NullRawMessage{RawMessage: meta, Valid: true},
-	})
-	if err != nil {
-		g.logger.Error("record event failed", "type", event.Type, "token_id", event.TokenID, "err", err)
-	}
-
-	// 2) Non-blocking publish
-	select {
-	case g.eventChan <- event:
-	default:
-		g.logger.Warn("event publish queue full; skipping publish",
-			"type", event.Type, "token_id", event.TokenID)
-	}
-}
-
-func isNaN(f float64) bool { return f != f }
-
-func (g *Gatherer) loadMarketCache() error {
-	rows, err := g.store.GetActiveMarketScans(g.ctx, 10000)
-	if err != nil {
-		return err
-	}
-	g.cacheMu.Lock()
-	defer g.cacheMu.Unlock()
-	for i := range rows {
-		r := rows[i]
-		g.marketCache[r.TokenID] = &r
-	}
-	g.logger.Info("cache loaded", "count", len(g.marketCache))
-	return nil
-}
-
-func (g *Gatherer) updateCache(tokenID string, scan *MarketScanRow) {
-	g.cacheMu.Lock()
-	g.marketCache[tokenID] = scan
-	g.cacheMu.Unlock()
-}
-
-func (g *Gatherer) lastScan(tokenID string) (*MarketScanRow, bool) {
-	g.cacheMu.RLock()
-	defer g.cacheMu.RUnlock()
-	r, ok := g.marketCache[tokenID]
-	return r, ok
-}
-
-// Clean price formatting helper
-func f64(v float64) sql.NullFloat64 {
-	if v == 0 && (1/v) == math.Inf(1) {
-		return sql.NullFloat64{Valid: false}
-	}
-	return sql.NullFloat64{Float64: v, Valid: true}
-}
-
-func (g *Gatherer) addClobMap(tokenID string, clobIDs string) {
-	if clobIDs == "" {
-		return
-	}
-
-	ids := decodeAssetIDs(clobIDs)
-	if len(ids) == 0 {
-		return
-	}
-
-	g.assetMu.Lock()
-	for _, id := range ids {
-		if id != "" {
-			g.assetToToken[id] = tokenID
-		}
-	}
-	g.assetMu.Unlock()
-}
-
-func decodeAssetIDs(s string) []string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-
-	// JSON array? e.g. ["id1","id2"]
-	if strings.HasPrefix(s, "[") {
-		var arr []string
-		if err := json.Unmarshal([]byte(s), &arr); err == nil {
-			out := make([]string, 0, len(arr))
-			for _, v := range arr {
-				v = strings.TrimSpace(v)
-				v = strings.Trim(v, `"'`)
-				if v != "" {
-					out = append(out, v)
-				}
-			}
-			return out
-		}
-	}
-
-	// Fallback: CSV (strip stray quotes/brackets)
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		p = strings.Trim(p, `[]"'"`)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func (g *Gatherer) wsAssetList() []string {
-	g.assetMu.RLock()
-	defer g.assetMu.RUnlock()
-	out := make([]string, 0, len(g.assetToToken))
-	for k := range g.assetToToken {
-		out = append(out, k)
-	}
-	return out
-}
-
-func (g *Gatherer) tokenForAsset(assetID string) string {
-	g.assetMu.RLock()
-	defer g.assetMu.RUnlock()
-	return g.assetToToken[assetID]
-}
 
 func (g *Gatherer) runWSIngest() {
 	backoff := time.Second
@@ -463,8 +255,8 @@ func (g *Gatherer) runWSIngest() {
 			}
 		}
 
-		ws := NewPolymarketWSClient(g.logger)
-		err := ws.Run(g.ctx, g.config.WebsocketURL, assets, onQuote, onTrade)
+		wsc := ws.NewPolymarketClient(g.logger)
+		err := wsc.Run(g.ctx, g.config.WebsocketURL, assets, onQuote, onTrade)
 		if err != nil && g.ctx.Err() == nil {
 			g.logger.Warn("ws ingest ended with error; reconnecting", "err", err)
 			time.Sleep(backoff)
@@ -478,49 +270,11 @@ func (g *Gatherer) runWSIngest() {
 }
 
 // startWriters drains quotes/trades/features to storage.
-// If COPY persister is present, enqueue there; otherwise call Store methods.
 func (g *Gatherer) startWriters() {
-	// Quotes
-	g.wg.Add(1)
-	go func() {
-		defer g.wg.Done()
-		for {
-			select {
-			case <-g.ctx.Done():
-				return
-			case q := <-g.quotesCh:
-				if g.p != nil {
-					g.p.EnqueueQuote(q) // implement in persister OR fall back below
-					continue
-				}
-				if err := g.store.InsertQuote(g.ctx, q); err != nil {
-					g.logger.Error("insert quote", "token_id", q.TokenID, "err", err)
-				}
-			}
-		}
-	}()
+	// NOTE: Quotes/Trades consumers removed.
+	// The feature engine is the single consumer of g.quotesCh/g.tradesCh and
+	// is responsible for persistence via the persister to avoid fan-out loss.
 
-	// Trades
-	g.wg.Add(1)
-	go func() {
-		defer g.wg.Done()
-		for {
-			select {
-			case <-g.ctx.Done():
-				return
-			case t := <-g.tradesCh:
-				if g.p != nil {
-					g.p.EnqueueTrade(t) // implement in persister OR fall back below
-					continue
-				}
-				if err := g.store.InsertTrade(g.ctx, t); err != nil {
-					g.logger.Error("insert trade", "token_id", t.TokenID, "err", err)
-				}
-			}
-		}
-	}()
-
-	// Features (in case your feature engine publishes snapshots here)
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()

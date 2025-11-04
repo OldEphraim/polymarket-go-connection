@@ -5,31 +5,11 @@ import (
 	"time"
 )
 
-// sensible defaults if not set in config
-func (g *Gatherer) maxAbsSpread() float64 {
-	if g.config.Thresholds.MaxAbsSpread > 0 {
-		return g.config.Thresholds.MaxAbsSpread
-	}
-	return 0.02 // 2¢ default
-}
-func (g *Gatherer) minLiquidity() float64 {
-	if g.config.Thresholds.MinLiquidity > 0 {
-		return g.config.Thresholds.MinLiquidity
-	}
-	return 50 // tune for your scale
-}
 func (g *Gatherer) debounceWindow() time.Duration {
 	if g.config.Thresholds.DebounceWindow > 0 {
 		return g.config.Thresholds.DebounceWindow
 	}
 	return 30 * time.Second
-}
-func absSpread(bid, ask float64) float64 {
-	s := ask - bid
-	if s < 0 {
-		return 0
-	}
-	return s
 }
 
 // ===== Legacy detectors (compatible with your strategies now) =====
@@ -210,17 +190,4 @@ func (g *Gatherer) detectMeanRevertHint(f FeatureUpdate) {
 			"avg_vol_5m": f.AvgVol5m,
 		},
 	})
-}
-
-// shouldDebounce returns true if the same (type, token) fired within 'dur'
-func (g *Gatherer) shouldDebounce(t MarketEventType, tokenID string, window time.Duration) bool {
-	key := string(t) + ":" + tokenID
-	now := time.Now()
-	g.emitMu.Lock()
-	defer g.emitMu.Unlock()
-	if last, ok := g.lastEmit[key]; ok && now.Sub(last) < window {
-		return true
-	}
-	g.lastEmit[key] = now
-	return false
 }

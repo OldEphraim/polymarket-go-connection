@@ -15,7 +15,8 @@ const (
 	defaultFlushInterval = 500 * time.Millisecond
 )
 
-// Persister batches quotes, trades, and features and flushes them with COPY (or COPY→UPSERT for features).
+// Persister batches quotes, trades, and features and flushes them with COPY.
+// Features go into a staging table, then we call merge_market_features_stage().
 type Persister struct {
 	db *sql.DB
 
@@ -206,33 +207,10 @@ func (p *Persister) flush() error {
 		}
 	}
 
-	// COPY features via a temp table then UPSERT
+	// COPY features → staging, then merge
 	if len(features) > 0 {
-		// temp matches columns we fill; nullable columns use NULLs where we don't have data
-		createSQL := `
-CREATE TEMP TABLE IF NOT EXISTS tmp_features (
-	token_id text NOT NULL,
-	ts timestamptz NOT NULL,
-	ret_1m double precision,
-	ret_5m double precision,
-	vol_1m double precision,
-	avg_vol_5m double precision,
-	sigma_5m double precision,
-	zscore_5m double precision,
-	imbalance_top double precision,
-	spread_bps double precision,
-	broke_high_15m boolean,
-	broke_low_15m boolean,
-	time_to_resolve_h double precision,
-	signed_flow_1m double precision
-) ON COMMIT DROP;`
-		if _, cerr := tx.Exec(createSQL); cerr != nil {
-			err = cerr
-			return err
-		}
-
 		stmt, cerr := tx.Prepare(pq.CopyIn(
-			"tmp_features",
+			"market_features_stage",
 			"token_id", "ts",
 			"ret_1m", "ret_5m",
 			"vol_1m", "avg_vol_5m",
@@ -255,8 +233,8 @@ CREATE TEMP TABLE IF NOT EXISTS tmp_features (
 				nullFloat(f.Sigma5m), nullFloat(f.ZScore5m),
 				nullFloat(f.ImbalanceTop),
 				nullFloat(f.SpreadBps),
-				sql.NullBool{Bool: f.BrokeHigh15m, Valid: true},
-				sql.NullBool{Bool: f.BrokeLow15m, Valid: true},
+				// booleans are non-nullable in stage; just pass the bools
+				f.BrokeHigh15m, f.BrokeLow15m,
 				nullFloat(f.TimeToResolveH),
 				nullFloat(f.SignedFlow1m),
 			); cerr != nil {
@@ -275,43 +253,8 @@ CREATE TEMP TABLE IF NOT EXISTS tmp_features (
 			return err
 		}
 
-		upsertSQL := `
-INSERT INTO market_features (
-	token_id, ts,
-	ret_1m, ret_5m,
-	vol_1m, avg_vol_5m,
-	sigma_5m, zscore_5m,
-	imbalance_top,
-	spread_bps,
-	broke_high_15m, broke_low_15m,
-	time_to_resolve_h,
-	signed_flow_1m
-)
-SELECT
-	token_id, ts,
-	ret_1m, ret_5m,
-	vol_1m, avg_vol_5m,
-	sigma_5m, zscore_5m,
-	imbalance_top,
-	spread_bps,
-	broke_high_15m, broke_low_15m,
-	time_to_resolve_h,
-	signed_flow_1m
-FROM tmp_features
-ON CONFLICT (token_id, ts) DO UPDATE SET
-	ret_1m = EXCLUDED.ret_1m,
-	ret_5m = EXCLUDED.ret_5m,
-	vol_1m = EXCLUDED.vol_1m,
-	avg_vol_5m = EXCLUDED.avg_vol_5m,
-	sigma_5m = EXCLUDED.sigma_5m,
-	zscore_5m = EXCLUDED.zscore_5m,
-	imbalance_top = EXCLUDED.imbalance_top,
-	spread_bps = EXCLUDED.spread_bps,
-	broke_high_15m = EXCLUDED.broke_high_15m,
-	broke_low_15m = EXCLUDED.broke_low_15m,
-	time_to_resolve_h = EXCLUDED.time_to_resolve_h,
-	signed_flow_1m = EXCLUDED.signed_flow_1m;`
-		if _, cerr := tx.Exec(upsertSQL); cerr != nil {
+		// Merge (upsert + truncate stage)
+		if _, cerr := tx.Exec(`SELECT merge_market_features_stage()`); cerr != nil {
 			err = cerr
 			return err
 		}
@@ -331,10 +274,3 @@ func nullFloat(f float64) sql.NullFloat64 {
 	}
 	return sql.NullFloat64{Float64: f, Valid: true}
 }
-
-// ----- Backwards-compat helpers the old code referenced (no-ops now) -----
-
-// keep old helper names around so other files compile if they still call them
-func persistQuote(_ context.Context, _ Store, _ Quote)            {}
-func persistTrade(_ context.Context, _ Store, _ Trade)            {}
-func persistFeatures(_ context.Context, _ Store, _ FeatureUpdate) {}

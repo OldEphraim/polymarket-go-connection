@@ -30,6 +30,7 @@ type Querier interface {
 	InsertQuote(ctx context.Context, arg InsertQuoteParams) error
 	// === Trades ===
 	InsertTrade(ctx context.Context, arg InsertTradeParams) error
+	MergeMarketFeaturesStage(ctx context.Context) error
 	RecordMarketEvent(ctx context.Context, arg RecordMarketEventParams) (MarketEvent, error)
 	RecordSignal(ctx context.Context, arg RecordSignalParams) (MarketSignal, error)
 	UpdateSessionBalance(ctx context.Context, arg UpdateSessionBalanceParams) error

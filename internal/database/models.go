@@ -12,6 +12,18 @@ import (
 	"github.com/sqlc-dev/pqtype"
 )
 
+type ArchiveJob struct {
+	ID           int64        `json:"id"`
+	TableName    string       `json:"table_name"`
+	TsStart      time.Time    `json:"ts_start"`
+	TsEnd        time.Time    `json:"ts_end"`
+	S3Key        string       `json:"s3_key"`
+	RowCount     int64        `json:"row_count"`
+	BytesWritten int64        `json:"bytes_written"`
+	Status       string       `json:"status"`
+	CreatedAt    sql.NullTime `json:"created_at"`
+}
+
 type Market struct {
 	ID        int32          `json:"id"`
 	TokenID   string         `json:"token_id"`
@@ -49,7 +61,82 @@ type MarketFeature struct {
 	SignedFlow1m   sql.NullFloat64 `json:"signed_flow_1m"`
 }
 
+type MarketFeaturesOld struct {
+	TokenID        string          `json:"token_id"`
+	Ts             time.Time       `json:"ts"`
+	Ret1m          sql.NullFloat64 `json:"ret_1m"`
+	Ret5m          sql.NullFloat64 `json:"ret_5m"`
+	Vol1m          sql.NullFloat64 `json:"vol_1m"`
+	AvgVol5m       sql.NullFloat64 `json:"avg_vol_5m"`
+	Sigma5m        sql.NullFloat64 `json:"sigma_5m"`
+	Zscore5m       sql.NullFloat64 `json:"zscore_5m"`
+	ImbalanceTop   sql.NullFloat64 `json:"imbalance_top"`
+	SpreadBps      sql.NullFloat64 `json:"spread_bps"`
+	BrokeHigh15m   sql.NullBool    `json:"broke_high_15m"`
+	BrokeLow15m    sql.NullBool    `json:"broke_low_15m"`
+	TimeToResolveH sql.NullFloat64 `json:"time_to_resolve_h"`
+	SignedFlow1m   sql.NullFloat64 `json:"signed_flow_1m"`
+}
+
+type MarketFeaturesOldView struct {
+	TokenID        string          `json:"token_id"`
+	Ts             time.Time       `json:"ts"`
+	Ret1m          sql.NullFloat64 `json:"ret_1m"`
+	Ret5m          sql.NullFloat64 `json:"ret_5m"`
+	Vol1m          sql.NullFloat64 `json:"vol_1m"`
+	AvgVol5m       sql.NullFloat64 `json:"avg_vol_5m"`
+	Sigma5m        sql.NullFloat64 `json:"sigma_5m"`
+	Zscore5m       sql.NullFloat64 `json:"zscore_5m"`
+	ImbalanceTop   sql.NullFloat64 `json:"imbalance_top"`
+	SpreadBps      sql.NullFloat64 `json:"spread_bps"`
+	BrokeHigh15m   sql.NullBool    `json:"broke_high_15m"`
+	BrokeLow15m    sql.NullBool    `json:"broke_low_15m"`
+	TimeToResolveH sql.NullFloat64 `json:"time_to_resolve_h"`
+	SignedFlow1m   sql.NullFloat64 `json:"signed_flow_1m"`
+}
+
+type MarketFeaturesStage struct {
+	TokenID        string          `json:"token_id"`
+	Ts             time.Time       `json:"ts"`
+	Ret1m          sql.NullFloat64 `json:"ret_1m"`
+	Ret5m          sql.NullFloat64 `json:"ret_5m"`
+	Vol1m          sql.NullFloat64 `json:"vol_1m"`
+	AvgVol5m       sql.NullFloat64 `json:"avg_vol_5m"`
+	Sigma5m        sql.NullFloat64 `json:"sigma_5m"`
+	Zscore5m       sql.NullFloat64 `json:"zscore_5m"`
+	ImbalanceTop   sql.NullFloat64 `json:"imbalance_top"`
+	SpreadBps      sql.NullFloat64 `json:"spread_bps"`
+	BrokeHigh15m   sql.NullBool    `json:"broke_high_15m"`
+	BrokeLow15m    sql.NullBool    `json:"broke_low_15m"`
+	TimeToResolveH sql.NullFloat64 `json:"time_to_resolve_h"`
+	SignedFlow1m   sql.NullFloat64 `json:"signed_flow_1m"`
+}
+
 type MarketQuote struct {
+	ID        int64           `json:"id"`
+	TokenID   string          `json:"token_id"`
+	Ts        time.Time       `json:"ts"`
+	BestBid   sql.NullFloat64 `json:"best_bid"`
+	BestAsk   sql.NullFloat64 `json:"best_ask"`
+	BidSize1  sql.NullFloat64 `json:"bid_size1"`
+	AskSize1  sql.NullFloat64 `json:"ask_size1"`
+	SpreadBps sql.NullFloat64 `json:"spread_bps"`
+	Mid       sql.NullFloat64 `json:"mid"`
+}
+
+type MarketQuotesOld struct {
+	ID        int64           `json:"id"`
+	TokenID   string          `json:"token_id"`
+	Ts        time.Time       `json:"ts"`
+	BestBid   sql.NullFloat64 `json:"best_bid"`
+	BestAsk   sql.NullFloat64 `json:"best_ask"`
+	BidSize1  sql.NullFloat64 `json:"bid_size1"`
+	AskSize1  sql.NullFloat64 `json:"ask_size1"`
+	SpreadBps sql.NullFloat64 `json:"spread_bps"`
+	Mid       sql.NullFloat64 `json:"mid"`
+}
+
+type MarketQuotesOldView struct {
 	ID        int64           `json:"id"`
 	TokenID   string          `json:"token_id"`
 	Ts        time.Time       `json:"ts"`
@@ -104,6 +191,26 @@ type MarketTrade struct {
 	TradeID   sql.NullString `json:"trade_id"`
 }
 
+type MarketTradesOld struct {
+	ID        int64          `json:"id"`
+	TokenID   string         `json:"token_id"`
+	Ts        time.Time      `json:"ts"`
+	Price     float64        `json:"price"`
+	Size      float64        `json:"size"`
+	Aggressor sql.NullString `json:"aggressor"`
+	TradeID   sql.NullString `json:"trade_id"`
+}
+
+type MarketTradesOldView struct {
+	ID        int64          `json:"id"`
+	TokenID   string         `json:"token_id"`
+	Ts        time.Time      `json:"ts"`
+	Price     float64        `json:"price"`
+	Size      float64        `json:"size"`
+	Aggressor sql.NullString `json:"aggressor"`
+	TradeID   sql.NullString `json:"trade_id"`
+}
+
 type PaperOrder struct {
 	ID        int32          `json:"id"`
 	SessionID sql.NullInt32  `json:"session_id"`
@@ -128,6 +235,18 @@ type PaperPosition struct {
 	UpdatedAt     sql.NullTime   `json:"updated_at"`
 }
 
+type PaperTrade struct {
+	ID          int64        `json:"id"`
+	SessionID   int32        `json:"session_id"`
+	TokenID     string       `json:"token_id"`
+	Side        string       `json:"side"`
+	Price       string       `json:"price"`
+	Shares      string       `json:"shares"`
+	Notional    string       `json:"notional"`
+	RealizedPnl string       `json:"realized_pnl"`
+	CreatedAt   sql.NullTime `json:"created_at"`
+}
+
 type Strategy struct {
 	ID             int32           `json:"id"`
 	Name           string          `json:"name"`
@@ -144,4 +263,5 @@ type TradingSession struct {
 	CurrentBalance sql.NullString `json:"current_balance"`
 	StartedAt      sql.NullTime   `json:"started_at"`
 	EndedAt        sql.NullTime   `json:"ended_at"`
+	RealizedPnl    string         `json:"realized_pnl"`
 }

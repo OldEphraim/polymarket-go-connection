@@ -3,11 +3,9 @@ package gatherer
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"math"
 
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
-	"github.com/sqlc-dev/pqtype"
 )
 
 type SQLCStore struct {
@@ -25,16 +23,6 @@ func (s *SQLCStore) DB() *sql.DB { return s.db }
 // ---- Helpers ----
 func nff(v float64) sql.NullFloat64 { return sql.NullFloat64{Float64: v, Valid: !math.IsNaN(v)} }
 func ns(s string) sql.NullString    { return sql.NullString{String: s, Valid: s != ""} }
-func njson(m map[string]any) pqtype.NullRawMessage {
-	b := jsonMarshal(m) // small wrapper to avoid import cycles
-	return pqtype.NullRawMessage{RawMessage: b, Valid: b != nil}
-}
-
-// jsonMarshal is isolated to avoid importing encoding/json here if you prefer.
-func jsonMarshal(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
-}
 
 // ---- Implement gatherer.Store ----
 

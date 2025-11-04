@@ -119,24 +119,6 @@ type gammaPCChange struct {
 	BestAsk string `json:"best_ask"`
 }
 
-// Top-level price_change shape the server is sending us
-type priceChangeTop struct {
-	Market       string `json:"market"`
-	EventType    string `json:"event_type"`
-	TimestampStr string `json:"timestamp"` // often stringified millis
-	PriceChanges []struct {
-		AssetID string `json:"asset_id"`
-		// best_* come as strings; parse to float
-		BestBid string `json:"best_bid"`
-		BestAsk string `json:"best_ask"`
-		// other fields we don't need right now:
-		Price string `json:"price"`
-		Size  string `json:"size"`
-		Side  string `json:"side"`
-		Hash  string `json:"hash"`
-	} `json:"price_changes"`
-}
-
 // ===== Store interface (backed by your sqlc-generated Store) =====
 type Store interface {
 	UpsertMarketScan(ctx context.Context, p UpsertMarketScanParams) (MarketScanRow, error)

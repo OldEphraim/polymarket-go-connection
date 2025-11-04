@@ -14,7 +14,7 @@ import (
 const createSession = `-- name: CreateSession :one
 INSERT INTO trading_sessions (strategy_id, start_balance, current_balance)
 VALUES ($1, $2, $3)
-RETURNING id, strategy_id, start_balance, current_balance, started_at, ended_at
+RETURNING id, strategy_id, start_balance, current_balance, started_at, ended_at, realized_pnl
 `
 
 type CreateSessionParams struct {
@@ -33,6 +33,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (T
 		&i.CurrentBalance,
 		&i.StartedAt,
 		&i.EndedAt,
+		&i.RealizedPnl,
 	)
 	return i, err
 }
@@ -77,7 +78,7 @@ func (q *Queries) EndSession(ctx context.Context, id int32) error {
 }
 
 const getActiveSession = `-- name: GetActiveSession :one
-SELECT id, strategy_id, start_balance, current_balance, started_at, ended_at FROM trading_sessions
+SELECT id, strategy_id, start_balance, current_balance, started_at, ended_at, realized_pnl FROM trading_sessions
 WHERE strategy_id = $1 AND ended_at IS NULL
 ORDER BY started_at DESC
 LIMIT 1
@@ -93,6 +94,7 @@ func (q *Queries) GetActiveSession(ctx context.Context, strategyID sql.NullInt32
 		&i.CurrentBalance,
 		&i.StartedAt,
 		&i.EndedAt,
+		&i.RealizedPnl,
 	)
 	return i, err
 }

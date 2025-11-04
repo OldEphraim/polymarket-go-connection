@@ -271,7 +271,7 @@ func (c *polyWS) Run(
 				}
 			}
 
-			trades := extractTrades(raw, data)
+			trades := extractTrades(raw)
 			if len(trades) == 0 {
 				if wsLogUnknown {
 					writeUnknown(fmt.Sprintf("trade_unknown_%s", et), data)
@@ -391,16 +391,6 @@ type bestChange struct {
 	BestAsk float64 `json:"best_ask"`
 }
 
-type gammaChange struct {
-	AssetID string `json:"asset_id"`
-	Price   string `json:"price"`
-	Size    string `json:"size"`
-	Side    string `json:"side"` // "BUY"/"SELL"
-	Hash    string `json:"hash"`
-	BestBid string `json:"best_bid"`
-	BestAsk string `json:"best_ask"`
-}
-
 // ---- tolerant trade extraction ----
 
 type tradeOut struct {
@@ -411,7 +401,7 @@ type tradeOut struct {
 	ts      time.Time
 }
 
-func extractTrades(raw json.RawMessage, _whole []byte) []tradeOut {
+func extractTrades(raw json.RawMessage) []tradeOut {
 	var out []tradeOut
 
 	// 1) Array of objects

@@ -99,7 +99,7 @@ func (fe *featureEngine) onQuote(q Quote) {
 		st.high15m, st.low15m = hi, lo
 	}
 	// emit opportunistically if cadence elapsed
-	fe.maybeEmit(q.TokenID, q.TS, q.SpreadBps, 0, q.Mid)
+	fe.maybeEmit(q.TokenID, q.TS, q.SpreadBps, q.Mid)
 }
 
 func (fe *featureEngine) onTrade(t Trade) {
@@ -117,16 +117,16 @@ func (fe *featureEngine) onTrade(t Trade) {
 	st.last1m.PushBack(traded{ts: t.TS, size: t.Size, signed: t.Size * sign})
 	st.last5m.PushBack(traded{ts: t.TS, size: t.Size, signed: t.Size * sign})
 	fe.gcTrades(st, t.TS)
-	fe.maybeEmit(t.TokenID, t.TS, math.NaN(), sign, math.NaN())
+	fe.maybeEmit(t.TokenID, t.TS, math.NaN(), math.NaN())
 }
 
 func (fe *featureEngine) emitDue(now time.Time) {
 	for token := range fe.state {
-		fe.maybeEmit(token, now, math.NaN(), 0, math.NaN())
+		fe.maybeEmit(token, now, math.NaN(), math.NaN())
 	}
 }
 
-func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, signed float64, mid float64) {
+func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid float64) {
 	st := fe.st(token)
 	if ts.Sub(st.lastEmit) < fe.cfg.Stats.FeatCadence {
 		return
