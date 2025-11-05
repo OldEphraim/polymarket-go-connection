@@ -3,8 +3,6 @@ package gatherer
 import (
 	"encoding/json"
 	"strings"
-
-	_ "net/http/pprof" // optional pprof endpoints
 )
 
 func (g *Gatherer) loadMarketCache() error {

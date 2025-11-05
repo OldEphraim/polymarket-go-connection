@@ -101,36 +101,11 @@ type RecordMarketEventParams struct {
 	Metadata  pqtype.NullRawMessage
 }
 
-// Gamma /ws/market price_change frame (top-level, numbers as strings)
-type gammaPriceChange struct {
-	Market       string            `json:"market"`
-	PriceChanges []gammaPCChange   `json:"price_changes"`
-	Timestamp    string            `json:"timestamp"`  // ms as string
-	EventType    string            `json:"event_type"` // "price_change"
-	Extra        map[string]string `json:"extra,omitempty"`
-}
-
-type gammaPCChange struct {
-	AssetID string `json:"asset_id"`
-	Price   string `json:"price"`    // trade-ish price
-	Size    string `json:"size"`     // "0" if just a quote move
-	Side    string `json:"side"`     // "BUY" / "SELL"
-	BestBid string `json:"best_bid"` // top-of-book as strings
-	BestAsk string `json:"best_ask"`
-}
-
 // ===== Store interface (backed by your sqlc-generated Store) =====
 type Store interface {
 	UpsertMarketScan(ctx context.Context, p UpsertMarketScanParams) (MarketScanRow, error)
 	UpsertMarket(ctx context.Context, p UpsertMarketParams) (interface{}, error)
 	RecordMarketEvent(ctx context.Context, p RecordMarketEventParams) (interface{}, error)
-
-	// New tables (quotes/trades/features) — fill with your sqlc names
-	InsertQuote(ctx context.Context, q Quote) error            // TODO(sqlc)
-	InsertTrade(ctx context.Context, t Trade) error            // TODO(sqlc)
-	UpsertFeatures(ctx context.Context, f FeatureUpdate) error // TODO(sqlc)
-
-	// Convenience
 	GetActiveMarketScans(ctx context.Context, limit int) ([]MarketScanRow, error)
 }
 

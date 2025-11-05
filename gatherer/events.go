@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"time"
 
-	_ "net/http/pprof" // optional pprof endpoints
-
 	"github.com/sqlc-dev/pqtype"
 )
 

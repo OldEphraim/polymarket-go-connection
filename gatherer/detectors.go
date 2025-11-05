@@ -136,6 +136,11 @@ func (g *Gatherer) detectMomentum(f FeatureUpdate) {
 		return
 	}
 
+	// optional imbalance gate
+	if g.config.Thresholds.ImbMin > 0 && math.Abs(f.ImbalanceTop) < g.config.Thresholds.ImbMin {
+		return
+	}
+
 	// directional confirmation
 	if f.Ret1m > 0 && (f.SignedFlow1m <= 0 || f.ImbalanceTop <= 0) {
 		return

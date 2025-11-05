@@ -3,9 +3,12 @@ package gatherer
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 	"github.com/lib/pq"
 )
 
@@ -18,7 +21,9 @@ const (
 // Persister batches quotes, trades, and features and flushes them with COPY.
 // Features go into a staging table, then we call merge_market_features_stage().
 type Persister struct {
-	db *sql.DB
+	db  *sql.DB
+	q   *database.Queries
+	log *slog.Logger
 
 	batchSize     int
 	flushInterval time.Duration
@@ -31,22 +36,26 @@ type Persister struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// prevent overlapping flushes
+	flushing int32
 }
 
-type rawDB interface {
-	DB() *sql.DB
-}
-
-func NewPersister(r rawDB, batchSize int, flushEvery time.Duration) *Persister {
+func NewPersister(db *sql.DB, q *database.Queries, log *slog.Logger, batchSize int, flushEvery time.Duration) *Persister {
 	if batchSize <= 0 {
 		batchSize = defaultBatchSize
 	}
 	if flushEvery <= 0 {
 		flushEvery = defaultFlushInterval
 	}
+	if log == nil {
+		log = slog.Default()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Persister{
-		db:            r.DB(),
+		db:            db,
+		q:             q,
+		log:           log,
 		batchSize:     batchSize,
 		flushInterval: flushEvery,
 		ctx:           ctx,
@@ -63,10 +72,13 @@ func (p *Persister) Start() {
 		for {
 			select {
 			case <-p.ctx.Done():
-				_ = p.flush()
+				// Final drain with a fresh timeout context (avoid BeginTx with a canceled ctx)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				p.tryFlush(ctx)
+				cancel()
 				return
 			case <-t.C:
-				_ = p.flush()
+				p.tryFlush(p.ctx)
 			}
 		}
 	}()
@@ -87,6 +99,24 @@ func (p *Persister) Stop(ctx context.Context) error {
 	}
 }
 
+// Expose a manual flush for tests or ad-hoc drains.
+func (p *Persister) Flush(ctx context.Context) error {
+	p.tryFlush(ctx)
+	// tryFlush swallows the error by design to keep callsites simple.
+	// If you want explicit error propagation here, call p.flush(ctx) directly.
+	return nil
+}
+
+func (p *Persister) tryFlush(ctx context.Context) {
+	if !atomic.CompareAndSwapInt32(&p.flushing, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&p.flushing, 0)
+	if err := p.flush(ctx); err != nil {
+		p.log.Error("persister flush error", "err", err)
+	}
+}
+
 // Enqueue APIs (thread-safe)
 
 func (p *Persister) EnqueueQuote(q Quote) {
@@ -95,7 +125,7 @@ func (p *Persister) EnqueueQuote(q Quote) {
 	need := len(p.quotes) >= p.batchSize
 	p.mu.Unlock()
 	if need {
-		_ = p.flush()
+		p.tryFlush(p.ctx)
 	}
 }
 
@@ -105,7 +135,7 @@ func (p *Persister) EnqueueTrade(t Trade) {
 	need := len(p.trades) >= p.batchSize
 	p.mu.Unlock()
 	if need {
-		_ = p.flush()
+		p.tryFlush(p.ctx)
 	}
 }
 
@@ -115,13 +145,14 @@ func (p *Persister) EnqueueFeatures(f FeatureUpdate) {
 	need := len(p.features) >= p.batchSize
 	p.mu.Unlock()
 	if need {
-		_ = p.flush()
+		p.tryFlush(p.ctx)
 	}
 }
 
 // ---- flush ----
 
-func (p *Persister) flush() error {
+func (p *Persister) flush(ctx context.Context) (err error) {
+	// Fast path: nothing to do
 	p.mu.Lock()
 	if len(p.quotes) == 0 && len(p.trades) == 0 && len(p.features) == 0 {
 		p.mu.Unlock()
@@ -130,12 +161,12 @@ func (p *Persister) flush() error {
 	quotes := p.quotes
 	trades := p.trades
 	features := p.features
-	p.quotes = nil
-	p.trades = nil
-	p.features = nil
+	p.quotes, p.trades, p.features = nil, nil, nil
 	p.mu.Unlock()
 
-	tx, err := p.db.Begin()
+	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelReadCommitted,
+	})
 	if err != nil {
 		return err
 	}
@@ -253,8 +284,9 @@ func (p *Persister) flush() error {
 			return err
 		}
 
-		// Merge (upsert + truncate stage)
-		if _, cerr := tx.Exec(`SELECT merge_market_features_stage()`); cerr != nil {
+		// Merge (upsert + truncate stage) via sqlc
+		tq := p.q.WithTx(tx)
+		if cerr := tq.MergeMarketFeaturesStage(ctx); cerr != nil {
 			err = cerr
 			return err
 		}
@@ -264,6 +296,9 @@ func (p *Persister) flush() error {
 		err = cerr
 		return err
 	}
+
+	p.log.Debug("persister flush committed",
+		"quotes", len(quotes), "trades", len(trades), "features", len(features))
 	return nil
 }
 

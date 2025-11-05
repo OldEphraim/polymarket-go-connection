@@ -24,7 +24,7 @@ type Thresholds struct {
 	DebounceWindow time.Duration `json:"debounce_window"` // e.g., 30s
 	SigmaFloor     float64       `json:"sigma_floor"`     // e.g., 0.01 = 1¢
 
-	// NEW (for legacy price jumps)
+	// Legacy-jump knobs
 	PriceJumpMinPct   float64       `json:"price_jump_min_pct"`  // e.g. 0.05 => 5%
 	PriceJumpMinAbs   float64       `json:"price_jump_min_abs"`  // e.g. 0.01 => 1¢
 	PriceJumpDebounce time.Duration `json:"price_jump_debounce"` // per-token cool-down for price jumps
@@ -35,18 +35,19 @@ type Config struct {
 	WebsocketURL string        `json:"websocket_url"`
 	ScanInterval time.Duration `json:"scan_interval"`
 	UseWebsocket bool          `json:"use_websocket"`
-	BookLevels   int           `json:"book_levels"`
+
+	// TODO(book-levels): when multi-level book is supported, re-enable:
+	// BookLevels int `json:"book_levels"`
 
 	Stats      StatsWindows `json:"stats_windows"`
 	Thresholds Thresholds   `json:"thresholds"`
 
-	// Optional: lets you tune the size of the in-process publish queue
+	// Optional: tune the size of the in-process publish queue
 	EventQueueSize int `json:"event_queue_size"`
 
-	LogLevel         string `json:"log_level"`
-	EmitNewMarkets   bool   `json:"emit_new_markets"`
-	EmitPriceJumps   bool   `json:"emit_price_jumps"`
-	EmitVolumeSpikes bool   `json:"emit_volume_spikes"`
+	EmitNewMarkets   bool `json:"emit_new_markets"`
+	EmitPriceJumps   bool `json:"emit_price_jumps"`
+	EmitVolumeSpikes bool `json:"emit_volume_spikes"`
 }
 
 func DefaultConfig() *Config {
@@ -55,7 +56,7 @@ func DefaultConfig() *Config {
 		WebsocketURL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
 		ScanInterval: 30 * time.Second,
 		UseWebsocket: true,
-		BookLevels:   1,
+		// BookLevels: 1, // see TODO above
 
 		Stats: StatsWindows{
 			Ret1m:       time.Minute,
@@ -66,25 +67,20 @@ func DefaultConfig() *Config {
 			FeatCadence: 5 * time.Second,
 		},
 		Thresholds: Thresholds{
-			// existing
-			MaxSpreadBps: 120,
-			ZMin:         2.5,
-			VolSurgeMin:  2.0,
-			ImbMin:       0.2,
-			// new
+			MaxSpreadBps:      120,
+			ZMin:              2.5,
+			VolSurgeMin:       2.0,
+			ImbMin:            0.2,
 			MaxAbsSpread:      0.02, // 2¢
 			MinLiquidity:      50,   // tune for your scale
 			DebounceWindow:    30 * time.Second,
-			SigmaFloor:        0.01, // 1¢
-			PriceJumpMinPct:   0.05, // 5% min pct jump
-			PriceJumpMinAbs:   0.01, // 1¢ min absolute move
-			PriceJumpDebounce: 5 * time.Minute,
+			SigmaFloor:        0.01,            // 1¢
+			PriceJumpMinPct:   0.05,            // 5%
+			PriceJumpMinAbs:   0.01,            // 1¢
+			PriceJumpDebounce: 5 * time.Minute, //
 		},
 
-		// 20k was your original; bump if needed
-		EventQueueSize: 100000,
-
-		LogLevel:         "info",
+		EventQueueSize:   100000,
 		EmitNewMarkets:   true,
 		EmitPriceJumps:   true,
 		EmitVolumeSpikes: true,

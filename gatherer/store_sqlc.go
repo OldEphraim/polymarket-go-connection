@@ -3,7 +3,6 @@ package gatherer
 import (
 	"context"
 	"database/sql"
-	"math"
 
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 )
@@ -16,13 +15,6 @@ type SQLCStore struct {
 func NewSQLCStore(q *database.Queries, db *sql.DB) *SQLCStore {
 	return &SQLCStore{q: q, db: db}
 }
-
-// Expose the raw DB so the Persister can COPY
-func (s *SQLCStore) DB() *sql.DB { return s.db }
-
-// ---- Helpers ----
-func nff(v float64) sql.NullFloat64 { return sql.NullFloat64{Float64: v, Valid: !math.IsNaN(v)} }
-func ns(s string) sql.NullString    { return sql.NullString{String: s, Valid: s != ""} }
 
 // ---- Implement gatherer.Store ----
 
@@ -100,64 +92,4 @@ func (s *SQLCStore) GetActiveMarketScans(ctx context.Context, limit int) ([]Mark
 		})
 	}
 	return out, nil
-}
-
-// New tables
-func (s *SQLCStore) InsertQuote(ctx context.Context, q Quote) error {
-	return s.q.InsertQuote(ctx, database.InsertQuoteParams{
-		TokenID:   q.TokenID,
-		Ts:        q.TS,
-		BestBid:   nff(q.BestBid),
-		BestAsk:   nff(q.BestAsk),
-		BidSize1:  nff(q.BidSize1),
-		AskSize1:  nff(q.AskSize1),
-		SpreadBps: nff(q.SpreadBps),
-		Mid:       nff(q.Mid),
-	})
-}
-
-func (s *SQLCStore) InsertTrade(ctx context.Context, t Trade) error {
-	return s.q.InsertTrade(ctx, database.InsertTradeParams{
-		TokenID:   t.TokenID,
-		Ts:        t.TS,
-		Price:     t.Price,
-		Size:      t.Size,
-		Aggressor: ns(t.Aggressor),
-		TradeID:   ns(t.TradeID),
-	})
-}
-
-func (s *SQLCStore) UpsertFeatures(ctx context.Context, f FeatureUpdate) error {
-	return s.q.UpsertFeatures(ctx, database.UpsertFeaturesParams{
-		TokenID:        f.TokenID,
-		Ts:             f.TS,
-		Ret1m:          nff(f.Ret1m),
-		Ret5m:          nff(f.Ret5m),
-		Vol1m:          nff(f.Vol1m),
-		AvgVol5m:       nff(f.AvgVol5m),
-		Sigma5m:        nff(f.Sigma5m),
-		Zscore5m:       nff(f.ZScore5m),
-		ImbalanceTop:   nff(f.ImbalanceTop),
-		SpreadBps:      nff(f.SpreadBps),
-		BrokeHigh15m:   sql.NullBool{Bool: f.BrokeHigh15m, Valid: true},
-		BrokeLow15m:    sql.NullBool{Bool: f.BrokeLow15m, Valid: true},
-		TimeToResolveH: nff(f.TimeToResolveH),
-		SignedFlow1m:   nff(f.SignedFlow1m),
-	})
-}
-
-// Convenient extra reads (optional)
-func (s *SQLCStore) GetLatestMid(ctx context.Context, tokenID string) (float64, error) {
-	mid, err := s.q.GetLatestMid(ctx, tokenID)
-	if err != nil {
-		return 0, err
-	}
-	if !mid.Valid {
-		return 0, sql.ErrNoRows
-	}
-	return mid.Float64, nil
-}
-
-func (s *SQLCStore) GetActiveTokenIDs(ctx context.Context, limit int) ([]string, error) {
-	return s.q.GetActiveTokenIDs(ctx, int32(limit))
 }

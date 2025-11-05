@@ -139,11 +139,25 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 	}
 	ret1m := fe.windowRet(st, fe.cfg.Stats.Ret1m)
 	ret5m := fe.windowRet(st, fe.cfg.Stats.Ret5m)
-	vol1m, sflow1m := fe.windowVol(st, time.Minute)
-	avgVol5m, _ := fe.windowVol(st, 5*time.Minute)
 
-	// compute sigma over returns, not level diffs (see windowSigmaRet below)
-	sigma5m := fe.windowSigmaRet(st, 5*time.Minute)
+	w1 := fe.cfg.Stats.Vol1m
+	if w1 <= 0 {
+		w1 = time.Minute
+	}
+	w5 := fe.cfg.Stats.Vol5m
+	if w5 <= 0 {
+		w5 = 5 * time.Minute
+	}
+	sigW := fe.cfg.Stats.Sigma5m
+	if sigW <= 0 {
+		sigW = 5 * time.Minute
+	}
+
+	vol1m, sflow1m := fe.windowVol(st, w1)
+	avgVol5m, _ := fe.windowVol(st, w5)
+
+	// compute sigma over returns, not level diffs
+	sigma5m := fe.windowSigmaRet(st, sigW)
 
 	floor := fe.cfg.Thresholds.SigmaFloor
 	if floor <= 0 {
@@ -196,8 +210,25 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 
 // ===== window helpers =====
 func (fe *featureEngine) gcPrices(st *rollState, now time.Time) {
-	// keep up to longest window (5m)
-	cut := now.Add(-5 * time.Minute)
+	// keep up to the largest price-derived window we might read from
+	ret5 := fe.cfg.Stats.Ret5m
+	if ret5 <= 0 {
+		ret5 = 5 * time.Minute
+	}
+	sigW := fe.cfg.Stats.Sigma5m
+	if sigW <= 0 {
+		sigW = 5 * time.Minute
+	}
+	// keep enough for 15m high/low too
+	keep := ret5
+	if sigW > keep {
+		keep = sigW
+	}
+	if (15 * time.Minute) > keep {
+		keep = 15 * time.Minute
+	}
+
+	cut := now.Add(-keep)
 	for st.lastMid.Len() > 0 {
 		fr := st.lastMid.Front().Value.(priced)
 		if fr.ts.Before(cut) {
@@ -209,7 +240,16 @@ func (fe *featureEngine) gcPrices(st *rollState, now time.Time) {
 }
 
 func (fe *featureEngine) gcTrades(st *rollState, now time.Time) {
-	cut1 := now.Add(-1 * time.Minute)
+	w1 := fe.cfg.Stats.Vol1m
+	if w1 <= 0 {
+		w1 = time.Minute
+	}
+	w5 := fe.cfg.Stats.Vol5m
+	if w5 <= 0 {
+		w5 = 5 * time.Minute
+	}
+
+	cut1 := now.Add(-w1)
 	for st.last1m.Len() > 0 {
 		fr := st.last1m.Front().Value.(traded)
 		if fr.ts.Before(cut1) {
@@ -218,7 +258,8 @@ func (fe *featureEngine) gcTrades(st *rollState, now time.Time) {
 			break
 		}
 	}
-	cut5 := now.Add(-5 * time.Minute)
+
+	cut5 := now.Add(-w5)
 	for st.last5m.Len() > 0 {
 		fr := st.last5m.Front().Value.(traded)
 		if fr.ts.Before(cut5) {

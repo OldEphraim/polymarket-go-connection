@@ -86,7 +86,7 @@ func main() {
 	// If you have a debug server, keep it as-is (cfg.UseWebsocket etc.)
 
 	// Gatherer instance
-	g := gatherer.New(store, cfg, logger)
+	g := gatherer.New(store, cfg, logger, sqlDB, q)
 
 	// Lifecycle management
 	var mu sync.Mutex

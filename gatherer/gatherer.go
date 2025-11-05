@@ -3,20 +3,20 @@ package gatherer
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 
-	_ "net/http/pprof" // optional pprof endpoints
-
 	ws "github.com/OldEphraim/polymarket-go-connection/gatherer/ws"
+	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 )
 
 type Gatherer struct {
 	store    Store
+	db       *sql.DB
+	sqlc     *database.Queries
 	client   *http.Client
 	config   *Config
 	logger   *slog.Logger
@@ -52,8 +52,7 @@ type Gatherer struct {
 	debugSrv *http.Server
 }
 
-// NOTE: WSClient removed from signature; the gatherer owns WS in ingest_ws.go
-func New(store Store, config *Config, logger *slog.Logger) *Gatherer {
+func New(store Store, config *Config, logger *slog.Logger, db *sql.DB, sqlc *database.Queries) *Gatherer {
 	if config == nil {
 		config = DefaultConfig()
 	}
@@ -70,6 +69,8 @@ func New(store Store, config *Config, logger *slog.Logger) *Gatherer {
 
 	return &Gatherer{
 		store:        store,
+		db:           db,
+		sqlc:         sqlc,
 		client:       &http.Client{Timeout: 10 * time.Second},
 		config:       config,
 		logger:       logger,
@@ -100,20 +101,12 @@ func (g *Gatherer) Start() error {
 		g.logger.Error("load market cache", "err", err)
 	}
 
-	// Initialize COPY persister (uses db.Store.DB())
-	// We lazy-cast to the minimal interface the persister expects.
-	type rawDB interface{ DB() *sql.DB }
-	if rdb, ok := any(g.store).(rawDB); ok {
-		g.p = NewPersister(rdb, defaultBatchSize, defaultFlushInterval)
-		g.p.Start()
-		g.logger.Info("persister started",
-			"batch_size", defaultBatchSize,
-			"flush_interval_ms", int(defaultFlushInterval/time.Millisecond))
-	} else {
-		// Persister is required so the feature engine can be the sole consumer
-		// of quotes/trades without risking data loss.
-		return errors.New("gatherer: store does not expose DB(); persister required")
-	}
+	// Initialize COPY persister (explicit deps; no type-asserts)
+	g.p = NewPersister(g.db, g.sqlc, g.logger, defaultBatchSize, defaultFlushInterval)
+	g.p.Start()
+	g.logger.Info("persister started",
+		"batch_size", defaultBatchSize,
+		"flush_interval_ms", int(defaultFlushInterval/time.Millisecond))
 
 	// Feature engine
 	g.wg.Add(1)
@@ -121,9 +114,6 @@ func (g *Gatherer) Start() error {
 		defer g.wg.Done()
 		runFeatureEngine(g.ctx, g.logger, g.config, g.p, g.featuresCh, g.quotesCh, g.tradesCh)
 	}()
-
-	// start channel writers to persist quotes/trades/features
-	g.startWriters()
 
 	// Detector loop
 	g.wg.Add(1)
@@ -143,7 +133,7 @@ func (g *Gatherer) Start() error {
 		g.scanLoop()
 	}()
 
-	// WS ingest loop (optional)
+	// WS ingest loop
 	if g.config.UseWebsocket {
 		g.wg.Add(1)
 		go func() {
@@ -181,8 +171,6 @@ func (g *Gatherer) Stop() {
 }
 
 func (g *Gatherer) EventChannel() <-chan MarketEvent { return g.eventChan }
-
-// ===== Shared helpers =====
 
 func (g *Gatherer) runWSIngest() {
 	backoff := time.Second
@@ -267,27 +255,4 @@ func (g *Gatherer) runWSIngest() {
 		}
 		return
 	}
-}
-
-// startWriters drains quotes/trades/features to storage.
-func (g *Gatherer) startWriters() {
-	// NOTE: Quotes/Trades consumers removed.
-	// The feature engine is the single consumer of g.quotesCh/g.tradesCh and
-	// is responsible for persistence via the persister to avoid fan-out loss.
-
-	g.wg.Add(1)
-	go func() {
-		defer g.wg.Done()
-		for {
-			select {
-			case <-g.ctx.Done():
-				return
-			case f := <-g.featuresCh:
-				// If you later add COPY support for features, mirror the pattern.
-				if err := g.store.UpsertFeatures(g.ctx, f); err != nil {
-					g.logger.Error("upsert features", "token_id", f.TokenID, "err", err)
-				}
-			}
-		}
-	}()
 }
