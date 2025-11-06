@@ -112,7 +112,8 @@ func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
 	currentPrice := g.calculateMarketPrice(market)
 
 	// numeric volume/liquidity directly from payload
-	// (prefer total volume if present; you can swap to Volume24hr if you want 24h flow)
+	// (prefer total volume if present; can be swapped to Volume24hr if we want 24h flow)
+	// TODO: total volume and Volume24hr are different things, and confusion exists here because we need an explicit way for the gatherer to see when a market has resolved. This does not yet exist.
 	volume := market.VolumeNum
 	if volume == 0 && market.Volume24hr > 0 {
 		volume = market.Volume24hr
@@ -192,8 +193,8 @@ func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
 
 	// detectors
 	if exists && oldScan != nil {
-		// keep your existing detector (legacy) that compares old/new scans
-		g.detectLegacy(&newScan, oldScan, market) // or g.detectEvents(oldScan, &newScan, market) if that's what you have
+		// keep existing detector (legacy) that compares old/new scans
+		g.detectLegacy(&newScan, oldScan, market)
 	} else if g.config.EmitNewMarkets {
 		ageHours := 0.0
 		// CreatedAt might be zero if missing; guard it

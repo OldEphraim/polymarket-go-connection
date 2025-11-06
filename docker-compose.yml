@@ -75,7 +75,7 @@ services:
       GATHERER_USE_WS: ${GATHERER_USE_WS:-true}
       GATHERER_WS_URL: ${GATHERER_WS_URL:-wss://ws-subscriptions-clob.polymarket.com/ws/market}
       GATHERER_SCAN_INTERVAL: ${GATHERER_SCAN_INTERVAL:-30s}
-      POLY_WS_DEBUG: ${POLY_WS_DEBUG:-1}
+      POLY_WS_DEBUG: ${POLY_WS_DEBUG:-0}
       POLY_WS_LOG_UNKNOWN: ${POLY_WS_LOG_UNKNOWN:-0}
       # POLY_WS_UNKNOWN_PATH: ${POLY_WS_UNKNOWN_PATH:-/tmp/ws_unknown.jsonl} # only set when debugging
     ports:

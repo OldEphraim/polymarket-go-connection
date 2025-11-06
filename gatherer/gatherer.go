@@ -170,8 +170,6 @@ func (g *Gatherer) Stop() {
 		"total_events", g.eventsEmitted)
 }
 
-func (g *Gatherer) EventChannel() <-chan MarketEvent { return g.eventChan }
-
 func (g *Gatherer) runWSIngest() {
 	backoff := time.Second
 	var qCount, tCount int64

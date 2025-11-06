@@ -13,8 +13,7 @@ func (g *Gatherer) loadMarketCache() error {
 	g.cacheMu.Lock()
 	defer g.cacheMu.Unlock()
 	for i := range rows {
-		r := rows[i]
-		g.marketCache[r.TokenID] = &r
+		g.marketCache[rows[i].TokenID] = &rows[i]
 	}
 	g.logger.Info("cache loaded", "count", len(g.marketCache))
 	return nil
