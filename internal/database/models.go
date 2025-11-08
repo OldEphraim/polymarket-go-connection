@@ -7,7 +7,6 @@ package database
 import (
 	"database/sql"
 	"encoding/json"
-	"time"
 
 	"github.com/sqlc-dev/pqtype"
 )
@@ -15,8 +14,8 @@ import (
 type ArchiveJob struct {
 	ID           int64        `json:"id"`
 	TableName    string       `json:"table_name"`
-	TsStart      time.Time    `json:"ts_start"`
-	TsEnd        time.Time    `json:"ts_end"`
+	TsStart      sql.NullTime `json:"ts_start"`
+	TsEnd        sql.NullTime `json:"ts_end"`
 	S3Key        string       `json:"s3_key"`
 	RowCount     int64        `json:"row_count"`
 	BytesWritten int64        `json:"bytes_written"`
@@ -46,7 +45,7 @@ type MarketEvent struct {
 
 type MarketFeature struct {
 	TokenID        string          `json:"token_id"`
-	Ts             time.Time       `json:"ts"`
+	Ts             sql.NullTime    `json:"ts"`
 	Ret1m          sql.NullFloat64 `json:"ret_1m"`
 	Ret5m          sql.NullFloat64 `json:"ret_5m"`
 	Vol1m          sql.NullFloat64 `json:"vol_1m"`
@@ -63,7 +62,7 @@ type MarketFeature struct {
 
 type MarketFeaturesOld struct {
 	TokenID        string          `json:"token_id"`
-	Ts             time.Time       `json:"ts"`
+	Ts             sql.NullTime    `json:"ts"`
 	Ret1m          sql.NullFloat64 `json:"ret_1m"`
 	Ret5m          sql.NullFloat64 `json:"ret_5m"`
 	Vol1m          sql.NullFloat64 `json:"vol_1m"`
@@ -80,7 +79,7 @@ type MarketFeaturesOld struct {
 
 type MarketFeaturesOldView struct {
 	TokenID        string          `json:"token_id"`
-	Ts             time.Time       `json:"ts"`
+	Ts             sql.NullTime    `json:"ts"`
 	Ret1m          sql.NullFloat64 `json:"ret_1m"`
 	Ret5m          sql.NullFloat64 `json:"ret_5m"`
 	Vol1m          sql.NullFloat64 `json:"vol_1m"`
@@ -97,7 +96,7 @@ type MarketFeaturesOldView struct {
 
 type MarketFeaturesStage struct {
 	TokenID        string          `json:"token_id"`
-	Ts             time.Time       `json:"ts"`
+	Ts             sql.NullTime    `json:"ts"`
 	Ret1m          sql.NullFloat64 `json:"ret_1m"`
 	Ret5m          sql.NullFloat64 `json:"ret_5m"`
 	Vol1m          sql.NullFloat64 `json:"vol_1m"`
@@ -115,7 +114,7 @@ type MarketFeaturesStage struct {
 type MarketQuote struct {
 	ID        int64           `json:"id"`
 	TokenID   string          `json:"token_id"`
-	Ts        time.Time       `json:"ts"`
+	Ts        sql.NullTime    `json:"ts"`
 	BestBid   sql.NullFloat64 `json:"best_bid"`
 	BestAsk   sql.NullFloat64 `json:"best_ask"`
 	BidSize1  sql.NullFloat64 `json:"bid_size1"`
@@ -127,7 +126,7 @@ type MarketQuote struct {
 type MarketQuotesOld struct {
 	ID        int64           `json:"id"`
 	TokenID   string          `json:"token_id"`
-	Ts        time.Time       `json:"ts"`
+	Ts        sql.NullTime    `json:"ts"`
 	BestBid   sql.NullFloat64 `json:"best_bid"`
 	BestAsk   sql.NullFloat64 `json:"best_ask"`
 	BidSize1  sql.NullFloat64 `json:"bid_size1"`
@@ -139,7 +138,7 @@ type MarketQuotesOld struct {
 type MarketQuotesOldView struct {
 	ID        int64           `json:"id"`
 	TokenID   string          `json:"token_id"`
-	Ts        time.Time       `json:"ts"`
+	Ts        sql.NullTime    `json:"ts"`
 	BestBid   sql.NullFloat64 `json:"best_bid"`
 	BestAsk   sql.NullFloat64 `json:"best_ask"`
 	BidSize1  sql.NullFloat64 `json:"bid_size1"`
@@ -184,7 +183,7 @@ type MarketSignal struct {
 type MarketTrade struct {
 	ID        int64          `json:"id"`
 	TokenID   string         `json:"token_id"`
-	Ts        time.Time      `json:"ts"`
+	Ts        sql.NullTime   `json:"ts"`
 	Price     float64        `json:"price"`
 	Size      float64        `json:"size"`
 	Aggressor sql.NullString `json:"aggressor"`
@@ -194,7 +193,7 @@ type MarketTrade struct {
 type MarketTradesOld struct {
 	ID        int64          `json:"id"`
 	TokenID   string         `json:"token_id"`
-	Ts        time.Time      `json:"ts"`
+	Ts        sql.NullTime   `json:"ts"`
 	Price     float64        `json:"price"`
 	Size      float64        `json:"size"`
 	Aggressor sql.NullString `json:"aggressor"`
@@ -204,7 +203,7 @@ type MarketTradesOld struct {
 type MarketTradesOldView struct {
 	ID        int64          `json:"id"`
 	TokenID   string         `json:"token_id"`
-	Ts        time.Time      `json:"ts"`
+	Ts        sql.NullTime   `json:"ts"`
 	Price     float64        `json:"price"`
 	Size      float64        `json:"size"`
 	Aggressor sql.NullString `json:"aggressor"`

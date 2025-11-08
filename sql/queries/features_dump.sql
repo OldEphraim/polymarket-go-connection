@@ -1,0 +1,16 @@
+-- name: DumpFeaturesHour :many
+SELECT
+  token_id, ts, ret_1m, ret_5m, vol_1m, avg_vol_5m, sigma_5m, zscore_5m,
+  imbalance_top, spread_bps, broke_high_15m, broke_low_15m, time_to_resolve_h, signed_flow_1m
+FROM market_features
+WHERE ts >= sqlc.arg(ts_start)::timestamptz
+  AND ts  < sqlc.arg(ts_end)  ::timestamptz
+ORDER BY ts, token_id;
+
+-- name: OldestUnarchivedFeaturesHour :one
+WITH hourly_data AS (
+  SELECT date_trunc('hour', ts) AS hour
+  FROM market_features
+  GROUP BY 1
+)
+SELECT CAST(MIN(hour) AS timestamptz) AS oldest;

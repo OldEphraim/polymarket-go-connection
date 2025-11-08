@@ -8,7 +8,6 @@ package database
 import (
 	"context"
 	"database/sql"
-	"time"
 )
 
 const getActiveTokenIDs = `-- name: GetActiveTokenIDs :many
@@ -68,7 +67,7 @@ INSERT INTO market_quotes (
 
 type InsertQuoteParams struct {
 	TokenID   string          `json:"token_id"`
-	Ts        time.Time       `json:"ts"`
+	Ts        sql.NullTime    `json:"ts"`
 	BestBid   sql.NullFloat64 `json:"best_bid"`
 	BestAsk   sql.NullFloat64 `json:"best_ask"`
 	BidSize1  sql.NullFloat64 `json:"bid_size1"`
@@ -103,7 +102,7 @@ ON CONFLICT (trade_id) WHERE trade_id IS NOT NULL DO NOTHING
 
 type InsertTradeParams struct {
 	TokenID   string         `json:"token_id"`
-	Ts        time.Time      `json:"ts"`
+	Ts        sql.NullTime   `json:"ts"`
 	Price     float64        `json:"price"`
 	Size      float64        `json:"size"`
 	Aggressor sql.NullString `json:"aggressor"`
@@ -150,7 +149,7 @@ ON CONFLICT (token_id, ts) DO UPDATE SET
 
 type UpsertFeaturesParams struct {
 	TokenID        string          `json:"token_id"`
-	Ts             time.Time       `json:"ts"`
+	Ts             sql.NullTime    `json:"ts"`
 	Ret1m          sql.NullFloat64 `json:"ret_1m"`
 	Ret5m          sql.NullFloat64 `json:"ret_5m"`
 	Vol1m          sql.NullFloat64 `json:"vol_1m"`

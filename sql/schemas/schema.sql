@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict yqVPhFzItWn6lqic3T3B71qze7dppeOCVnU4ZUVrUGZMfYMz3ZqXwdz08PTmGNK
+\restrict tJ1MZhin7bWOoPIkyQNC36lOfccddaKdBlNSAVyI2DbBTuonJg6xfyIlQauSouI
 
 -- Dumped from database version 14.19 (Homebrew)
 -- Dumped by pg_dump version 14.19 (Homebrew)
@@ -455,6 +455,55 @@ $$;
 
 
 --
+-- Name: merge_market_features_stage(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.merge_market_features_stage() RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  INSERT INTO market_features AS mf (
+    token_id, ts,
+    ret_1m, ret_5m,
+    vol_1m, avg_vol_5m,
+    sigma_5m, zscore_5m,
+    imbalance_top,
+    spread_bps,
+    broke_high_15m, broke_low_15m,
+    time_to_resolve_h,
+    signed_flow_1m
+  )
+  SELECT
+    token_id, ts,
+    ret_1m, ret_5m,
+    vol_1m, avg_vol_5m,
+    sigma_5m, zscore_5m,
+    imbalance_top,
+    spread_bps,
+    broke_high_15m, broke_low_15m,
+    time_to_resolve_h,
+    signed_flow_1m
+  FROM market_features_stage
+  ON CONFLICT (token_id, ts) DO UPDATE SET
+    ret_1m = EXCLUDED.ret_1m,
+    ret_5m = EXCLUDED.ret_5m,
+    vol_1m = EXCLUDED.vol_1m,
+    avg_vol_5m = EXCLUDED.avg_vol_5m,
+    sigma_5m = EXCLUDED.sigma_5m,
+    zscore_5m = EXCLUDED.zscore_5m,
+    imbalance_top = EXCLUDED.imbalance_top,
+    spread_bps = EXCLUDED.spread_bps,
+    broke_high_15m = EXCLUDED.broke_high_15m,
+    broke_low_15m = EXCLUDED.broke_low_15m,
+    time_to_resolve_h = EXCLUDED.time_to_resolve_h,
+    signed_flow_1m = EXCLUDED.signed_flow_1m;
+
+  TRUNCATE TABLE market_features_stage;
+END
+$$;
+
+
+--
 -- Name: migrate_daily_to_hourly_partitions(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -491,6 +540,51 @@ BEGIN
     END IF;
   END LOOP;
 END
+$$;
+
+
+--
+-- Name: poly_partition_span(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.poly_partition_span(pattern text) RETURNS TABLE(partition_count integer, oldest_partition timestamp with time zone, newest_partition timestamp with time zone)
+    LANGUAGE sql STABLE
+    AS $$
+  WITH partitions AS (
+    SELECT
+      t.schemaname,
+      t.tablename,
+      CASE
+        -- Strip the 'market_<something>_p' prefix; expect exactly 10 digits YYYYMMDDHH
+        WHEN length(regexp_replace(t.tablename, '^market_[[:alnum:]_]+_p', '')) = 10
+        THEN to_timestamp(regexp_replace(t.tablename, '^market_[[:alnum:]_]+_p', ''), 'YYYYMMDDHH24')
+        ELSE NULL
+      END AS partition_time
+    FROM pg_catalog.pg_tables AS t
+    WHERE t.tablename LIKE pattern
+  )
+  SELECT
+    COUNT(*)::int,
+    MIN(partition_time),
+    MAX(partition_time)
+  FROM partitions
+  WHERE partition_time IS NOT NULL;
+$$;
+
+
+--
+-- Name: poly_sum_partition_sizes_mb(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.poly_sum_partition_sizes_mb(pattern text) RETURNS double precision
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT COALESCE(
+    SUM(pg_total_relation_size(format('%I.%I', t.schemaname, t.tablename)))::float / 1024 / 1024,
+    0
+  )
+  FROM pg_catalog.pg_tables AS t
+  WHERE t.tablename LIKE pattern;
 $$;
 
 
@@ -892,6 +986,28 @@ CREATE TABLE public.market_features_p2025102917 (
     signed_flow_1m double precision
 )
 WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
+
+
+--
+-- Name: market_features_stage; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE UNLOGGED TABLE public.market_features_stage (
+    token_id text NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    ret_1m double precision,
+    ret_5m double precision,
+    vol_1m double precision,
+    avg_vol_5m double precision,
+    sigma_5m double precision,
+    zscore_5m double precision,
+    imbalance_top double precision,
+    spread_bps double precision,
+    broke_high_15m boolean,
+    broke_low_15m boolean,
+    time_to_resolve_h double precision,
+    signed_flow_1m double precision
+);
 
 
 --
@@ -2354,6 +2470,13 @@ CREATE INDEX idx_market_trades_ts ON public.market_trades_old USING btree (ts DE
 
 
 --
+-- Name: idx_mfs_token_ts; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_mfs_token_ts ON public.market_features_stage USING btree (token_id, ts);
+
+
+--
 -- Name: idx_paper_trades_session_time; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3000,5 +3123,5 @@ ALTER TABLE ONLY public.trading_sessions
 -- PostgreSQL database dump complete
 --
 
-\unrestrict yqVPhFzItWn6lqic3T3B71qze7dppeOCVnU4ZUVrUGZMfYMz3ZqXwdz08PTmGNK
+\unrestrict tJ1MZhin7bWOoPIkyQNC36lOfccddaKdBlNSAVyI2DbBTuonJg6xfyIlQauSouI
 

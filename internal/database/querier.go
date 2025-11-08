@@ -10,10 +10,33 @@ import (
 )
 
 type Querier interface {
+	ArchiveDone(ctx context.Context, arg ArchiveDoneParams) error
+	ArchiveFail(ctx context.Context, arg ArchiveFailParams) error
+	ArchiveRecordedDone(ctx context.Context, arg ArchiveRecordedDoneParams) (bool, error)
+	ArchiveStart(ctx context.Context, arg ArchiveStartParams) error
 	CreateSession(ctx context.Context, arg CreateSessionParams) (TradingSession, error)
 	CreateStrategy(ctx context.Context, arg CreateStrategyParams) (Strategy, error)
 	DeactivateMarketScan(ctx context.Context, tokenID string) error
+	DeleteExportedHoursFeatures(ctx context.Context, win string) (int64, error)
+	// Windowed deletes (rename param to avoid reserved keyword)
+	DeleteExportedHoursQuotes(ctx context.Context, win string) (int64, error)
+	DeleteExportedHoursTrades(ctx context.Context, win string) (int64, error)
+	DropArchivedMarketFeaturesPartitionsHourly(ctx context.Context, keepHours int32) (int32, error)
+	// Drop archived partitions
+	DropArchivedMarketQuotesPartitionsHourly(ctx context.Context, keepHours int32) (int32, error)
+	DropArchivedMarketTradesPartitionsHourly(ctx context.Context, keepHours int32) (int32, error)
+	DumpFeaturesHour(ctx context.Context, arg DumpFeaturesHourParams) ([]MarketFeature, error)
+	DumpQuotesHour(ctx context.Context, arg DumpQuotesHourParams) ([]DumpQuotesHourRow, error)
+	DumpTradesHour(ctx context.Context, arg DumpTradesHourParams) ([]DumpTradesHourRow, error)
+	EmergencyDeleteFeatures(ctx context.Context, arg EmergencyDeleteFeaturesParams) (int64, error)
+	// Emergency deletes (batched)
+	EmergencyDeleteQuotes(ctx context.Context, arg EmergencyDeleteQuotesParams) (int64, error)
+	EmergencyDeleteTrades(ctx context.Context, arg EmergencyDeleteTradesParams) (int64, error)
 	EndSession(ctx context.Context, id int32) error
+	EnsureFeaturesPartitionsHourly(ctx context.Context, arg EnsureFeaturesPartitionsHourlyParams) error
+	// Ensure partitions (hourly)
+	EnsureQuotesPartitionsHourly(ctx context.Context, arg EnsureQuotesPartitionsHourlyParams) error
+	EnsureTradesPartitionsHourly(ctx context.Context, arg EnsureTradesPartitionsHourlyParams) error
 	GetActiveMarketScans(ctx context.Context, limit int32) ([]MarketScan, error)
 	GetActiveMarkets(ctx context.Context) ([]Market, error)
 	GetActiveSession(ctx context.Context, strategyID sql.NullInt32) (TradingSession, error)
@@ -23,6 +46,7 @@ type Querier interface {
 	GetMarketByTokenID(ctx context.Context, tokenID string) (Market, error)
 	GetMarketEventsSince(ctx context.Context, id int32) ([]MarketEvent, error)
 	GetMarketScan(ctx context.Context, tokenID string) (MarketScan, error)
+	GetPartitionSpan(ctx context.Context, pattern string) (GetPartitionSpanRow, error)
 	GetRecentMarketEvents(ctx context.Context, limit int32) ([]MarketEvent, error)
 	GetRecentSignals(ctx context.Context, arg GetRecentSignalsParams) ([]MarketSignal, error)
 	GetSignalsByType(ctx context.Context, arg GetSignalsByTypeParams) ([]MarketSignal, error)
@@ -31,13 +55,23 @@ type Querier interface {
 	// === Trades ===
 	InsertTrade(ctx context.Context, arg InsertTradeParams) error
 	MergeMarketFeaturesStage(ctx context.Context) error
+	OldestUnarchivedFeaturesHour(ctx context.Context) (sql.NullTime, error)
+	OldestUnarchivedQuotesHour(ctx context.Context) (sql.NullTime, error)
+	OldestUnarchivedTradesHour(ctx context.Context) (sql.NullTime, error)
+	PgCheckpoint(ctx context.Context) error
+	PgSwitchWal(ctx context.Context) (string, error)
 	RecordMarketEvent(ctx context.Context, arg RecordMarketEventParams) (MarketEvent, error)
 	RecordSignal(ctx context.Context, arg RecordSignalParams) (MarketSignal, error)
+	SumPartitionSizesMB(ctx context.Context, pattern string) (float64, error)
 	UpdateSessionBalance(ctx context.Context, arg UpdateSessionBalanceParams) error
 	// === Features ===
 	UpsertFeatures(ctx context.Context, arg UpsertFeaturesParams) error
 	UpsertMarket(ctx context.Context, arg UpsertMarketParams) (Market, error)
 	UpsertMarketScan(ctx context.Context, arg UpsertMarketScanParams) (MarketScan, error)
+	VacuumFeatures(ctx context.Context) error
+	// Optional VACUUM helpers
+	VacuumQuotes(ctx context.Context) error
+	VacuumTrades(ctx context.Context) error
 }
 
 var _ Querier = (*Queries)(nil)

@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
 	"syscall"
 	"time"
 
+	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 	_ "github.com/lib/pq"
 )
 
@@ -79,13 +81,13 @@ func main() {
 		log.Fatalf("db open: %v", err)
 	}
 	defer db.Close()
+	q := database.New(db)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 		prev := readPrevPolicy(*policyFile)
-
-		metrics := collectMetrics(ctx, db)
+		metrics := collectMetrics(ctx, q)
 		policy := calculatePolicyStable(metrics, prev, *targetUsedPct, *minRetention, *maxRetention)
 
 		// Write policy to file for other services to read
@@ -105,12 +107,12 @@ func main() {
 	}
 }
 
-func collectMetrics(ctx context.Context, db *sql.DB) HealthMetrics {
+func collectMetrics(ctx context.Context, q *database.Queries) HealthMetrics {
 	m := HealthMetrics{
 		Timestamp: time.Now(),
 	}
 
-	// Get disk space
+	// Disk space
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs("/", &stat); err == nil && stat.Bsize > 0 {
 		total := int(stat.Blocks * uint64(stat.Bsize) / 1024 / 1024)
@@ -125,59 +127,39 @@ func collectMetrics(ctx context.Context, db *sql.DB) HealthMetrics {
 		m.FreeSpaceMB = free
 		if total > 0 {
 			usedPct := float64(total-free) / float64(total) * 100
-			// clamp to [0,100]
 			m.UsedPercent = math.Max(0, math.Min(100, usedPct))
 		}
 	}
 
-	// Get partition info
-	var partitionCount int
-	var oldest, newest time.Time
+	// Build LIKE pattern for the current year (e.g., market_%_p2025%)
+	year := time.Now().Year()
+	pattern := fmt.Sprintf("market_%%_p%d%%", year)
 
-	err := db.QueryRowContext(ctx, `
-		WITH partitions AS (
-			SELECT 
-				tablename,
-				CASE 
-					WHEN length(regexp_replace(tablename, '^market_\w+_p', '')) = 10 
-					THEN to_timestamp(regexp_replace(tablename, '^market_\w+_p', ''), 'YYYYMMDDHH24')
-					ELSE NULL
-				END as partition_time
-			FROM pg_tables 
-			WHERE tablename LIKE 'market_%_p2025%'
-		)
-		SELECT 
-			COUNT(*),
-			MIN(partition_time),
-			MAX(partition_time)
-		FROM partitions
-		WHERE partition_time IS NOT NULL
-	`).Scan(&partitionCount, &oldest, &newest)
-
+	// Partition span via direct query (sqlc returns interface{} for TABLE functions)
+	span, err := q.GetPartitionSpan(ctx, pattern)
 	if err == nil {
-		m.PartitionCount = partitionCount
-		m.OldestPartition = oldest
-		m.NewestPartition = newest
+		m.PartitionCount = int(span.PartitionCount)
+		if span.OldestPartition.Valid {
+			m.OldestPartition = span.OldestPartition.Time
+		}
+		if span.NewestPartition.Valid {
+			m.NewestPartition = span.NewestPartition.Time
+		}
 	}
 
-	// Estimate write rate from recent partitions (clamped)
-	if !oldest.IsZero() && !newest.IsZero() {
-		hoursDiff := newest.Sub(oldest).Hours()
+	// Estimate write rate from span (clamped)
+	if !m.OldestPartition.IsZero() && !m.NewestPartition.IsZero() {
+		hoursDiff := m.NewestPartition.Sub(m.OldestPartition).Hours()
 		if hoursDiff > 0 {
-			m.WriteRateMBHour = float64(partitionCount) * 100 / hoursDiff
+			// very rough: X partitions ~ X*100 MB (your earlier heuristic)
+			m.WriteRateMBHour = float64(m.PartitionCount) * 100.0 / hoursDiff
 		}
 	}
 
 	// Better write rate from actual sizes (clamped)
-	var totalSizeMB float64
-	_ = db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(pg_total_relation_size(schemaname||'.'||tablename))::float / 1024 / 1024, 0)
-		FROM pg_tables 
-		WHERE tablename LIKE 'market_%_p2025%'
-	`).Scan(&totalSizeMB)
-
-	if !oldest.IsZero() {
-		hoursSinceOldest := time.Since(oldest).Hours()
+	totalSizeMB, _ := q.SumPartitionSizesMB(ctx, pattern)
+	if !m.OldestPartition.IsZero() {
+		hoursSinceOldest := time.Since(m.OldestPartition).Hours()
 		if hoursSinceOldest > 0 {
 			m.WriteRateMBHour = totalSizeMB / hoursSinceOldest
 		}
