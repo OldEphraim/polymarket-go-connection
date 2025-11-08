@@ -16,6 +16,7 @@ type Querier interface {
 	ArchiveStart(ctx context.Context, arg ArchiveStartParams) error
 	CreateSession(ctx context.Context, arg CreateSessionParams) (TradingSession, error)
 	CreateStrategy(ctx context.Context, arg CreateStrategyParams) (Strategy, error)
+	CreateUniqueTempMarketFeaturesStage(ctx context.Context) (string, error)
 	DeactivateMarketScan(ctx context.Context, tokenID string) error
 	DeleteExportedHoursFeatures(ctx context.Context, win string) (int64, error)
 	// Windowed deletes (rename param to avoid reserved keyword)
@@ -54,7 +55,7 @@ type Querier interface {
 	InsertQuote(ctx context.Context, arg InsertQuoteParams) error
 	// === Trades ===
 	InsertTrade(ctx context.Context, arg InsertTradeParams) error
-	MergeMarketFeaturesStage(ctx context.Context) error
+	MergeMarketFeaturesFrom(ctx context.Context, tempTable string) error
 	OldestUnarchivedFeaturesHour(ctx context.Context) (sql.NullTime, error)
 	OldestUnarchivedQuotesHour(ctx context.Context) (sql.NullTime, error)
 	OldestUnarchivedTradesHour(ctx context.Context) (sql.NullTime, error)

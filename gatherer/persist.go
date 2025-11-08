@@ -3,7 +3,9 @@ package gatherer
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -238,10 +240,26 @@ func (p *Persister) flush(ctx context.Context) (err error) {
 		}
 	}
 
-	// COPY features → staging, then merge
+	// COPY features → unique TEMP stage, then merge
 	if len(features) > 0 {
-		stmt, cerr := tx.Prepare(pq.CopyIn(
-			"market_features_stage",
+		tq := p.q.WithTx(tx)
+
+		// Create a unique temp table in THIS session/tx
+		tempName, cerr := tq.CreateUniqueTempMarketFeaturesStage(ctx)
+		if cerr != nil {
+			err = cerr
+			return err
+		}
+
+		schema, table := splitSchemaTable(tempName) // expect "pg_temp", "mfs_stage_..."
+		if schema == "" || table == "" {
+			err = fmt.Errorf("unexpected temp table name: %q", tempName)
+			return err
+		}
+
+		// COPY into the temp table
+		stmt, cerr := tx.Prepare(pq.CopyInSchema(
+			schema, table,
 			"token_id", "ts",
 			"ret_1m", "ret_5m",
 			"vol_1m", "avg_vol_5m",
@@ -264,7 +282,6 @@ func (p *Persister) flush(ctx context.Context) (err error) {
 				nullFloat(f.Sigma5m), nullFloat(f.ZScore5m),
 				nullFloat(f.ImbalanceTop),
 				nullFloat(f.SpreadBps),
-				// booleans are non-nullable in stage; just pass the bools
 				f.BrokeHigh15m, f.BrokeLow15m,
 				nullFloat(f.TimeToResolveH),
 				nullFloat(f.SignedFlow1m),
@@ -284,12 +301,12 @@ func (p *Persister) flush(ctx context.Context) (err error) {
 			return err
 		}
 
-		// Merge (upsert + truncate stage) via sqlc
-		tq := p.q.WithTx(tx)
-		if cerr := tq.MergeMarketFeaturesStage(ctx); cerr != nil {
+		// Merge (upsert + delete temp rows) via sqlc
+		if cerr := tq.MergeMarketFeaturesFrom(ctx, tempName); cerr != nil {
 			err = cerr
 			return err
 		}
+
 	}
 
 	if cerr := tx.Commit(); cerr != nil {
@@ -308,4 +325,17 @@ func nullFloat(f float64) sql.NullFloat64 {
 		return sql.NullFloat64{Valid: false}
 	}
 	return sql.NullFloat64{Float64: f, Valid: true}
+}
+
+func splitSchemaTable(qualified string) (schema, table string) {
+	// Expect "pg_temp.name" (returned by our function).
+	parts := strings.SplitN(qualified, ".", 2)
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0], parts[1]
+	}
+	// Fallbacks: if no dot, default to pg_temp
+	if !strings.Contains(qualified, ".") && qualified != "" {
+		return "pg_temp", qualified
+	}
+	return "", ""
 }

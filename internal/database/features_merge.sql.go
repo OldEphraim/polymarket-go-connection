@@ -9,11 +9,11 @@ import (
 	"context"
 )
 
-const mergeMarketFeaturesStage = `-- name: MergeMarketFeaturesStage :exec
-SELECT merge_market_features_stage()
+const mergeMarketFeaturesFrom = `-- name: MergeMarketFeaturesFrom :exec
+SELECT merge_market_features_from($1::text)
 `
 
-func (q *Queries) MergeMarketFeaturesStage(ctx context.Context) error {
-	_, err := q.db.ExecContext(ctx, mergeMarketFeaturesStage)
+func (q *Queries) MergeMarketFeaturesFrom(ctx context.Context, tempTable string) error {
+	_, err := q.db.ExecContext(ctx, mergeMarketFeaturesFrom, tempTable)
 	return err
 }

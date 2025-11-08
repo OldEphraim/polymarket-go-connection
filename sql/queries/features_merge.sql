@@ -1,2 +1,2 @@
--- name: MergeMarketFeaturesStage :exec
-SELECT merge_market_features_stage();
+-- name: MergeMarketFeaturesFrom :exec
+SELECT merge_market_features_from(@temp_table::text);
