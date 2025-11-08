@@ -101,6 +101,11 @@ func (g *Gatherer) Start() error {
 		g.logger.Error("load market cache", "err", err)
 	}
 
+	// Seed WS asset map from DB before anything else
+	if err := g.seedAssetsFromDB(); err != nil {
+		g.logger.Warn("seed assets from DB failed", "err", err)
+	}
+
 	// Initialize COPY persister (explicit deps; no type-asserts)
 	g.p = NewPersister(g.db, g.sqlc, g.logger, defaultBatchSize, defaultFlushInterval)
 	g.p.Start()
@@ -138,6 +143,18 @@ func (g *Gatherer) Start() error {
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()
+			// wait until we have a healthy asset set
+			target := 20000 // tune: minimum assets before first connect
+			deadline := time.Now().Add(45 * time.Second)
+			for {
+				if len(g.wsAssetList()) >= target {
+					break
+				}
+				if time.Now().After(deadline) {
+					break
+				} // don’t block forever; we’ll resubscribe later
+				time.Sleep(1 * time.Second)
+			}
 			g.runWSIngest()
 		}()
 	}
@@ -175,6 +192,8 @@ func (g *Gatherer) runWSIngest() {
 	var qCount, tCount int64
 	lastReport := time.Now()
 
+	lastSubscribed := 0
+
 	for {
 		if g.ctx.Err() != nil {
 			return
@@ -182,12 +201,39 @@ func (g *Gatherer) runWSIngest() {
 
 		assets := g.wsAssetList()
 		if len(assets) == 0 {
-			// No assets yet — first REST scan hasn’t filled the clob map.
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		g.logger.Info("ws subscribing", "assets", len(assets))
+		// dedupe + snapshot count
+		seen := make(map[string]struct{}, len(assets))
+		clean := cleanIDs(assets, seen)
+		lastSubscribed = len(clean)
+
+		g.logger.Info("ws subscribing", "assets", lastSubscribed)
+
+		// child ctx so we can trigger reconnect when asset set grows
+		wsCtx, cancel := context.WithCancel(g.ctx)
+
+		// monitor growth and force reconnect if it increases significantly
+		go func(prev int, cancel context.CancelFunc) {
+			t := time.NewTicker(2 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-wsCtx.Done():
+					return
+				case <-t.C:
+					cur := len(g.wsAssetList())
+					// reconnect if +10% or +1,000 IDs, whichever is larger
+					if cur >= prev+1000 || (prev > 0 && float64(cur) >= float64(prev)*1.10) {
+						g.logger.Info("ws resubscribe triggered", "prev_assets", prev, "new_assets", cur)
+						cancel()
+						return
+					}
+				}
+			}
+		}(lastSubscribed, cancel)
 
 		onQuote := func(assetID string, bestBid, bestAsk float64, ts time.Time) {
 			tokenID := g.tokenForAsset(assetID)
@@ -200,19 +246,10 @@ func (g *Gatherer) runWSIngest() {
 				spreadBps = (bestAsk - bestBid) / mid * 10000
 			}
 			select {
-			case g.quotesCh <- Quote{
-				TokenID:   tokenID,
-				TS:        ts,
-				BestBid:   bestBid,
-				BestAsk:   bestAsk,
-				SpreadBps: spreadBps,
-				Mid:       mid,
-			}:
+			case g.quotesCh <- Quote{TokenID: tokenID, TS: ts, BestBid: bestBid, BestAsk: bestAsk, SpreadBps: spreadBps, Mid: mid}:
 				qCount++
 			default:
 			}
-
-			// lightweight periodic report (once per 10s)
 			if time.Since(lastReport) > 10*time.Second {
 				g.logger.Info("ws traffic", "quotes", qCount, "trades", tCount)
 				lastReport = time.Now()
@@ -225,13 +262,7 @@ func (g *Gatherer) runWSIngest() {
 				return
 			}
 			select {
-			case g.tradesCh <- Trade{
-				TokenID:   tokenID,
-				TS:        ts,
-				Price:     price,
-				Size:      size,
-				Aggressor: side,
-			}:
+			case g.tradesCh <- Trade{TokenID: tokenID, TS: ts, Price: price, Size: size, Aggressor: side}:
 				tCount++
 			default:
 			}
@@ -242,15 +273,33 @@ func (g *Gatherer) runWSIngest() {
 		}
 
 		wsc := ws.NewPolymarketClient(g.logger)
-		err := wsc.Run(g.ctx, g.config.WebsocketURL, assets, onQuote, onTrade)
+		err := wsc.Run(wsCtx, g.config.WebsocketURL, clean, onQuote, onTrade)
+		cancel() // ensure the monitor goroutine exits
+
 		if err != nil && g.ctx.Err() == nil {
-			g.logger.Warn("ws ingest ended with error; reconnecting", "err", err)
+			g.logger.Warn("ws ingest ended; reconnecting", "err", err)
 			time.Sleep(backoff)
 			if backoff < 5*time.Second {
 				backoff += time.Second
 			}
 			continue
 		}
+		// Normal exit or parent context cancelled.
 		return
 	}
+}
+
+func cleanIDs(ids []string, seen map[string]struct{}) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
