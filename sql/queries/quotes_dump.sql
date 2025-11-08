@@ -6,9 +6,17 @@ WHERE ts >= sqlc.arg(ts_start)::timestamptz
 ORDER BY ts, id;
 
 -- name: OldestUnarchivedQuotesHour :one
-WITH hourly_data AS (
-  SELECT date_trunc('hour', ts) AS hour
+WITH hourly AS (
+  SELECT date_trunc('hour', ts) AS h
   FROM market_quotes
   GROUP BY 1
 )
-SELECT CAST(MIN(hour) AS timestamptz) AS oldest;
+SELECT MIN(h)::timestamptz AS oldest
+FROM hourly
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM archive_jobs aj
+  WHERE aj.table_name = 'market_quotes'
+    AND aj.status     = 'done'
+    AND h >= aj.ts_start AND h < aj.ts_end
+);
