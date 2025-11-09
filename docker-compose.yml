@@ -81,6 +81,8 @@ services:
     ports:
       - "6060:6060"
     command: ["/usr/local/bin/gatherer"]
+    mem_limit: "800m"
+    memswap_limit: "1200m"
     volumes:
       - retention_policy:/tmp:ro # needs to be tmp:rw for POLY_WS_UNKNOWN_PATH
     restart: unless-stopped
@@ -144,6 +146,8 @@ services:
               "-backfill"]
     volumes:
       - retention_policy:/tmp:ro
+    mem_limit: "600m"
+    memswap_limit: "1000m"
     depends_on:
       migrator:
         condition: service_completed_successfully

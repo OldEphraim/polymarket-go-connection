@@ -93,3 +93,11 @@ func (s *SQLCStore) GetActiveMarketScans(ctx context.Context, limit int) ([]Mark
 	}
 	return out, nil
 }
+
+func (s *SQLCStore) GetActiveTokenIDsPage(ctx context.Context, p database.GetActiveTokenIDsPageParams) ([]string, error) {
+	return s.q.GetActiveTokenIDsPage(ctx, p)
+}
+
+func (s *SQLCStore) GetAssetMapPage(ctx context.Context, p database.GetAssetMapPageParams) ([]database.GetAssetMapPageRow, error) {
+	return s.q.GetAssetMapPage(ctx, p)
+}

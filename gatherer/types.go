@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 	"github.com/sqlc-dev/pqtype"
 )
 
@@ -106,7 +107,8 @@ type Store interface {
 	UpsertMarketScan(ctx context.Context, p UpsertMarketScanParams) (MarketScanRow, error)
 	UpsertMarket(ctx context.Context, p UpsertMarketParams) (interface{}, error)
 	RecordMarketEvent(ctx context.Context, p RecordMarketEventParams) (interface{}, error)
-	GetActiveMarketScans(ctx context.Context, limit int) ([]MarketScanRow, error)
+	GetActiveTokenIDsPage(ctx context.Context, p database.GetActiveTokenIDsPageParams) ([]string, error)
+	GetAssetMapPage(ctx context.Context, p database.GetAssetMapPageParams) ([]database.GetAssetMapPageRow, error)
 }
 
 // Minimal projection of your sqlc MarketScan row.

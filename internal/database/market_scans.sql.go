@@ -70,6 +70,92 @@ func (q *Queries) GetActiveMarketScans(ctx context.Context, limit int32) ([]Mark
 	return items, nil
 }
 
+const getActiveTokenIDsPage = `-- name: GetActiveTokenIDsPage :many
+SELECT token_id
+FROM market_scans
+WHERE is_active = true AND token_id > $1
+ORDER BY token_id
+LIMIT $2
+`
+
+type GetActiveTokenIDsPageParams struct {
+	TokenID string `json:"token_id"`
+	Limit   int32  `json:"limit"`
+}
+
+func (q *Queries) GetActiveTokenIDsPage(ctx context.Context, arg GetActiveTokenIDsPageParams) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, getActiveTokenIDsPage, arg.TokenID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var token_id string
+		if err := rows.Scan(&token_id); err != nil {
+			return nil, err
+		}
+		items = append(items, token_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getAssetMapPage = `-- name: GetAssetMapPage :many
+SELECT
+    token_id,
+    -- returns text[] even if clob_token_ids absent (empty array):
+    COALESCE(
+      (SELECT ARRAY(
+         SELECT jsonb_array_elements_text(metadata->'clob_token_ids')
+       )),
+      ARRAY[]::text[]
+    ) AS clob_ids
+FROM market_scans
+WHERE is_active = true
+  AND token_id > $1
+ORDER BY token_id
+LIMIT $2
+`
+
+type GetAssetMapPageParams struct {
+	TokenID string `json:"token_id"`
+	Limit   int32  `json:"limit"`
+}
+
+type GetAssetMapPageRow struct {
+	TokenID string      `json:"token_id"`
+	ClobIds interface{} `json:"clob_ids"`
+}
+
+func (q *Queries) GetAssetMapPage(ctx context.Context, arg GetAssetMapPageParams) ([]GetAssetMapPageRow, error) {
+	rows, err := q.db.QueryContext(ctx, getAssetMapPage, arg.TokenID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetAssetMapPageRow{}
+	for rows.Next() {
+		var i GetAssetMapPageRow
+		if err := rows.Scan(&i.TokenID, &i.ClobIds); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getMarketEventsSince = `-- name: GetMarketEventsSince :many
 SELECT id, token_id, event_type, old_value, new_value, metadata, detected_at FROM market_events
 WHERE id > $1

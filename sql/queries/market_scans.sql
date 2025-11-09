@@ -63,3 +63,26 @@ SELECT * FROM market_events
 WHERE id > $1
 ORDER BY id ASC
 LIMIT 100;
+
+-- name: GetActiveTokenIDsPage :many
+SELECT token_id
+FROM market_scans
+WHERE is_active = true AND token_id > $1
+ORDER BY token_id
+LIMIT $2;
+
+-- name: GetAssetMapPage :many
+SELECT
+    token_id,
+    -- returns text[] even if clob_token_ids absent (empty array):
+    COALESCE(
+      (SELECT ARRAY(
+         SELECT jsonb_array_elements_text(metadata->'clob_token_ids')
+       )),
+      ARRAY[]::text[]
+    ) AS clob_ids
+FROM market_scans
+WHERE is_active = true
+  AND token_id > $1
+ORDER BY token_id
+LIMIT $2;

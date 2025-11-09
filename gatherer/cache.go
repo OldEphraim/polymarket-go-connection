@@ -3,17 +3,36 @@ package gatherer
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 )
 
 func (g *Gatherer) loadMarketCache() error {
-	rows, err := g.store.GetActiveMarketScans(g.ctx, 10000)
-	if err != nil {
-		return err
-	}
+	const pageSize = 1000
+	last := ""
+
 	g.cacheMu.Lock()
 	defer g.cacheMu.Unlock()
-	for i := range rows {
-		g.marketCache[rows[i].TokenID] = &rows[i]
+
+	for {
+		rows, err := g.store.GetActiveTokenIDsPage(g.ctx, database.GetActiveTokenIDsPageParams{
+			TokenID: last,
+			Limit:   pageSize,
+		})
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, r := range rows {
+			// store only what detectors actually need; if only tokenID, keep it minimal:
+			if _, exists := g.marketCache[r]; !exists {
+				g.marketCache[r] = &MarketScanRow{TokenID: r}
+			}
+		}
+		last = rows[len(rows)-1]
 	}
 	g.logger.Info("cache loaded", "count", len(g.marketCache))
 	return nil
@@ -21,51 +40,37 @@ func (g *Gatherer) loadMarketCache() error {
 
 // Seed assetToToken from DB metadata so WS can subscribe to (almost) everything immediately
 func (g *Gatherer) seedAssetsFromDB() error {
-	rows, err := g.store.GetActiveMarketScans(g.ctx, 1_000_000) // ok to overshoot; sqlc impl should page/limit internally if needed
-	if err != nil {
-		return err
-	}
+	const pageSize = 1000
+	last := ""
+	totalInserted := 0
 
-	count := 0
 	g.assetMu.Lock()
 	defer g.assetMu.Unlock()
 
-	for i := range rows {
-		r := rows[i]
-		if !r.Metadata.Valid || r.TokenID == "" {
-			continue
+	for {
+		page, err := g.store.GetAssetMapPage(g.ctx, database.GetAssetMapPageParams{
+			TokenID: last,
+			Limit:   pageSize,
+		})
+		if err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			break
 		}
 
-		var meta map[string]any
-		if err := json.Unmarshal(r.Metadata.RawMessage, &meta); err != nil {
-			continue
-		}
-
-		raw, ok := meta["clob_token_ids"]
-		if !ok || raw == nil {
-			continue
-		}
-
-		switch v := raw.(type) {
-		case []any: // properly stored array
-			for _, elt := range v {
-				if s, ok := elt.(string); ok && s != "" {
-					g.assetToToken[s] = r.TokenID
-					count++
+		for _, row := range page {
+			for _, asset := range toStrings(row.ClobIds) {
+				if asset != "" {
+					g.assetToToken[asset] = row.TokenID
+					totalInserted++
 				}
 			}
-		case string: // JSON-stringified array or CSV
-			for _, s := range decodeAssetIDs(v) {
-				if s != "" {
-					g.assetToToken[s] = r.TokenID
-					count++
-				}
-			}
-		default:
-			// ignore scalars/unknown
 		}
+		last = page[len(page)-1].TokenID
 	}
-	g.logger.Info("seeded asset map from DB", "assets", len(g.assetToToken), "inserted", count)
+
+	g.logger.Info("seeded asset map from DB", "assets", len(g.assetToToken), "inserted", totalInserted)
 	return nil
 }
 
@@ -133,4 +138,32 @@ func (g *Gatherer) tokenForAsset(assetID string) string {
 	g.assetMu.RLock()
 	defer g.assetMu.RUnlock()
 	return g.assetToToken[assetID]
+}
+
+func toStrings(x any) []string {
+	switch v := x.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, it := range v {
+			if s, ok := it.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []byte:
+		// handle jsonb/text[] surfaced as JSON bytes
+		var arr []string
+		if json.Unmarshal(v, &arr) == nil {
+			return arr
+		}
+	case string:
+		// sometimes drivers hand JSON as string
+		var arr []string
+		if json.Unmarshal([]byte(v), &arr) == nil {
+			return arr
+		}
+	}
+	return nil
 }

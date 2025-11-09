@@ -43,6 +43,8 @@ type Querier interface {
 	GetActiveSession(ctx context.Context, strategyID sql.NullInt32) (TradingSession, error)
 	// === Utility ===
 	GetActiveTokenIDs(ctx context.Context, limit int32) ([]string, error)
+	GetActiveTokenIDsPage(ctx context.Context, arg GetActiveTokenIDsPageParams) ([]string, error)
+	GetAssetMapPage(ctx context.Context, arg GetAssetMapPageParams) ([]GetAssetMapPageRow, error)
 	GetLatestMid(ctx context.Context, tokenID string) (sql.NullFloat64, error)
 	GetMarketByTokenID(ctx context.Context, tokenID string) (Market, error)
 	GetMarketEventsSince(ctx context.Context, id int32) ([]MarketEvent, error)

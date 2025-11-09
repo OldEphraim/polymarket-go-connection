@@ -192,10 +192,7 @@ func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
 	}
 
 	// detectors
-	if exists && oldScan != nil {
-		// keep existing detector (legacy) that compares old/new scans
-		g.detectLegacy(&newScan, oldScan, market)
-	} else if g.config.EmitNewMarkets {
+	if g.config.EmitNewMarkets {
 		ageHours := 0.0
 		// CreatedAt might be zero if missing; guard it
 		if market.CreatedAt != nil && !market.CreatedAt.IsZero() {
