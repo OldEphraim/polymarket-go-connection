@@ -142,6 +142,7 @@ services:
       DATABASE_URL: postgresql://a8garber:${POSTGRES_PASSWORD}@postgres:5432/polymarket_dev?sslmode=disable
       ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET}
       AWS_REGION: ${AWS_REGION}
+      ARCHIVER_DEBUG_ADDR: ":7070"
     command: ["/usr/local/bin/archiver",
               "-tables", "${ARCHIVER_TABLES:-market_features,market_trades,market_quotes}",
               "-concurrency", "3",
@@ -150,6 +151,8 @@ services:
       - retention_policy:/tmp:ro
     mem_limit: "600m"
     memswap_limit: "1000m"
+    ports:
+      - "7070:7070"
     depends_on:
       migrator:
         condition: service_completed_successfully

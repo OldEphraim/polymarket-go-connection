@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"net/http"
+	_ "net/http/pprof"
+
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -21,6 +24,13 @@ import (
 )
 
 func main() {
+	if addr := os.Getenv("ARCHIVER_DEBUG_ADDR"); addr != "" {
+		go func() {
+			log.Printf("archiver pprof listening on %s", addr)
+			_ = http.ListenAndServe(addr, nil)
+		}()
+	}
+
 	var (
 		tablesCSV   = flag.String("tables", "", "Comma-separated tables: market_features,market_trades,market_quotes")
 		table       = flag.String("table", "", "Single table (deprecated if -tables)")
