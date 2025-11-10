@@ -10,23 +10,39 @@ import (
 	"database/sql"
 )
 
-const dumpFeaturesHour = `-- name: DumpFeaturesHour :many
+const dumpFeaturesHourPage = `-- name: DumpFeaturesHourPage :many
 SELECT
-  token_id, ts, ret_1m, ret_5m, vol_1m, avg_vol_5m, sigma_5m, zscore_5m,
-  imbalance_top, spread_bps, broke_high_15m, broke_low_15m, time_to_resolve_h, signed_flow_1m
+  token_id, ts, ret_1m, ret_5m, vol_1m, avg_vol_5m,
+  sigma_5m, zscore_5m, imbalance_top, spread_bps,
+  broke_high_15m, broke_low_15m, time_to_resolve_h, signed_flow_1m
 FROM market_features
 WHERE ts >= $1::timestamptz
-  AND ts  < $2  ::timestamptz
+  AND ts  < $2::timestamptz
+  AND (
+    $3::timestamptz IS NULL
+    OR (ts, token_id) > ($3::timestamptz,
+                         COALESCE($4::text, ''))
+  )
 ORDER BY ts, token_id
+LIMIT $5::int
 `
 
-type DumpFeaturesHourParams struct {
-	TsStart sql.NullTime `json:"ts_start"`
-	TsEnd   sql.NullTime `json:"ts_end"`
+type DumpFeaturesHourPageParams struct {
+	TsStart      sql.NullTime   `json:"ts_start"`
+	TsEnd        sql.NullTime   `json:"ts_end"`
+	AfterTs      sql.NullTime   `json:"after_ts"`
+	AfterTokenID sql.NullString `json:"after_token_id"`
+	PageLimit    int32          `json:"page_limit"`
 }
 
-func (q *Queries) DumpFeaturesHour(ctx context.Context, arg DumpFeaturesHourParams) ([]MarketFeature, error) {
-	rows, err := q.db.QueryContext(ctx, dumpFeaturesHour, arg.TsStart, arg.TsEnd)
+func (q *Queries) DumpFeaturesHourPage(ctx context.Context, arg DumpFeaturesHourPageParams) ([]MarketFeature, error) {
+	rows, err := q.db.QueryContext(ctx, dumpFeaturesHourPage,
+		arg.TsStart,
+		arg.TsEnd,
+		arg.AfterTs,
+		arg.AfterTokenID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

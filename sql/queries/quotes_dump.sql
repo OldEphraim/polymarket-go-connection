@@ -1,9 +1,14 @@
--- name: DumpQuotesHour :many
-SELECT token_id, ts, best_bid, best_ask, bid_size1, ask_size1, spread_bps, mid
+-- name: DumpQuotesHourPage :many
+SELECT token_id, ts, best_bid, best_ask, bid_size1, ask_size1, spread_bps, mid, id
 FROM market_quotes
 WHERE ts >= sqlc.arg(ts_start)::timestamptz
-  AND ts  < sqlc.arg(ts_end)  ::timestamptz
-ORDER BY ts, id;
+  AND ts  < sqlc.arg(ts_end)::timestamptz
+  AND (
+    sqlc.narg(after_ts)::timestamptz IS NULL
+    OR (ts, id) > (sqlc.narg(after_ts)::timestamptz, sqlc.narg(after_id)::bigint)
+  )
+ORDER BY ts, id
+LIMIT sqlc.arg(page_limit)::int;
 
 -- name: OldestUnarchivedQuotesHour :one
 SELECT date_trunc('hour', m.ts)::timestamptz AS oldest

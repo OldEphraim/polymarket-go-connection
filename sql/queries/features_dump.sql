@@ -1,11 +1,18 @@
--- name: DumpFeaturesHour :many
+-- name: DumpFeaturesHourPage :many
 SELECT
-  token_id, ts, ret_1m, ret_5m, vol_1m, avg_vol_5m, sigma_5m, zscore_5m,
-  imbalance_top, spread_bps, broke_high_15m, broke_low_15m, time_to_resolve_h, signed_flow_1m
+  token_id, ts, ret_1m, ret_5m, vol_1m, avg_vol_5m,
+  sigma_5m, zscore_5m, imbalance_top, spread_bps,
+  broke_high_15m, broke_low_15m, time_to_resolve_h, signed_flow_1m
 FROM market_features
 WHERE ts >= sqlc.arg(ts_start)::timestamptz
-  AND ts  < sqlc.arg(ts_end)  ::timestamptz
-ORDER BY ts, token_id;
+  AND ts  < sqlc.arg(ts_end)::timestamptz
+  AND (
+    sqlc.narg(after_ts)::timestamptz IS NULL
+    OR (ts, token_id) > (sqlc.narg(after_ts)::timestamptz,
+                         COALESCE(sqlc.narg(after_token_id)::text, ''))
+  )
+ORDER BY ts, token_id
+LIMIT sqlc.arg(page_limit)::int;
 
 -- name: OldestUnarchivedFeaturesHour :one
 SELECT date_trunc('hour', m.ts)::timestamptz AS oldest

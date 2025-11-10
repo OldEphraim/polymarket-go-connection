@@ -1,9 +1,14 @@
--- name: DumpTradesHour :many
-SELECT token_id, ts, price, size, aggressor, trade_id
+-- name: DumpTradesHourPage :many
+SELECT token_id, ts, price, size, aggressor, trade_id, id
 FROM market_trades
 WHERE ts >= sqlc.arg(ts_start)::timestamptz
-  AND ts  < sqlc.arg(ts_end)  ::timestamptz
-ORDER BY ts, id;
+  AND ts  < sqlc.arg(ts_end)::timestamptz
+  AND (
+    sqlc.narg(after_ts)::timestamptz IS NULL
+    OR (ts, id) > (sqlc.narg(after_ts)::timestamptz, sqlc.narg(after_id)::bigint)
+  )
+ORDER BY ts, id
+LIMIT sqlc.arg(page_limit)::int;
 
 -- name: OldestUnarchivedTradesHour :one
 SELECT date_trunc('hour', m.ts)::timestamptz AS oldest

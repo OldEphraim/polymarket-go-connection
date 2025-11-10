@@ -10,37 +10,52 @@ import (
 	"database/sql"
 )
 
-const dumpTradesHour = `-- name: DumpTradesHour :many
-SELECT token_id, ts, price, size, aggressor, trade_id
+const dumpTradesHourPage = `-- name: DumpTradesHourPage :many
+SELECT token_id, ts, price, size, aggressor, trade_id, id
 FROM market_trades
 WHERE ts >= $1::timestamptz
-  AND ts  < $2  ::timestamptz
+  AND ts  < $2::timestamptz
+  AND (
+    $3::timestamptz IS NULL
+    OR (ts, id) > ($3::timestamptz, $4::bigint)
+  )
 ORDER BY ts, id
+LIMIT $5::int
 `
 
-type DumpTradesHourParams struct {
-	TsStart sql.NullTime `json:"ts_start"`
-	TsEnd   sql.NullTime `json:"ts_end"`
+type DumpTradesHourPageParams struct {
+	TsStart   sql.NullTime  `json:"ts_start"`
+	TsEnd     sql.NullTime  `json:"ts_end"`
+	AfterTs   sql.NullTime  `json:"after_ts"`
+	AfterID   sql.NullInt64 `json:"after_id"`
+	PageLimit int32         `json:"page_limit"`
 }
 
-type DumpTradesHourRow struct {
+type DumpTradesHourPageRow struct {
 	TokenID   string         `json:"token_id"`
 	Ts        sql.NullTime   `json:"ts"`
 	Price     float64        `json:"price"`
 	Size      float64        `json:"size"`
 	Aggressor sql.NullString `json:"aggressor"`
 	TradeID   sql.NullString `json:"trade_id"`
+	ID        int64          `json:"id"`
 }
 
-func (q *Queries) DumpTradesHour(ctx context.Context, arg DumpTradesHourParams) ([]DumpTradesHourRow, error) {
-	rows, err := q.db.QueryContext(ctx, dumpTradesHour, arg.TsStart, arg.TsEnd)
+func (q *Queries) DumpTradesHourPage(ctx context.Context, arg DumpTradesHourPageParams) ([]DumpTradesHourPageRow, error) {
+	rows, err := q.db.QueryContext(ctx, dumpTradesHourPage,
+		arg.TsStart,
+		arg.TsEnd,
+		arg.AfterTs,
+		arg.AfterID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []DumpTradesHourRow{}
+	items := []DumpTradesHourPageRow{}
 	for rows.Next() {
-		var i DumpTradesHourRow
+		var i DumpTradesHourPageRow
 		if err := rows.Scan(
 			&i.TokenID,
 			&i.Ts,
@@ -48,6 +63,7 @@ func (q *Queries) DumpTradesHour(ctx context.Context, arg DumpTradesHourParams) 
 			&i.Size,
 			&i.Aggressor,
 			&i.TradeID,
+			&i.ID,
 		); err != nil {
 			return nil, err
 		}

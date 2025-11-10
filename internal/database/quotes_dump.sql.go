@@ -10,20 +10,28 @@ import (
 	"database/sql"
 )
 
-const dumpQuotesHour = `-- name: DumpQuotesHour :many
-SELECT token_id, ts, best_bid, best_ask, bid_size1, ask_size1, spread_bps, mid
+const dumpQuotesHourPage = `-- name: DumpQuotesHourPage :many
+SELECT token_id, ts, best_bid, best_ask, bid_size1, ask_size1, spread_bps, mid, id
 FROM market_quotes
 WHERE ts >= $1::timestamptz
-  AND ts  < $2  ::timestamptz
+  AND ts  < $2::timestamptz
+  AND (
+    $3::timestamptz IS NULL
+    OR (ts, id) > ($3::timestamptz, $4::bigint)
+  )
 ORDER BY ts, id
+LIMIT $5::int
 `
 
-type DumpQuotesHourParams struct {
-	TsStart sql.NullTime `json:"ts_start"`
-	TsEnd   sql.NullTime `json:"ts_end"`
+type DumpQuotesHourPageParams struct {
+	TsStart   sql.NullTime  `json:"ts_start"`
+	TsEnd     sql.NullTime  `json:"ts_end"`
+	AfterTs   sql.NullTime  `json:"after_ts"`
+	AfterID   sql.NullInt64 `json:"after_id"`
+	PageLimit int32         `json:"page_limit"`
 }
 
-type DumpQuotesHourRow struct {
+type DumpQuotesHourPageRow struct {
 	TokenID   string          `json:"token_id"`
 	Ts        sql.NullTime    `json:"ts"`
 	BestBid   sql.NullFloat64 `json:"best_bid"`
@@ -32,17 +40,24 @@ type DumpQuotesHourRow struct {
 	AskSize1  sql.NullFloat64 `json:"ask_size1"`
 	SpreadBps sql.NullFloat64 `json:"spread_bps"`
 	Mid       sql.NullFloat64 `json:"mid"`
+	ID        int64           `json:"id"`
 }
 
-func (q *Queries) DumpQuotesHour(ctx context.Context, arg DumpQuotesHourParams) ([]DumpQuotesHourRow, error) {
-	rows, err := q.db.QueryContext(ctx, dumpQuotesHour, arg.TsStart, arg.TsEnd)
+func (q *Queries) DumpQuotesHourPage(ctx context.Context, arg DumpQuotesHourPageParams) ([]DumpQuotesHourPageRow, error) {
+	rows, err := q.db.QueryContext(ctx, dumpQuotesHourPage,
+		arg.TsStart,
+		arg.TsEnd,
+		arg.AfterTs,
+		arg.AfterID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []DumpQuotesHourRow{}
+	items := []DumpQuotesHourPageRow{}
 	for rows.Next() {
-		var i DumpQuotesHourRow
+		var i DumpQuotesHourPageRow
 		if err := rows.Scan(
 			&i.TokenID,
 			&i.Ts,
@@ -52,6 +67,7 @@ func (q *Queries) DumpQuotesHour(ctx context.Context, arg DumpQuotesHourParams) 
 			&i.AskSize1,
 			&i.SpreadBps,
 			&i.Mid,
+			&i.ID,
 		); err != nil {
 			return nil, err
 		}
