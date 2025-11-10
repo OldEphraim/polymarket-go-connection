@@ -1,18 +1,22 @@
 package gatherer
 
 import (
+	"database/sql"
 	"encoding/json"
 	"strings"
 
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 )
 
+type cacheEntry struct {
+	TokenID      string
+	Price24hAgo  sql.NullFloat64
+	Volume24hAgo sql.NullFloat64
+}
+
 func (g *Gatherer) loadMarketCache() error {
 	const pageSize = 1000
 	last := ""
-
-	g.cacheMu.Lock()
-	defer g.cacheMu.Unlock()
 
 	for {
 		rows, err := g.store.GetActiveTokenIDsPage(g.ctx, database.GetActiveTokenIDsPageParams{
@@ -26,15 +30,24 @@ func (g *Gatherer) loadMarketCache() error {
 			break
 		}
 
-		for _, r := range rows {
-			// store only what detectors actually need; if only tokenID, keep it minimal:
-			if _, exists := g.marketCache[r]; !exists {
-				g.marketCache[r] = &MarketScanRow{TokenID: r}
+		g.cacheMu.Lock()
+		if g.marketCache == nil {
+			g.marketCache = make(map[string]*cacheEntry, 4096)
+		}
+		for _, tok := range rows {
+			if _, exists := g.marketCache[tok]; !exists {
+				g.marketCache[tok] = &cacheEntry{TokenID: tok}
 			}
 		}
+		g.cacheMu.Unlock()
+
 		last = rows[len(rows)-1]
 	}
-	g.logger.Info("cache loaded", "count", len(g.marketCache))
+	g.logger.Info("cache loaded", "count", func() int {
+		g.cacheMu.RLock()
+		defer g.cacheMu.RUnlock()
+		return len(g.marketCache)
+	}())
 	return nil
 }
 
@@ -43,9 +56,6 @@ func (g *Gatherer) seedAssetsFromDB() error {
 	const pageSize = 1000
 	last := ""
 	totalInserted := 0
-
-	g.assetMu.Lock()
-	defer g.assetMu.Unlock()
 
 	for {
 		page, err := g.store.GetAssetMapPage(g.ctx, database.GetAssetMapPageParams{
@@ -59,6 +69,10 @@ func (g *Gatherer) seedAssetsFromDB() error {
 			break
 		}
 
+		g.assetMu.Lock()
+		if g.assetToToken == nil {
+			g.assetToToken = make(map[string]string, 8192)
+		}
 		for _, row := range page {
 			for _, asset := range toStrings(row.ClobIds) {
 				if asset != "" {
@@ -67,10 +81,18 @@ func (g *Gatherer) seedAssetsFromDB() error {
 				}
 			}
 		}
+		g.assetMu.Unlock()
+
 		last = page[len(page)-1].TokenID
 	}
 
-	g.logger.Info("seeded asset map from DB", "assets", len(g.assetToToken), "inserted", totalInserted)
+	g.logger.Info("seeded asset map from DB",
+		"assets", func() int {
+			g.assetMu.RLock()
+			defer g.assetMu.RUnlock()
+			return len(g.assetToToken)
+		}(),
+		"inserted", totalInserted)
 	return nil
 }
 

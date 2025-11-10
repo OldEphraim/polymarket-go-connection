@@ -2,10 +2,30 @@ package ws
 
 import (
 	"encoding/json"
-	"strconv"
 	"strings"
 	"time"
 )
+
+type tradeMsg struct {
+	// ids
+	TokenID string `json:"token_id"`
+	AssetID string `json:"asset_id"`
+	// price (aliases)
+	Price json.Number `json:"price"`
+	P     json.Number `json:"p"`
+	// size (aliases)
+	Size     json.Number `json:"size"`
+	Quantity json.Number `json:"quantity"`
+	Q        json.Number `json:"q"`
+	// side (aliases)
+	Side      string `json:"side"`
+	TakerSide string `json:"taker_side"`
+	Aggressor string `json:"aggressor"`
+	// timestamps (ms or s)
+	Timestamp   json.Number `json:"timestamp"`
+	TimestampMS json.Number `json:"timestamp_ms"`
+	TS          json.Number `json:"ts"`
+}
 
 type tradeOut struct {
 	assetID string
@@ -16,13 +36,12 @@ type tradeOut struct {
 }
 
 func extractTrades(raw json.RawMessage) []tradeOut {
-	var out []tradeOut
-
-	// 1) Array of objects
-	var arr []map[string]any
+	// fast path: array
+	var arr []json.RawMessage
 	if json.Unmarshal(raw, &arr) == nil && len(arr) > 0 {
-		for _, m := range arr {
-			if t, ok := tradeFromAnyMap(m); ok {
+		out := make([]tradeOut, 0, len(arr))
+		for _, el := range arr {
+			if t, ok := decodeTrade(el); ok {
 				out = append(out, t)
 			}
 		}
@@ -30,168 +49,99 @@ func extractTrades(raw json.RawMessage) []tradeOut {
 			return out
 		}
 	}
-
-	// 2) Single object / wrappers
-	var obj map[string]any
+	// single object or wrapped
+	var obj map[string]json.RawMessage
 	if json.Unmarshal(raw, &obj) == nil {
 		// direct
-		if t, ok := tradeFromAnyMap(obj); ok {
-			out = append(out, t)
+		if t, ok := decodeTrade(raw); ok {
+			return []tradeOut{t}
 		}
 		// nested "trade"
-		if m, ok := obj["trade"].(map[string]any); ok {
-			if t, ok := tradeFromAnyMap(m); ok {
-				out = append(out, t)
+		if v, ok := obj["trade"]; ok {
+			if t, ok := decodeTrade(v); ok {
+				return []tradeOut{t}
 			}
 		}
 		// nested "trades"
-		if xs, ok := obj["trades"].([]any); ok {
-			for _, el := range xs {
-				if m, ok := el.(map[string]any); ok {
-					if t, ok := tradeFromAnyMap(m); ok {
+		if v, ok := obj["trades"]; ok {
+			var xs []json.RawMessage
+			if json.Unmarshal(v, &xs) == nil {
+				out := make([]tradeOut, 0, len(xs))
+				for _, el := range xs {
+					if t, ok := decodeTrade(el); ok {
 						out = append(out, t)
 					}
 				}
-			}
-		}
-		// nested arrays under "data" / "payload"
-		if xs, ok := obj["data"].([]any); ok {
-			for _, el := range xs {
-				if m, ok := el.(map[string]any); ok {
-					if t, ok := tradeFromAnyMap(m); ok {
-						out = append(out, t)
-					}
+				if len(out) > 0 {
+					return out
 				}
 			}
 		}
-		if xs, ok := obj["payload"].([]any); ok {
-			for _, el := range xs {
-				if m, ok := el.(map[string]any); ok {
-					if t, ok := tradeFromAnyMap(m); ok {
-						out = append(out, t)
+		// nested arrays under "data"/"payload"
+		for _, k := range []string{"data", "payload"} {
+			if v, ok := obj[k]; ok {
+				var xs []json.RawMessage
+				if json.Unmarshal(v, &xs) == nil {
+					out := make([]tradeOut, 0, len(xs))
+					for _, el := range xs {
+						if t, ok := decodeTrade(el); ok {
+							out = append(out, t)
+						}
+					}
+					if len(out) > 0 {
+						return out
 					}
 				}
 			}
 		}
 	}
-
-	return out
+	return nil
 }
 
-func tradeFromAnyMap(m map[string]any) (tradeOut, bool) {
-	// asset id
-	asset := strAny(m["token_id"])
+func decodeTrade(b []byte) (tradeOut, bool) {
+	var m tradeMsg
+	if err := json.Unmarshal(b, &m); err != nil {
+		return tradeOut{}, false
+	}
+	asset := m.TokenID
 	if asset == "" {
-		asset = strAny(m["asset_id"])
+		asset = m.AssetID
 	}
-	if asset == "" {
-		if mm, ok := m["market"].(map[string]any); ok {
-			asset = strAny(mm["token_id"])
-			if asset == "" {
-				asset = strAny(mm["asset_id"])
-			}
-		}
-	}
+	price := firstFloat(m.Price, m.P)
+	size := firstFloat(m.Size, m.Quantity, m.Q)
+	side := normSide(firstString(m.Side, m.TakerSide, m.Aggressor))
+	ts := pickTime(m)
 
-	// price
-	price := fAny(m["price"])
-	if price == 0 {
-		price = fAny(m["p"])
+	if asset == "" || price <= 0 || size <= 0 || side == "" {
+		return tradeOut{}, false
 	}
-
-	// size / quantity
-	size := fAny(m["size"])
-	if size == 0 {
-		size = fAny(m["quantity"])
-	}
-	if size == 0 {
-		size = fAny(m["q"])
-	}
-
-	// side
-	side := strAny(m["side"])
-	if side == "" {
-		side = strAny(m["taker_side"])
-	}
-	if side == "" {
-		side = strAny(m["aggressor"])
-	}
-	side = normSide(side)
-
-	// timestamp(s)
-	ts := time.Time{}
-	if v := iAny(m["timestamp"]); v > 0 {
-		ts = time.Unix(0, v*int64(time.Millisecond))
-	} else if v := iAny(m["timestamp_ms"]); v > 0 {
-		ts = time.Unix(0, v*int64(time.Millisecond))
-	} else if v := iAny(m["ts"]); v > 0 {
-		if v > 1_000_000_000_000 {
-			ts = time.Unix(0, v*int64(time.Millisecond))
-		} else {
-			ts = time.Unix(v, 0)
-		}
-	}
-
-	t := tradeOut{
+	return tradeOut{
 		assetID: asset,
 		price:   price,
 		size:    size,
 		side:    side,
 		ts:      ts,
-	}
-	if t.assetID == "" || t.price <= 0 || t.size <= 0 || t.side == "" {
-		return tradeOut{}, false
-	}
-	return t, true
+	}, true
 }
 
-func strAny(v any) string {
-	switch x := v.(type) {
-	case string:
-		return strings.TrimSpace(x)
-	case json.Number:
-		return x.String()
-	case float64:
-		return strconv.FormatFloat(x, 'f', -1, 64)
-	case int64:
-		return strconv.FormatInt(x, 10)
-	case int:
-		return strconv.Itoa(x)
-	default:
-		return ""
-	}
-}
-
-func fAny(v any) float64 {
-	switch x := v.(type) {
-	case float64:
-		return x
-	case json.Number:
-		f, _ := x.Float64()
-		return f
-	case string:
-		if f, err := strconv.ParseFloat(strings.TrimSpace(x), 64); err == nil {
-			return f
+func firstFloat(nums ...json.Number) float64 {
+	for _, n := range nums {
+		if s := string(n); s != "" {
+			if f, err := n.Float64(); err == nil && f > 0 {
+				return f
+			}
 		}
 	}
 	return 0
 }
-
-func iAny(v any) int64 {
-	switch x := v.(type) {
-	case float64:
-		return int64(x)
-	case json.Number:
-		i, _ := x.Int64()
-		return i
-	case string:
-		if i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64); err == nil {
-			return i
+func firstString(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
 		}
 	}
-	return 0
+	return ""
 }
-
 func normSide(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	switch s {
@@ -202,4 +152,30 @@ func normSide(s string) string {
 	default:
 		return ""
 	}
+}
+func pickTime(m tradeMsg) time.Time {
+	// prefer ms
+	if s := string(m.TimestampMS); s != "" {
+		if ms, err := m.TimestampMS.Int64(); err == nil && ms > 0 {
+			return time.Unix(0, ms*int64(time.Millisecond))
+		}
+	}
+	if s := string(m.Timestamp); s != "" {
+		if v, err := m.Timestamp.Int64(); err == nil && v > 0 {
+			// heuristics: if it looks like ms
+			if v > 1_000_000_000_000 {
+				return time.Unix(0, v*int64(time.Millisecond))
+			}
+			return time.Unix(v, 0)
+		}
+	}
+	if s := string(m.TS); s != "" {
+		if v, err := m.TS.Int64(); err == nil && v > 0 {
+			if v > 1_000_000_000_000 {
+				return time.Unix(0, v*int64(time.Millisecond))
+			}
+			return time.Unix(v, 0)
+		}
+	}
+	return time.Time{}
 }

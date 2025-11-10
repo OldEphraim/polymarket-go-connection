@@ -35,9 +35,8 @@ func (g *Gatherer) performScan() {
 	start := time.Now()
 	g.scansPerformed++
 
-	var allEvents []PolymarketEvent
-	offset := 0
-	limit := 100
+	offset, limit := 0, 100
+	marketCount := 0
 
 	for {
 		events, hasMore, err := g.fetchEventsBatch(offset, limit)
@@ -45,31 +44,26 @@ func (g *Gatherer) performScan() {
 			g.logger.Error("fetch events batch", "offset", offset, "err", err)
 			break
 		}
-		allEvents = append(allEvents, events...)
+
+		for _, ev := range events {
+			for _, m := range ev.Markets {
+				if m.Closed {
+					continue
+				}
+				marketCount++
+				g.marketsFound++
+				g.processMarket(m, ev.ID)
+			}
+		}
 
 		if !hasMore || len(events) < limit {
 			break
 		}
 		offset += limit
-
-		// be polite to the API
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	marketCount := 0
-	for _, ev := range allEvents {
-		for _, m := range ev.Markets {
-			if m.Closed {
-				continue
-			}
-			marketCount++
-			g.marketsFound++
-			g.processMarket(m, ev.ID)
-		}
-	}
-
 	g.logger.Info("scan complete",
-		"events", len(allEvents),
 		"markets_processed", marketCount,
 		"took", time.Since(start))
 }
@@ -105,7 +99,7 @@ func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
 
 	// get cached prior
 	g.cacheMu.RLock()
-	oldScan, exists := g.marketCache[tokenID]
+	old, exists := g.marketCache[tokenID]
 	g.cacheMu.RUnlock()
 
 	// price
@@ -146,9 +140,9 @@ func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
 		Liquidity:  sql.NullFloat64{Float64: liquidity, Valid: true},
 		Metadata:   pqtype.NullRawMessage{RawMessage: metaJSON, Valid: true},
 	}
-	if exists && oldScan != nil {
-		params.Price24hAgo = oldScan.Price24hAgo
-		params.Volume24hAgo = oldScan.Volume24hAgo
+	if exists && old != nil {
+		params.Price24hAgo = old.Price24hAgo
+		params.Volume24hAgo = old.Volume24hAgo
 	}
 
 	newScan, err := g.store.UpsertMarketScan(g.ctx, params)
@@ -167,7 +161,14 @@ func (g *Gatherer) processMarket(market PolymarketMarket, eventID string) {
 
 	// update cache
 	g.cacheMu.Lock()
-	g.marketCache[tokenID] = &newScan
+	if g.marketCache == nil {
+		g.marketCache = make(map[string]*cacheEntry, 4096)
+	}
+	g.marketCache[tokenID] = &cacheEntry{
+		TokenID:      tokenID,
+		Price24hAgo:  newScan.Price24hAgo,
+		Volume24hAgo: newScan.Volume24hAgo,
+	}
 	g.cacheMu.Unlock()
 
 	// Only push a quote when both sides are present

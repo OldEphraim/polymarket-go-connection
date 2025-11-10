@@ -140,6 +140,11 @@ func (g *Gatherer) shouldDebounce(t MarketEventType, tokenID string, window time
 	now := time.Now()
 	g.emitMu.Lock()
 	defer g.emitMu.Unlock()
+
+	if g.lastEmit == nil {
+		g.lastEmit = make(map[string]time.Time, 4096)
+	}
+
 	if last, ok := g.lastEmit[key]; ok && now.Sub(last) < window {
 		return true
 	}

@@ -35,7 +35,7 @@ type Gatherer struct {
 
 	// Cache
 	cacheMu     sync.RWMutex
-	marketCache map[string]*MarketScanRow
+	marketCache map[string]*cacheEntry
 
 	// Metrics
 	scansPerformed int64
@@ -61,29 +61,41 @@ func New(store Store, config *Config, logger *slog.Logger, db *sql.DB, sqlc *dat
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// honor EventQueueSize if present
-	evSize := 20000
-	if config.EventQueueSize > 0 {
+	// Right-size queues (still generous, but not OOM-bait)
+	evSize := 2000
+	if config.EventQueueSize > 0 && config.EventQueueSize < 50_000 {
 		evSize = config.EventQueueSize
 	}
 
-	return &Gatherer{
-		store:        store,
-		db:           db,
-		sqlc:         sqlc,
-		client:       &http.Client{Timeout: 10 * time.Second},
-		config:       config,
-		logger:       logger,
-		ctx:          ctx,
-		cancel:       cancel,
-		eventChan:    make(chan MarketEvent, evSize),
-		quotesCh:     make(chan Quote, 50000),
-		tradesCh:     make(chan Trade, 100000),
-		featuresCh:   make(chan FeatureUpdate, 20000),
-		marketCache:  make(map[string]*MarketScanRow),
-		lastEmit:     make(map[string]time.Time),
-		assetToToken: make(map[string]string),
+	// Reuse a single HTTP client with a tuned Transport (fewer TLS/header allocs)
+	tr := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
 	}
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	g := &Gatherer{
+		store:      store,
+		db:         db,
+		sqlc:       sqlc,
+		client:     client,
+		config:     config,
+		logger:     logger,
+		ctx:        ctx,
+		cancel:     cancel,
+		eventChan:  make(chan MarketEvent, evSize),
+		quotesCh:   make(chan Quote, 5000),
+		tradesCh:   make(chan Trade, 10000),
+		featuresCh: make(chan FeatureUpdate, 5000),
+		// Lazy-init maps on first use to avoid big upfront allocs in pprof “gatherer.New”
+		// (we’ll check nil before write and make(...) as needed)
+		marketCache:  nil,
+		lastEmit:     nil,
+		assetToToken: nil,
+	}
+	return g
 }
 
 func (g *Gatherer) Start() error {

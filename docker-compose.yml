@@ -78,6 +78,8 @@ services:
       POLY_WS_DEBUG: ${POLY_WS_DEBUG:-0}
       POLY_WS_LOG_UNKNOWN: ${POLY_WS_LOG_UNKNOWN:-0}
       # POLY_WS_UNKNOWN_PATH: ${POLY_WS_UNKNOWN_PATH:-/tmp/ws_unknown.jsonl} # only set when debugging
+      GOMEMLIMIT: ${GOMEMLIMIT:-700MiB}
+      GOGC: ${GOGC:-100}
     ports:
       - "6060:6060"
     command: ["/usr/local/bin/gatherer"]
