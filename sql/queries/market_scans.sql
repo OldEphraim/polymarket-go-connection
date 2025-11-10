@@ -73,14 +73,28 @@ LIMIT $2;
 
 -- name: GetAssetMapPage :many
 SELECT
-    token_id,
-    -- returns text[] even if clob_token_ids absent (empty array):
-    COALESCE(
-      (SELECT ARRAY(
-         SELECT jsonb_array_elements_text(metadata->'clob_token_ids')
-       )),
-      ARRAY[]::text[]
-    ) AS clob_ids
+  token_id,
+  CASE
+    WHEN jsonb_typeof(metadata->'clob_token_ids') = 'array' THEN
+      (
+        SELECT ARRAY(
+          SELECT jsonb_array_elements_text(metadata->'clob_token_ids')
+        )
+      )
+    WHEN jsonb_typeof(metadata->'clob_token_ids') = 'string' THEN
+      CASE
+        -- JSON-stringified array like "[\"a\",\"b\"]"
+        WHEN (metadata->>'clob_token_ids') ~ '^\s*\[' THEN
+          (
+            SELECT ARRAY(
+              SELECT jsonb_array_elements_text((metadata->>'clob_token_ids')::jsonb)
+            )
+          )
+        -- CSV fallback like "a,b,c"
+        ELSE regexp_split_to_array(metadata->>'clob_token_ids', '\s*,\s*')::text[]
+      END
+    ELSE ARRAY[]::text[]
+  END AS clob_ids
 FROM market_scans
 WHERE is_active = true
   AND token_id > $1
