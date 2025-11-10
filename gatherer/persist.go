@@ -18,6 +18,7 @@ import (
 const (
 	defaultBatchSize     = 5000
 	defaultFlushInterval = 500 * time.Millisecond
+	defaultCapPerType    = 20000 // bounded in-process queues
 )
 
 // Persister batches quotes, trades, and features and flushes them with COPY.
@@ -30,10 +31,17 @@ type Persister struct {
 	batchSize     int
 	flushInterval time.Duration
 
+	// Internal batches (protected by mu)
 	mu       sync.Mutex
 	quotes   []Quote
 	trades   []Trade
 	features []FeatureUpdate
+
+	// Bounded ingestion channels (non-blocking send/drop)
+	quotesCh   chan Quote
+	tradesCh   chan Trade
+	featuresCh chan FeatureUpdate
+	capPerType int
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -60,6 +68,10 @@ func NewPersister(db *sql.DB, q *database.Queries, log *slog.Logger, batchSize i
 		log:           log,
 		batchSize:     batchSize,
 		flushInterval: flushEvery,
+		quotesCh:      make(chan Quote, defaultCapPerType),
+		tradesCh:      make(chan Trade, defaultCapPerType),
+		featuresCh:    make(chan FeatureUpdate, defaultCapPerType),
+		capPerType:    defaultCapPerType,
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -81,6 +93,30 @@ func (p *Persister) Start() {
 				return
 			case <-t.C:
 				p.tryFlush(p.ctx)
+			case q := <-p.quotesCh:
+				p.mu.Lock()
+				p.quotes = append(p.quotes, q)
+				need := len(p.quotes) >= p.batchSize
+				p.mu.Unlock()
+				if need {
+					p.tryFlush(p.ctx)
+				}
+			case t := <-p.tradesCh:
+				p.mu.Lock()
+				p.trades = append(p.trades, t)
+				need := len(p.trades) >= p.batchSize
+				p.mu.Unlock()
+				if need {
+					p.tryFlush(p.ctx)
+				}
+			case f := <-p.featuresCh:
+				p.mu.Lock()
+				p.features = append(p.features, f)
+				need := len(p.features) >= p.batchSize
+				p.mu.Unlock()
+				if need {
+					p.tryFlush(p.ctx)
+				}
 			}
 		}
 	}()
@@ -119,35 +155,29 @@ func (p *Persister) tryFlush(ctx context.Context) {
 	}
 }
 
-// Enqueue APIs (thread-safe)
-
-func (p *Persister) EnqueueQuote(q Quote) {
-	p.mu.Lock()
-	p.quotes = append(p.quotes, q)
-	need := len(p.quotes) >= p.batchSize
-	p.mu.Unlock()
-	if need {
-		p.tryFlush(p.ctx)
+// Enqueue APIs (non-blocking; return false if dropped)
+func (p *Persister) EnqueueQuote(q Quote) bool {
+	select {
+	case p.quotesCh <- q:
+		return true
+	default:
+		return false
 	}
 }
-
-func (p *Persister) EnqueueTrade(t Trade) {
-	p.mu.Lock()
-	p.trades = append(p.trades, t)
-	need := len(p.trades) >= p.batchSize
-	p.mu.Unlock()
-	if need {
-		p.tryFlush(p.ctx)
+func (p *Persister) EnqueueTrade(t Trade) bool {
+	select {
+	case p.tradesCh <- t:
+		return true
+	default:
+		return false
 	}
 }
-
-func (p *Persister) EnqueueFeatures(f FeatureUpdate) {
-	p.mu.Lock()
-	p.features = append(p.features, f)
-	need := len(p.features) >= p.batchSize
-	p.mu.Unlock()
-	if need {
-		p.tryFlush(p.ctx)
+func (p *Persister) EnqueueFeatures(f FeatureUpdate) bool {
+	select {
+	case p.featuresCh <- f:
+		return true
+	default:
+		return false
 	}
 }
 

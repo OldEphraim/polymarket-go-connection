@@ -37,6 +37,13 @@ type rollState struct {
 	lastEmit time.Time
 }
 
+// Hard caps to prevent unbounded memory growth
+const (
+	maxMidsPerToken = 512
+	maxTrades1m     = 1024
+	maxTrades5m     = 4096
+)
+
 type priced struct {
 	ts  time.Time
 	mid float64
@@ -86,10 +93,12 @@ func (fe *featureEngine) st(token string) *rollState {
 func (fe *featureEngine) onQuote(q Quote) {
 	// persist every top-of-book snapshot (COPY-batched)
 	if fe.p != nil {
-		fe.p.EnqueueQuote(q)
+		_ = fe.p.EnqueueQuote(q) // drop if backlog full
 	}
 	st := fe.st(q.TokenID)
-	st.lastMid.PushBack(priced{ts: q.TS, mid: q.Mid})
+	for st.lastMid.Len() >= maxMidsPerToken {
+		st.lastMid.Remove(st.lastMid.Front())
+	}
 	fe.gcPrices(st, q.TS)
 
 	// update highs/lows every ~15s
@@ -105,7 +114,7 @@ func (fe *featureEngine) onQuote(q Quote) {
 func (fe *featureEngine) onTrade(t Trade) {
 	// persist every print (COPY-batched)
 	if fe.p != nil {
-		fe.p.EnqueueTrade(t)
+		_ = fe.p.EnqueueTrade(t) // drop if backlog full
 	}
 	st := fe.st(t.TokenID)
 	sign := 0.0
@@ -116,6 +125,12 @@ func (fe *featureEngine) onTrade(t Trade) {
 	}
 	st.last1m.PushBack(traded{ts: t.TS, size: t.Size, signed: t.Size * sign})
 	st.last5m.PushBack(traded{ts: t.TS, size: t.Size, signed: t.Size * sign})
+	for st.last1m.Len() > maxTrades1m {
+		st.last1m.Remove(st.last1m.Front())
+	}
+	for st.last5m.Len() > maxTrades5m {
+		st.last5m.Remove(st.last5m.Front())
+	}
 	fe.gcTrades(st, t.TS)
 	fe.maybeEmit(t.TokenID, t.TS, math.NaN(), math.NaN())
 }
@@ -185,6 +200,11 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 	brokeHi := hi > 0 && midNow >= hi
 	brokeLo := lo > 0 && midNow <= lo
 
+	// Skip dull emits: nothing changed and no flow
+	if vol1m == 0 && math.Abs(ret1m) < 0.001 && !brokeHi && !brokeLo {
+		return
+	}
+
 	fu := FeatureUpdate{
 		TokenID: token, TS: ts,
 		Ret1m: ret1m, Ret5m: ret5m,
@@ -199,7 +219,7 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 
 	// persist features (COPY-batched via stage+upsert)
 	if fe.p != nil {
-		fe.p.EnqueueFeatures(fu)
+		_ = fe.p.EnqueueFeatures(fu) // drop if backlog full
 	}
 
 	select {
