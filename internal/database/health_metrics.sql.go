@@ -10,6 +10,17 @@ import (
 	"database/sql"
 )
 
+const dbSizePretty = `-- name: DbSizePretty :one
+SELECT pg_size_pretty(pg_database_size($1::text))
+`
+
+func (q *Queries) DbSizePretty(ctx context.Context, dbname string) (string, error) {
+	row := q.db.QueryRowContext(ctx, dbSizePretty, dbname)
+	var pg_size_pretty string
+	err := row.Scan(&pg_size_pretty)
+	return pg_size_pretty, err
+}
+
 const getPartitionSpan = `-- name: GetPartitionSpan :one
 WITH r AS (
   SELECT poly_partition_span($1) AS t
@@ -32,6 +43,20 @@ func (q *Queries) GetPartitionSpan(ctx context.Context, pattern string) (GetPart
 	var i GetPartitionSpanRow
 	err := row.Scan(&i.PartitionCount, &i.OldestPartition, &i.NewestPartition)
 	return i, err
+}
+
+const lastArchiveDoneEnd = `-- name: LastArchiveDoneEnd :one
+SELECT MAX(ts_end)::timestamptz
+FROM archive_jobs
+WHERE table_name = $1
+  AND status = 'done'
+`
+
+func (q *Queries) LastArchiveDoneEnd(ctx context.Context, tableName string) (sql.NullTime, error) {
+	row := q.db.QueryRowContext(ctx, lastArchiveDoneEnd, tableName)
+	var column_1 sql.NullTime
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const sumPartitionSizesMB = `-- name: SumPartitionSizesMB :one

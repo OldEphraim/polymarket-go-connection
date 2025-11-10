@@ -38,6 +38,10 @@ func loadDynamicPolicy(defaultWindow, defaultTradesWindow, defaultFeaturesWindow
 		TradesHours        float64 `json:"trades_hours"`
 		FeaturesHours      float64 `json:"features_hours"`
 		EmergencyThreshold int     `json:"emergency_threshold_mb"`
+		JanitorSleepSecs   int     `json:"janitor_sleep_secs"`
+		BacklogQuotesH     float64 `json:"backlog_quotes_h"`
+		BacklogTradesH     float64 `json:"backlog_trades_h"`
+		BacklogFeaturesH   float64 `json:"backlog_features_h"`
 	}
 
 	if err := json.Unmarshal(data, &policy); err != nil {
@@ -49,8 +53,9 @@ func loadDynamicPolicy(defaultWindow, defaultTradesWindow, defaultFeaturesWindow
 	tradesWindow := fmt.Sprintf("%.1f hours", policy.TradesHours)
 	featuresWindow := fmt.Sprintf("%.1f hours", policy.FeaturesHours)
 
-	log.Printf("[janitor] Loaded dynamic policy: quotes=%s trades=%s features=%s emergency=%dMB",
-		quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold)
+	log.Printf("[janitor] Loaded dynamic policy: quotes=%s trades=%s features=%s emergency=%dMB sleep=%ds backlog(h): q=%.1f t=%.1f f=%.1f",
+		quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold,
+		policy.JanitorSleepSecs, policy.BacklogQuotesH, policy.BacklogTradesH, policy.BacklogFeaturesH)
 
 	return quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold
 }
@@ -70,7 +75,7 @@ func main() {
 		precreateHoursBack = flag.Int("precreate_hours_back", 2, "precreate partitions hours back")
 		precreateHoursFwd  = flag.Int("precreate_hours_fwd", 2, "precreate partitions hours forward")
 
-		checkInterval = flag.Duration("check_interval", 5*time.Minute, "how often to reload policy and run cleanup")
+		checkInterval = flag.Duration("check_interval", 5*time.Minute, "fallback: how often to reload policy and run cleanup (overridden by policy)")
 	)
 	flag.Parse()
 
@@ -114,10 +119,21 @@ func main() {
 			},
 		}
 
+		// Run partition drops first (fast, big wins), then windowed deletes
 		runJanitorCycle(ctx, q, tableConfigs, *tables, dynEmergencyMB,
 			*emergencyGrace, *precreateHoursBack, *precreateHoursFwd)
 
 		cancel()
+		// Prefer dynamic cadence from policy file when present
+		if b, err := os.ReadFile("/tmp/retention_policy.json"); err == nil {
+			var p struct {
+				JanitorSleepSecs int `json:"janitor_sleep_secs"`
+			}
+			if json.Unmarshal(b, &p) == nil && p.JanitorSleepSecs > 0 {
+				time.Sleep(time.Duration(p.JanitorSleepSecs) * time.Second)
+				continue
+			}
+		}
 		time.Sleep(*checkInterval)
 	}
 }
@@ -192,7 +208,39 @@ func runJanitorCycle(
 		}
 	}
 
-	// Normal mode: per-table windowed delete and partition drop
+	// Normal mode: DROP archived partitions first (fast O(1)), then windowed deletes
+	for _, tableName := range splitCSV(tablesCSV) {
+		cfg, ok := tableConfigs[tableName]
+		if !ok {
+			log.Printf("skip unknown table: %s", tableName)
+			continue
+		}
+		switch tableName {
+		case "market_quotes":
+			if dropped, err := q.DropArchivedMarketQuotesPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
+				log.Printf("[janitor] drop_archived quotes failed: %v", err)
+			} else if dropped > 0 {
+				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
+				dbCheckpoint(ctx, q)
+			}
+		case "market_trades":
+			if dropped, err := q.DropArchivedMarketTradesPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
+				log.Printf("[janitor] drop_archived trades failed: %v", err)
+			} else if dropped > 0 {
+				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
+				dbCheckpoint(ctx, q)
+			}
+		case "market_features":
+			if dropped, err := q.DropArchivedMarketFeaturesPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
+				log.Printf("[janitor] drop_archived features failed: %v", err)
+			} else if dropped > 0 {
+				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
+				dbCheckpoint(ctx, q)
+			}
+		}
+	}
+
+	// Then do windowed deletes (rows that are archived but still inside the keep window)
 	for _, tableName := range splitCSV(tablesCSV) {
 		cfg, ok := tableConfigs[tableName]
 		if !ok {
@@ -220,30 +268,6 @@ func runJanitorCycle(
 			log.Printf("[janitor] %s delete_exported_hours(%q) -> %d", tableName, cfg.window, deleted)
 			if deleted > 10000 {
 				vacuumTable(ctx, q, tableName)
-			}
-		}
-
-		switch tableName {
-		case "market_quotes":
-			if dropped, err := q.DropArchivedMarketQuotesPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
-				log.Printf("[janitor] drop_archived quotes failed: %v", err)
-			} else if dropped > 0 {
-				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
-				dbCheckpoint(ctx, q)
-			}
-		case "market_trades":
-			if dropped, err := q.DropArchivedMarketTradesPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
-				log.Printf("[janitor] drop_archived trades failed: %v", err)
-			} else if dropped > 0 {
-				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
-				dbCheckpoint(ctx, q)
-			}
-		case "market_features":
-			if dropped, err := q.DropArchivedMarketFeaturesPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
-				log.Printf("[janitor] drop_archived features failed: %v", err)
-			} else if dropped > 0 {
-				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
-				dbCheckpoint(ctx, q)
 			}
 		}
 	}

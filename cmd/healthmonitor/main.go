@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,14 +18,18 @@ import (
 )
 
 type HealthMetrics struct {
-	Timestamp       time.Time `json:"timestamp"`
-	FreeSpaceMB     int       `json:"free_space_mb"`
-	TotalSpaceMB    int       `json:"total_space_mb"`
-	UsedPercent     float64   `json:"used_percent"`
-	WriteRateMBHour float64   `json:"write_rate_mb_hour"`
-	PartitionCount  int       `json:"partition_count"`
-	OldestPartition time.Time `json:"oldest_partition"`
-	NewestPartition time.Time `json:"newest_partition"`
+	Timestamp        time.Time `json:"timestamp"`
+	FreeSpaceMB      int       `json:"free_space_mb"`
+	TotalSpaceMB     int       `json:"total_space_mb"`
+	UsedPercent      float64   `json:"used_percent"`
+	WriteRateMBHour  float64   `json:"write_rate_mb_hour"`
+	PartitionCount   int       `json:"partition_count"`
+	OldestPartition  time.Time `json:"oldest_partition"`
+	NewestPartition  time.Time `json:"newest_partition"`
+	DBSizeMB         int       `json:"db_size_mb"`
+	BacklogQuotesH   float64   `json:"backlog_quotes_h"`
+	BacklogTradesH   float64   `json:"backlog_trades_h"`
+	BacklogFeaturesH float64   `json:"backlog_features_h"`
 }
 
 type RetentionPolicy struct {
@@ -36,9 +41,14 @@ type RetentionPolicy struct {
 	JanitorSleepSecs   int       `json:"janitor_sleep_secs"`
 	EmergencyThreshold int       `json:"emergency_threshold_mb"`
 
-	// NEW: dynamic pacing / backpressure signals
+	// dynamic pacing / backpressure signals
 	BackpressureFreeMB int  `json:"backpressure_free_mb"`
 	PauseGatherer      bool `json:"pause_gatherer"`
+
+	// visibility — janitor/archiver can log these
+	BacklogQuotesH   float64 `json:"backlog_quotes_h"`
+	BacklogTradesH   float64 `json:"backlog_trades_h"`
+	BacklogFeaturesH float64 `json:"backlog_features_h"`
 }
 
 // Hysteresis thresholds (tweak as you like)
@@ -165,12 +175,52 @@ func collectMetrics(ctx context.Context, q *database.Queries) HealthMetrics {
 		}
 	}
 
+	// Database size (MB)
+	if dbSizePretty, err := q.DbSizePretty(ctx, "polymarket_dev"); err == nil {
+		// DbSizePretty returns human text; add a helper query that returns MB as numeric if you prefer.
+		// If you already added a numeric version, parse that here instead of string parsing.
+		if mb, ok := parsePrettyMB(dbSizePretty); ok {
+			m.DBSizeMB = mb
+		}
+	}
+
+	// Backlog hours: how far behind each table is since the last archived hour
+	nowUTC := time.Now().UTC()
+	if last, err := q.LastArchiveDoneEnd(ctx, "market_quotes"); err == nil && last.Valid {
+		m.BacklogQuotesH = math.Max(0, nowUTC.Sub(last.Time).Hours())
+	}
+	if last, err := q.LastArchiveDoneEnd(ctx, "market_trades"); err == nil && last.Valid {
+		m.BacklogTradesH = math.Max(0, nowUTC.Sub(last.Time).Hours())
+	}
+	if last, err := q.LastArchiveDoneEnd(ctx, "market_features"); err == nil && last.Valid {
+		m.BacklogFeaturesH = math.Max(0, nowUTC.Sub(last.Time).Hours())
+	}
+
 	// Final clamp on write rate
 	if m.WriteRateMBHour <= 0 || math.IsNaN(m.WriteRateMBHour) || math.IsInf(m.WriteRateMBHour, 0) {
 		m.WriteRateMBHour = minSafeguardWriteRate
 	}
 
 	return m
+}
+
+// parsePrettyMB best-effort parser if you kept DbSizePretty() returning text like "39 GB".
+func parsePrettyMB(s string) (int, bool) {
+	var v float64
+	var unit string
+	if _, err := fmt.Sscanf(s, "%f %s", &v, &unit); err != nil {
+		return 0, false
+	}
+	switch strings.ToUpper(unit) {
+	case "MB", "M", "MEGABYTES":
+		return int(v + 0.5), true
+	case "GB", "G", "GIGABYTES":
+		return int(v*1024 + 0.5), true
+	case "TB":
+		return int(v*1024*1024 + 0.5), true
+	default:
+		return 0, false
+	}
 }
 
 // Stable policy with hysteresis & clamped math
@@ -184,7 +234,10 @@ func calculatePolicyStable(m HealthMetrics, prev RetentionPolicy, targetPct, min
 	}
 
 	p := RetentionPolicy{
-		Timestamp: now,
+		Timestamp:        now,
+		BacklogQuotesH:   m.BacklogQuotesH,
+		BacklogTradesH:   m.BacklogTradesH,
+		BacklogFeaturesH: m.BacklogFeaturesH,
 	}
 
 	// Calculate how much space we want to use
@@ -217,22 +270,47 @@ func calculatePolicyStable(m HealthMetrics, prev RetentionPolicy, targetPct, min
 	}
 
 	// Distribute retention across tables (quotes most aggressive, features least)
-	p.QuotesHours = clamp(hoursWeCanKeep*0.2, minHours, maxHours)
-	p.TradesHours = clamp(hoursWeCanKeep*0.3, minHours, maxHours)
-	p.FeaturesHours = clamp(hoursWeCanKeep*0.5, minHours, maxHours)
+	// Base split
+	baseQ := hoursWeCanKeep * 0.20
+	baseT := hoursWeCanKeep * 0.30
+	baseF := hoursWeCanKeep * 0.50
+	// If backlog grows, shrink windows proportionally (quotes first)
+	if m.BacklogQuotesH > 2 {
+		baseQ *= 0.5 // push quotes out faster
+	}
+	if m.BacklogTradesH > 2 {
+		baseT *= 0.7
+	}
+	if m.BacklogFeaturesH > 2 {
+		baseF *= 0.8
+	}
+	p.QuotesHours = clamp(baseQ, minHours, maxHours)
+	p.TradesHours = clamp(baseT, minHours, maxHours)
+	p.FeaturesHours = clamp(baseF, minHours, maxHours)
 
-	// Base sleep intervals by utilization
+	// Base sleep intervals by utilization AND backlog pressure (min wins)
+	utilArchive, utilJanitor := 300, 300
 	switch {
 	case m.UsedPercent >= 85:
-		p.ArchiveSleepSecs = 30
-		p.JanitorSleepSecs = 60
+		utilArchive, utilJanitor = 30, 60
 	case m.UsedPercent >= 70:
-		p.ArchiveSleepSecs = 60
-		p.JanitorSleepSecs = 120
-	default:
-		p.ArchiveSleepSecs = 300
-		p.JanitorSleepSecs = 300
+		utilArchive, utilJanitor = 60, 120
 	}
+	backlogArchive, backlogJanitor := 300, 300
+	if (m.BacklogQuotesH + m.BacklogTradesH + m.BacklogFeaturesH) > 6 {
+		backlogArchive, backlogJanitor = 30, 60
+	} else if (m.BacklogQuotesH + m.BacklogTradesH + m.BacklogFeaturesH) > 2 {
+		backlogArchive, backlogJanitor = 60, 120
+	}
+	// choose the tighter (smaller) intervals
+	if backlogArchive < utilArchive {
+		utilArchive = backlogArchive
+	}
+	if backlogJanitor < utilJanitor {
+		utilJanitor = backlogJanitor
+	}
+	p.ArchiveSleepSecs = utilArchive
+	p.JanitorSleepSecs = utilJanitor
 
 	// Backpressure signal for writers (archiver/janitor already consume; gatherer will also read it)
 	// If we have very little free space, tell writers to slow down aggressively.

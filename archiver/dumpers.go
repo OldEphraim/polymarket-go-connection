@@ -20,7 +20,7 @@ type TradesDumper struct{ Q *database.Queries }
 type QuotesDumper struct{ Q *database.Queries }
 
 // tune per hour density
-const dumpPageSize = 25000
+const dumpPageSize = 50000
 
 func (d *FeaturesDumper) DumpHour(ctx context.Context, w Window, out io.Writer) (int64, error) {
 	enc := json.NewEncoder(out)
