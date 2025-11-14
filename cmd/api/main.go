@@ -183,7 +183,9 @@ WITH
     SELECT * FROM poly_partition_span('market_features_p%')
   ),
 
-  -- Approximate per-minute ingest + lag from partition spans
+  -- Approximate per-minute ingest + lag from partition spans.
+  -- Per-minute is total / min(span_minutes, 60), so it roughly reflects
+  -- the last ~hour rather than the entire history.
   quotes_rates AS (
     SELECT
       q.n AS total,
@@ -191,12 +193,18 @@ WITH
         WHEN s.oldest_partition IS NULL OR s.newest_partition IS NULL
              OR s.newest_partition <= s.oldest_partition
         THEN 0::float8
-        ELSE q.n / GREATEST(EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0, 1)
+        ELSE q.n / GREATEST(
+          LEAST(
+            EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0,
+            60.0
+          ),
+          1.0
+        )
       END AS per_min,
       CASE
         WHEN s.newest_partition IS NULL
-        THEN 0::bigint
-        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition))::bigint, 0)
+        THEN 0::float8
+        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition)), 0)
       END AS lag_sec
     FROM quotes_est q
     CROSS JOIN quotes_span s
@@ -208,12 +216,18 @@ WITH
         WHEN s.oldest_partition IS NULL OR s.newest_partition IS NULL
              OR s.newest_partition <= s.oldest_partition
         THEN 0::float8
-        ELSE q.n / GREATEST(EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0, 1)
+        ELSE q.n / GREATEST(
+          LEAST(
+            EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0,
+            60.0
+          ),
+          1.0
+        )
       END AS per_min,
       CASE
         WHEN s.newest_partition IS NULL
-        THEN 0::bigint
-        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition))::bigint, 0)
+        THEN 0::float8
+        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition)), 0)
       END AS lag_sec
     FROM trades_est q
     CROSS JOIN trades_span s
@@ -225,12 +239,18 @@ WITH
         WHEN s.oldest_partition IS NULL OR s.newest_partition IS NULL
              OR s.newest_partition <= s.oldest_partition
         THEN 0::float8
-        ELSE q.n / GREATEST(EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0, 1)
+        ELSE q.n / GREATEST(
+          LEAST(
+            EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0,
+            60.0
+          ),
+          1.0
+        )
       END AS per_min,
       CASE
         WHEN s.newest_partition IS NULL
-        THEN 0::bigint
-        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition))::bigint, 0)
+        THEN 0::float8
+        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition)), 0)
       END AS lag_sec
     FROM features_est q
     CROSS JOIN features_span s
