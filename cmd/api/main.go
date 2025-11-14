@@ -387,9 +387,22 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	limit, offset := parseLimitOffset(r, 100)
+
+	// hours lookback (1–168, default 1)
 	hours := atoiDefault(r.URL.Query().Get("hours"), 1)
 	if hours < 1 || hours > 168 {
 		hours = 1
+	}
+
+	// Optional filters
+	qv := r.URL.Query()
+	eventType := qv.Get("type") // "", "new_market", "price_jump", "state_extreme", etc.
+
+	minRet := 0.0
+	if ms := qv.Get("min_ret"); ms != "" {
+		if v, err := strconv.ParseFloat(ms, 64); err == nil && v >= 0 {
+			minRet = v
+		}
 	}
 
 	const q = `
@@ -404,10 +417,24 @@ SELECT
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 WHERE me.detected_at > now() - ($3::text || ' hours')::interval
+  AND ($4 = '' OR me.event_type = $4)
+  AND (
+    $5::float8 <= 0
+    OR ABS(COALESCE((me.metadata->>'ret_1m')::float8, 0)) >= $5::float8
+  )
 ORDER BY me.detected_at DESC
 LIMIT $1 OFFSET $2;
 `
-	rows, err := s.db.QueryContext(ctx, q, limit, offset, strconv.Itoa(hours))
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		q,
+		limit,
+		offset,
+		strconv.Itoa(hours), // $3
+		eventType,           // $4
+		minRet,              // $5
+	)
 	if err != nil {
 		s.log.Error("getMarketEvents", "err", err)
 		writeErr(w, http.StatusInternalServerError, "query failed")
@@ -432,10 +459,22 @@ LIMIT $1 OFFSET $2;
 		var oldV, newV sql.NullFloat64
 		var qn sql.NullString
 		var raw json.RawMessage
-		if err := rows.Scan(&e.TokenID, &evType, &oldV, &newV, &e.DetectedAt, &qn, &raw); err != nil {
+
+		if err := rows.Scan(
+			&e.TokenID,
+			&evType,
+			&oldV,
+			&newV,
+			&e.DetectedAt,
+			&qn,
+			&raw,
+		); err != nil {
+			// You were silently continuing before; keeping that behavior.
 			continue
 		}
+
 		e.EventType = evType.String
+
 		if oldV.Valid {
 			val := oldV.Float64
 			e.OldValue = &val
@@ -452,8 +491,10 @@ LIMIT $1 OFFSET $2;
 		if len(raw) > 0 {
 			_ = json.Unmarshal(raw, &e.Metadata)
 		}
+
 		out = append(out, e)
 	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 

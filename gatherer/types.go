@@ -22,6 +22,8 @@ const (
 	ImbalanceShift MarketEventType = "imbalance_shift"
 	NewHigh        MarketEventType = "new_high"
 	NewLow         MarketEventType = "new_low"
+
+	StateExtreme MarketEventType = "state_extreme"
 )
 
 type MarketEvent struct {

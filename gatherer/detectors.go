@@ -92,11 +92,14 @@ func (g *Gatherer) detectMeanRevertHint(f FeatureUpdate) {
 	if f.Vol1m <= 0 {
 		return
 	}
-	if g.shouldDebounce(PriceJump, f.TokenID, g.debounceWindow()) {
+
+	// Debounce separately from true price jumps
+	if g.shouldDebounce(StateExtreme, f.TokenID, g.debounceWindow()) {
 		return
 	}
+
 	g.emitEvent(MarketEvent{
-		Type:      PriceJump,
+		Type:      StateExtreme,
 		TokenID:   f.TokenID,
 		Timestamp: f.TS,
 
