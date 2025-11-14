@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict en9Ub5BSfxGsNxTZBW2HRReX2LCZQvfdlfhwOyrvq56cFJ4PQNawZRaCPp8KDRI
+\restrict iAYoadb4om5QDvCAlY0aH71F4rRcuVQ4t8jKNs5S71hNOuDJ3PGUJldmmfsbVAa
 
 -- Dumped from database version 14.19 (Homebrew)
 -- Dumped by pg_dump version 14.19 (Homebrew)
@@ -136,29 +136,50 @@ CREATE FUNCTION public.delete_exported_hours_features(p_window text) RETURNS big
     LANGUAGE plpgsql
     AS $$
 DECLARE
-  cutoff TIMESTAMPTZ;
-  n BIGINT;
+  cutoff     TIMESTAMPTZ := NOW() - (p_window::interval);
+  batch      INT         := 20000;     -- tune: 10k–50k are typical
+  n_total    BIGINT      := 0;
+  n_step     BIGINT;
+  win_start  TIMESTAMPTZ;
+  win_end    TIMESTAMPTZ;
 BEGIN
-  cutoff := NOW() - (p_window::interval);
-
-  WITH gone AS (
-    DELETE FROM market_features mf
-    USING archive_jobs aj
+  FOR win_start, win_end IN
+    SELECT aj.ts_start, aj.ts_end
+    FROM archive_jobs aj
     WHERE aj.table_name = 'market_features'
-      AND aj.status = 'done'
-      AND aj.ts_start < cutoff
-      AND mf.ts >= aj.ts_start
-      AND mf.ts <  aj.ts_end
-    RETURNING 1
-  )
-  SELECT COUNT(*) INTO n FROM gone;
+      AND aj.status     = 'done'
+      AND aj.ts_start   < cutoff         -- only truly cold windows
+    ORDER BY aj.ts_start
+  LOOP
+    LOOP
+      WITH doomed AS (
+        SELECT f.token_id, f.ts
+        FROM market_features f
+        WHERE f.ts >= win_start AND f.ts < win_end
+          AND f.ts < cutoff
+        ORDER BY f.ts, f.token_id
+        LIMIT batch
+      ),
+      del AS (
+        DELETE FROM market_features u
+        USING doomed d
+        WHERE u.token_id = d.token_id
+          AND u.ts       = d.ts
+        RETURNING 1
+      )
+      SELECT COALESCE(count(*),0) INTO n_step FROM del;
+
+      n_total := n_total + n_step;
+      EXIT WHEN n_step = 0;
+    END LOOP;
+  END LOOP;
 
   PERFORM pg_notify(
     'janitor',
-    json_build_object('table','market_features','deleted',n,'cutoff',cutoff)::text
+    json_build_object('table','market_features','deleted',n_total,'cutoff',cutoff)::text
   );
 
-  RETURN n;
+  RETURN n_total;
 END
 $$;
 
@@ -171,29 +192,49 @@ CREATE FUNCTION public.delete_exported_hours_quotes(p_window text) RETURNS bigin
     LANGUAGE plpgsql
     AS $$
 DECLARE
-  cutoff TIMESTAMPTZ;
-  n BIGINT;
+  cutoff     TIMESTAMPTZ := NOW() - (p_window::interval);
+  batch      INT         := 20000;
+  n_total    BIGINT      := 0;
+  n_step     BIGINT;
+  win_start  TIMESTAMPTZ;
+  win_end    TIMESTAMPTZ;
 BEGIN
-  cutoff := NOW() - (p_window::interval);
-
-  WITH gone AS (
-    DELETE FROM market_quotes q
-    USING archive_jobs aj
+  FOR win_start, win_end IN
+    SELECT aj.ts_start, aj.ts_end
+    FROM archive_jobs aj
     WHERE aj.table_name = 'market_quotes'
-      AND aj.status = 'done'
-      AND aj.ts_start < cutoff
-      AND q.ts >= aj.ts_start
-      AND q.ts <  aj.ts_end
-    RETURNING 1
-  )
-  SELECT COUNT(*) INTO n FROM gone;
+      AND aj.status     = 'done'
+      AND aj.ts_start   < cutoff
+    ORDER BY aj.ts_start
+  LOOP
+    LOOP
+      WITH doomed AS (
+        SELECT q.id
+        FROM market_quotes q
+        WHERE q.ts >= win_start AND q.ts < win_end
+          AND q.ts < cutoff
+        ORDER BY q.ts
+        LIMIT batch
+      ),
+      del AS (
+        DELETE FROM market_quotes u
+        USING doomed d
+        WHERE u.id = d.id
+        RETURNING 1
+      )
+      SELECT COALESCE(count(*),0) INTO n_step FROM del;
+
+      n_total := n_total + n_step;
+      EXIT WHEN n_step = 0;
+    END LOOP;
+  END LOOP;
 
   PERFORM pg_notify(
     'janitor',
-    json_build_object('table','market_quotes','deleted',n,'cutoff',cutoff)::text
+    json_build_object('table','market_quotes','deleted',n_total,'cutoff',cutoff)::text
   );
 
-  RETURN n;
+  RETURN n_total;
 END
 $$;
 
@@ -206,29 +247,49 @@ CREATE FUNCTION public.delete_exported_hours_trades(p_window text) RETURNS bigin
     LANGUAGE plpgsql
     AS $$
 DECLARE
-  cutoff TIMESTAMPTZ;
-  n BIGINT;
+  cutoff     TIMESTAMPTZ := NOW() - (p_window::interval);
+  batch      INT         := 20000;
+  n_total    BIGINT      := 0;
+  n_step     BIGINT;
+  win_start  TIMESTAMPTZ;
+  win_end    TIMESTAMPTZ;
 BEGIN
-  cutoff := NOW() - (p_window::interval);
-
-  WITH gone AS (
-    DELETE FROM market_trades t
-    USING archive_jobs aj
+  FOR win_start, win_end IN
+    SELECT aj.ts_start, aj.ts_end
+    FROM archive_jobs aj
     WHERE aj.table_name = 'market_trades'
-      AND aj.status = 'done'
-      AND aj.ts_start < cutoff
-      AND t.ts >= aj.ts_start
-      AND t.ts <  aj.ts_end
-    RETURNING 1
-  )
-  SELECT COUNT(*) INTO n FROM gone;
+      AND aj.status     = 'done'
+      AND aj.ts_start   < cutoff
+    ORDER BY aj.ts_start
+  LOOP
+    LOOP
+      WITH doomed AS (
+        SELECT t.id
+        FROM market_trades t
+        WHERE t.ts >= win_start AND t.ts < win_end
+          AND t.ts < cutoff
+        ORDER BY t.ts
+        LIMIT batch
+      ),
+      del AS (
+        DELETE FROM market_trades u
+        USING doomed d
+        WHERE u.id = d.id
+        RETURNING 1
+      )
+      SELECT COALESCE(count(*),0) INTO n_step FROM del;
+
+      n_total := n_total + n_step;
+      EXIT WHEN n_step = 0;
+    END LOOP;
+  END LOOP;
 
   PERFORM pg_notify(
     'janitor',
-    json_build_object('table','market_trades','deleted',n,'cutoff',cutoff)::text
+    json_build_object('table','market_trades','deleted',n_total,'cutoff',cutoff)::text
   );
 
-  RETURN n;
+  RETURN n_total;
 END
 $$;
 
@@ -2561,6 +2622,13 @@ CREATE INDEX idx_market_events_detected ON public.market_events USING btree (det
 
 
 --
+-- Name: idx_market_events_detected_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_events_detected_at ON public.market_events USING btree (detected_at);
+
+
+--
 -- Name: idx_market_events_token; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2603,6 +2671,13 @@ CREATE INDEX idx_market_quotes_ts ON public.market_quotes_old USING btree (ts DE
 
 
 --
+-- Name: idx_market_scans_is_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_market_scans_is_active ON public.market_scans USING btree (is_active);
+
+
+--
 -- Name: idx_market_scans_price_change; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2635,6 +2710,13 @@ CREATE INDEX idx_market_trades_ts ON public.market_trades_old USING btree (ts DE
 --
 
 CREATE INDEX idx_mfs_token_ts ON public.market_features_stage USING btree (token_id, ts);
+
+
+--
+-- Name: idx_paper_trades_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_paper_trades_created_at ON public.paper_trades USING btree (created_at);
 
 
 --
@@ -3284,5 +3366,5 @@ ALTER TABLE ONLY public.trading_sessions
 -- PostgreSQL database dump complete
 --
 
-\unrestrict en9Ub5BSfxGsNxTZBW2HRReX2LCZQvfdlfhwOyrvq56cFJ4PQNawZRaCPp8KDRI
+\unrestrict iAYoadb4om5QDvCAlY0aH71F4rRcuVQ4t8jKNs5S71hNOuDJ3PGUJldmmfsbVAa
 

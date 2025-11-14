@@ -101,9 +101,16 @@ func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	// total_pnl = realized (sessions) + sum unrealized (open positions)
+	// NOTE:
+	// - For partitioned tables (market_quotes_p*, market_trades_p*, market_features_p*)
+	//   we avoid COUNT(*) / MAX(ts) scans.
+	// - Instead we:
+	//     * use pg_class.reltuples to estimate total rows
+	//     * use poly_partition_span() to get oldest/newest partition boundaries
+	//     * derive per-minute ingest + lag from those spans.
 	const q = `
 WITH
+  -- Basic, now index-accelerated stats
   active_markets AS (
     SELECT COUNT(*) AS n FROM market_scans WHERE is_active = TRUE
   ),
@@ -124,56 +131,142 @@ WITH
     JOIN trading_sessions ts ON ts.id = t.session_id
     WHERE t.created_at > NOW() - INTERVAL '24 hours'
   ),
-  quotes_lag AS (
-    SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_quotes
-  ),
-  trades_lag AS (
-    SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_trades
-  ),
-  features_lag AS (
-    SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(ts)))::int, 0) AS sec FROM market_features
-  ),
   db_size AS (
     SELECT pg_size_pretty(pg_database_size(current_database())) AS size
   ),
-  features_per_min AS (
-    SELECT COUNT(*) AS n FROM market_features WHERE ts > NOW() - INTERVAL '1 minute'
+
+  -- Approximate totals via pg_class.reltuples (catalog only; very fast)
+  quotes_est AS (
+    SELECT COALESCE(SUM(c.reltuples),0)::bigint AS n
+    FROM pg_class c
+    JOIN pg_namespace nsp ON nsp.oid = c.relnamespace
+    WHERE nsp.nspname = 'public'
+      AND c.relname LIKE 'market_quotes_p%'
   ),
-  quotes_5m AS (
-    SELECT COALESCE(COUNT(*),0)::bigint AS n FROM market_quotes WHERE ts > NOW() - INTERVAL '5 minutes'
+  trades_est AS (
+    SELECT COALESCE(SUM(c.reltuples),0)::bigint AS n
+    FROM pg_class c
+    JOIN pg_namespace nsp ON nsp.oid = c.relnamespace
+    WHERE nsp.nspname = 'public'
+      AND c.relname LIKE 'market_trades_p%'
   ),
-  trades_5m AS (
-    SELECT COALESCE(COUNT(*),0)::bigint AS n FROM market_trades WHERE ts > NOW() - INTERVAL '5 minutes'
+  features_est AS (
+    SELECT COALESCE(SUM(c.reltuples),0)::bigint AS n
+    FROM pg_class c
+    JOIN pg_namespace nsp ON nsp.oid = c.relnamespace
+    WHERE nsp.nspname = 'public'
+      AND c.relname LIKE 'market_features_p%'
+  ),
+
+  -- Partition span metadata from your helper
+  quotes_span AS (
+    SELECT * FROM poly_partition_span('market_quotes_p%')
+  ),
+  trades_span AS (
+    SELECT * FROM poly_partition_span('market_trades_p%')
+  ),
+  features_span AS (
+    SELECT * FROM poly_partition_span('market_features_p%')
+  ),
+
+  -- Approximate per-minute ingest + lag from partition spans
+  quotes_rates AS (
+    SELECT
+      q.n AS total,
+      CASE
+        WHEN s.oldest_partition IS NULL OR s.newest_partition IS NULL
+             OR s.newest_partition <= s.oldest_partition
+        THEN 0::float8
+        ELSE q.n / GREATEST(EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0, 1)
+      END AS per_min,
+      CASE
+        WHEN s.newest_partition IS NULL
+        THEN 0::bigint
+        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition))::bigint, 0)
+      END AS lag_sec
+    FROM quotes_est q
+    CROSS JOIN quotes_span s
+  ),
+  trades_rates AS (
+    SELECT
+      q.n AS total,
+      CASE
+        WHEN s.oldest_partition IS NULL OR s.newest_partition IS NULL
+             OR s.newest_partition <= s.oldest_partition
+        THEN 0::float8
+        ELSE q.n / GREATEST(EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0, 1)
+      END AS per_min,
+      CASE
+        WHEN s.newest_partition IS NULL
+        THEN 0::bigint
+        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition))::bigint, 0)
+      END AS lag_sec
+    FROM trades_est q
+    CROSS JOIN trades_span s
+  ),
+  features_rates AS (
+    SELECT
+      q.n AS total,
+      CASE
+        WHEN s.oldest_partition IS NULL OR s.newest_partition IS NULL
+             OR s.newest_partition <= s.oldest_partition
+        THEN 0::float8
+        ELSE q.n / GREATEST(EXTRACT(EPOCH FROM (s.newest_partition - s.oldest_partition)) / 60.0, 1)
+      END AS per_min,
+      CASE
+        WHEN s.newest_partition IS NULL
+        THEN 0::bigint
+        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition))::bigint, 0)
+      END AS lag_sec
+    FROM features_est q
+    CROSS JOIN features_span s
   )
+
 SELECT
-  (SELECT n FROM active_markets)                                        AS active_markets,
-  (SELECT n FROM events_24h)                                            AS events_24h,
-  (SELECT n FROM open_positions)                                        AS open_positions,
-  (SELECT r FROM realized) + (SELECT unreal FROM open_positions)        AS total_pnl,
-  (SELECT n FROM strategies_active)                                     AS strategies_count,
-  (SELECT sec FROM quotes_lag)                                          AS quotes_lag_sec,
-  (SELECT sec FROM trades_lag)                                          AS trades_lag_sec,
-  (SELECT sec FROM features_lag)                                        AS features_lag_sec,
-  (SELECT size FROM db_size)                                            AS db_size,
-  (SELECT n FROM features_per_min)                                      AS features_per_minute,
-  (SELECT (n / 5.0) FROM quotes_5m)                                     AS ingest_quotes_per_min,
-  (SELECT (n / 5.0) FROM trades_5m)                                     AS ingest_trades_per_min
+  (SELECT n FROM active_markets)                                 AS active_markets,
+  (SELECT n FROM events_24h)                                     AS events_24h,
+  (SELECT n FROM open_positions)                                 AS open_positions,
+  (SELECT r FROM realized) + (SELECT unreal FROM open_positions) AS total_pnl,
+  (SELECT n FROM strategies_active)                              AS strategies_count,
+
+  -- Approximate lag using newest partition boundary
+  COALESCE((SELECT lag_sec FROM quotes_rates),   0)              AS quotes_lag_sec,
+  COALESCE((SELECT lag_sec FROM trades_rates),   0)              AS trades_lag_sec,
+  COALESCE((SELECT lag_sec FROM features_rates), 0)              AS features_lag_sec,
+
+  (SELECT size FROM db_size)                                     AS db_size,
+
+  -- Approximate per-minute rates
+  COALESCE((SELECT per_min FROM features_rates), 0)::bigint      AS features_per_minute,
+  COALESCE((SELECT per_min FROM quotes_rates),   0)              AS ingest_quotes_per_min,
+  COALESCE((SELECT per_min FROM trades_rates),   0)              AS ingest_trades_per_min,
+
+  -- Big brag numbers
+  COALESCE((SELECT total FROM quotes_rates),   0)::bigint        AS approx_quotes_total,
+  COALESCE((SELECT total FROM trades_rates),   0)::bigint        AS approx_trades_total,
+  COALESCE((SELECT total FROM features_rates), 0)::bigint        AS approx_features_total
 ;`
 
+	// Note: JSON field names are kept stable, with a few new ones appended.
 	var out struct {
-		ActiveMarkets      int64            `json:"active_markets"`
-		Events24h          int64            `json:"events_24h"`
-		OpenPositions      int64            `json:"open_positions"`
-		TotalPnL           float64          `json:"total_pnl"`
-		Strategies         int64            `json:"strategies_count"`
-		QuotesLagSec       int64            `json:"quotes_lag_sec"`
-		TradesLagSec       int64            `json:"trades_lag_sec"`
-		FeaturesLagSec     int64            `json:"features_lag_sec"`
-		DBSize             string           `json:"db_size"`
-		FeaturesPerMin     int64            `json:"features_per_minute"`
-		IngestQuotesPerMin float64          `json:"ingest_quotes_per_min"`
-		IngestTradesPerMin float64          `json:"ingest_trades_per_min"`
-		WriterQueueDepths  map[string]int64 `json:"writer_queue_depths,omitempty"`
+		ActiveMarkets      int64   `json:"active_markets"`
+		Events24h          int64   `json:"events_24h"`
+		OpenPositions      int64   `json:"open_positions"`
+		TotalPnL           float64 `json:"total_pnl"`
+		Strategies         int64   `json:"strategies_count"`
+		QuotesLagSec       int64   `json:"quotes_lag_sec"`
+		TradesLagSec       int64   `json:"trades_lag_sec"`
+		FeaturesLagSec     int64   `json:"features_lag_sec"`
+		DBSize             string  `json:"db_size"`
+		FeaturesPerMin     int64   `json:"features_per_minute"`
+		IngestQuotesPerMin float64 `json:"ingest_quotes_per_min"`
+		IngestTradesPerMin float64 `json:"ingest_trades_per_min"`
+
+		ApproxQuotesTotal   int64 `json:"approx_quotes_total"`
+		ApproxTradesTotal   int64 `json:"approx_trades_total"`
+		ApproxFeaturesTotal int64 `json:"approx_features_total"`
+
+		WriterQueueDepths map[string]int64 `json:"writer_queue_depths,omitempty"`
 	}
 
 	row := s.db.QueryRowContext(ctx, q)
@@ -190,6 +283,9 @@ SELECT
 		&out.FeaturesPerMin,
 		&out.IngestQuotesPerMin,
 		&out.IngestTradesPerMin,
+		&out.ApproxQuotesTotal,
+		&out.ApproxTradesTotal,
+		&out.ApproxFeaturesTotal,
 	); err != nil {
 		s.log.Error("getStats", "err", err)
 		http.Error(w, "stats error", http.StatusInternalServerError)
@@ -197,11 +293,17 @@ SELECT
 	}
 
 	// Optional: fetch writer queue depths from the gatherer’s internal debug endpoint.
-	// Set GATHERER_DEBUG_URL (e.g., http://gatherer:6060). If unset or fails, we omit the field.
 	if base := os.Getenv("GATHERER_DEBUG_URL"); base != "" {
 		reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(base, "/")+"/debug/queues", nil)
+
+		req, _ := http.NewRequestWithContext(
+			reqCtx,
+			http.MethodGet,
+			strings.TrimRight(base, "/")+"/debug/queues",
+			nil,
+		)
+
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil && resp != nil && resp.Body != nil {
 			defer resp.Body.Close()
