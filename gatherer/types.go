@@ -32,6 +32,10 @@ type MarketEvent struct {
 	OldValue  float64                `json:"old_value,omitempty"`
 	NewValue  float64                `json:"new_value,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+
+	// internal: control whether OldValue/NewValue should be persisted as non-NULL
+	HasOld bool `json:"-"`
+	HasNew bool `json:"-"`
 }
 
 // ===== Normalized book & tape =====
@@ -71,6 +75,8 @@ type FeatureUpdate struct {
 	BrokeLow15m    bool
 	TimeToResolveH float64
 	SignedFlow1m   float64 // +buy -sell
+	MidNow         float64
+	Mid1mAgo       float64
 }
 
 // ===== DB-facing types (align with your sqlc) =====

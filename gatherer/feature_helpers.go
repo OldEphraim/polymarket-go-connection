@@ -180,3 +180,20 @@ func (fe *featureEngine) windowHighLow(st *rollState, dur time.Duration) (hi, lo
 	}
 	return
 }
+
+func (fe *featureEngine) midAgo(st *rollState, dur time.Duration) float64 {
+	if st.lastMid.Len() == 0 {
+		return 0
+	}
+	now := st.lastMid.Back().Value.(priced)
+	cut := now.ts.Add(-dur)
+
+	// find first >= cut with a positive mid
+	for e := st.lastMid.Front(); e != nil; e = e.Next() {
+		p := e.Value.(priced)
+		if !p.ts.Before(cut) && p.mid > 0 {
+			return p.mid
+		}
+	}
+	return 0
+}

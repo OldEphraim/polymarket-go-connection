@@ -31,11 +31,9 @@ func (g *Gatherer) detectorLoop() {
 }
 
 func (g *Gatherer) detectMomentum(f FeatureUpdate) {
-	if f.AvgVol5m <= 0 || f.Vol1m <= 0 { // <-- require real prints
+	if f.AvgVol5m <= 0 || f.Vol1m <= 0 {
 		return
 	}
-
-	// gates: spread + volume burst
 	if int(f.SpreadBps) > g.config.Thresholds.MaxSpreadBps {
 		return
 	}
@@ -47,13 +45,9 @@ func (g *Gatherer) detectMomentum(f FeatureUpdate) {
 	if volx < g.config.Thresholds.VolSurgeMin {
 		return
 	}
-
-	// optional imbalance gate
 	if g.config.Thresholds.ImbMin > 0 && math.Abs(f.ImbalanceTop) < g.config.Thresholds.ImbMin {
 		return
 	}
-
-	// directional confirmation
 	if f.Ret1m > 0 && (f.SignedFlow1m <= 0 || f.ImbalanceTop <= 0) {
 		return
 	}
@@ -66,9 +60,15 @@ func (g *Gatherer) detectMomentum(f FeatureUpdate) {
 	}
 
 	g.emitEvent(MarketEvent{
-		Type:      PriceJump, // keep strategy compatibility
+		Type:      PriceJump,
 		TokenID:   f.TokenID,
 		Timestamp: f.TS,
+
+		OldValue: f.Mid1mAgo,
+		NewValue: f.MidNow,
+		HasOld:   f.Mid1mAgo > 0,
+		HasNew:   f.MidNow > 0,
+
 		Metadata: map[string]interface{}{
 			"ret_1m":         f.Ret1m,
 			"ret_5m":         f.Ret5m,
@@ -89,16 +89,22 @@ func (g *Gatherer) detectMeanRevertHint(f FeatureUpdate) {
 	if int(f.SpreadBps) > g.config.Thresholds.MaxSpreadBps {
 		return
 	}
-	if f.Vol1m <= 0 { // <-- require some trade flow
+	if f.Vol1m <= 0 {
 		return
 	}
 	if g.shouldDebounce(PriceJump, f.TokenID, g.debounceWindow()) {
 		return
 	}
 	g.emitEvent(MarketEvent{
-		Type:      PriceJump, // strategy-compatible
+		Type:      PriceJump,
 		TokenID:   f.TokenID,
 		Timestamp: f.TS,
+
+		OldValue: f.Mid1mAgo,
+		NewValue: f.MidNow,
+		HasOld:   f.Mid1mAgo > 0,
+		HasNew:   f.MidNow > 0,
+
 		Metadata: map[string]interface{}{
 			"zscore_5m":  f.ZScore5m,
 			"spread_bps": f.SpreadBps,
@@ -112,13 +118,21 @@ func (g *Gatherer) detectMeanRevertHint(f FeatureUpdate) {
 func (g *Gatherer) emitEvent(event MarketEvent) {
 	g.eventsEmitted++
 
-	// 1) Persist to DB
 	meta, _ := json.Marshal(event.Metadata)
+
+	var oldNull, newNull sql.NullFloat64
+	if event.HasOld {
+		oldNull = sql.NullFloat64{Float64: event.OldValue, Valid: true}
+	}
+	if event.HasNew {
+		newNull = sql.NullFloat64{Float64: event.NewValue, Valid: true}
+	}
+
 	_, err := g.store.RecordMarketEvent(g.ctx, RecordMarketEventParams{
 		TokenID:   event.TokenID,
 		EventType: sql.NullString{String: string(event.Type), Valid: true},
-		OldValue:  sql.NullFloat64{Float64: event.OldValue, Valid: true},
-		NewValue:  sql.NullFloat64{Float64: event.NewValue, Valid: true},
+		OldValue:  oldNull,
+		NewValue:  newNull,
 		Metadata:  pqtype.NullRawMessage{RawMessage: meta, Valid: true},
 	})
 	if err != nil {

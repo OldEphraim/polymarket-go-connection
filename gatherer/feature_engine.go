@@ -101,6 +101,9 @@ func (fe *featureEngine) onQuote(q Quote) {
 	}
 	fe.gcPrices(st, q.TS)
 
+	// record this mid in the rolling window
+	st.lastMid.PushBack(priced{ts: q.TS, mid: q.Mid})
+
 	// update highs/lows every ~15s
 	if q.TS.Sub(st.lastHighLowScan) >= 15*time.Second {
 		st.lastHighLowScan = q.TS
@@ -205,6 +208,14 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 		return
 	}
 
+	// compute mid 1m ago
+	// Reuse the same horizon as your 1m return, with sane default.
+	retH := fe.cfg.Stats.Ret1m
+	if retH <= 0 {
+		retH = time.Minute
+	}
+	mid1mAgo := fe.midAgo(st, retH)
+
 	fu := FeatureUpdate{
 		TokenID: token, TS: ts,
 		Ret1m: ret1m, Ret5m: ret5m,
@@ -212,6 +223,8 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 		Sigma5m: sigma5m, ZScore5m: z5,
 		SpreadBps: spreadBps, SignedFlow1m: sflow1m,
 		BrokeHigh15m: brokeHi, BrokeLow15m: brokeLo,
+		MidNow:   midNow,
+		Mid1mAgo: mid1mAgo,
 		// TimeToResolveH: TODO(poly) — compute if you have resolve timestamp
 	}
 
