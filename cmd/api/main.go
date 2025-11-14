@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/db"
@@ -20,11 +21,37 @@ import (
 	_ "github.com/lib/pq"
 )
 
+type StatsSnapshot struct {
+	ActiveMarkets      int64   `json:"active_markets"`
+	Events24h          int64   `json:"events_24h"`
+	OpenPositions      int64   `json:"open_positions"`
+	TotalPnL           float64 `json:"total_pnl"`
+	Strategies         int64   `json:"strategies_count"`
+	QuotesLagSec       int64   `json:"quotes_lag_sec"`
+	TradesLagSec       int64   `json:"trades_lag_sec"`
+	FeaturesLagSec     int64   `json:"features_lag_sec"`
+	DBSize             string  `json:"db_size"`
+	FeaturesPerMin     int64   `json:"features_per_minute"`
+	IngestQuotesPerMin float64 `json:"ingest_quotes_per_min"`
+	IngestTradesPerMin float64 `json:"ingest_trades_per_min"`
+
+	ApproxQuotesTotal   int64 `json:"approx_quotes_total"`
+	ApproxTradesTotal   int64 `json:"approx_trades_total"`
+	ApproxFeaturesTotal int64 `json:"approx_features_total"`
+
+	WriterQueueDepths map[string]int64 `json:"writer_queue_depths,omitempty"`
+
+	GeneratedAt time.Time `json:"generated_at"` // when this snapshot was computed
+}
+
 type APIServer struct {
 	store  *db.Store
 	db     *sql.DB
 	apiKey string
 	log    *slog.Logger
+
+	statsMu     sync.RWMutex
+	latestStats *StatsSnapshot
 }
 
 // --------- helpers ---------
@@ -94,20 +121,7 @@ func (s *APIServer) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ---------- endpoints ----------
-
-// /api/stats — high-level system & trading stats
-func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := s.reqCtx(r)
-	defer cancel()
-
-	// NOTE:
-	// - For partitioned tables (market_quotes_p*, market_trades_p*, market_features_p*)
-	//   we avoid COUNT(*) / MAX(ts) scans.
-	// - Instead we:
-	//     * use pg_class.reltuples to estimate total rows
-	//     * use poly_partition_span() to get oldest/newest partition boundaries
-	//     * derive per-minute ingest + lag from those spans.
+func (s *APIServer) computeStats(ctx context.Context) (*StatsSnapshot, error) {
 	const q = `
 WITH
   -- Basic, now index-accelerated stats
@@ -229,70 +243,45 @@ SELECT
   (SELECT r FROM realized) + (SELECT unreal FROM open_positions) AS total_pnl,
   (SELECT n FROM strategies_active)                              AS strategies_count,
 
-  -- Approximate lag using newest partition boundary
   COALESCE((SELECT lag_sec FROM quotes_rates),   0)              AS quotes_lag_sec,
   COALESCE((SELECT lag_sec FROM trades_rates),   0)              AS trades_lag_sec,
   COALESCE((SELECT lag_sec FROM features_rates), 0)              AS features_lag_sec,
 
   (SELECT size FROM db_size)                                     AS db_size,
 
-  -- Approximate per-minute rates
   COALESCE((SELECT per_min FROM features_rates), 0)::bigint      AS features_per_minute,
   COALESCE((SELECT per_min FROM quotes_rates),   0)              AS ingest_quotes_per_min,
   COALESCE((SELECT per_min FROM trades_rates),   0)              AS ingest_trades_per_min,
 
-  -- Big brag numbers
   COALESCE((SELECT total FROM quotes_rates),   0)::bigint        AS approx_quotes_total,
   COALESCE((SELECT total FROM trades_rates),   0)::bigint        AS approx_trades_total,
   COALESCE((SELECT total FROM features_rates), 0)::bigint        AS approx_features_total
 ;`
 
-	// Note: JSON field names are kept stable, with a few new ones appended.
-	var out struct {
-		ActiveMarkets      int64   `json:"active_markets"`
-		Events24h          int64   `json:"events_24h"`
-		OpenPositions      int64   `json:"open_positions"`
-		TotalPnL           float64 `json:"total_pnl"`
-		Strategies         int64   `json:"strategies_count"`
-		QuotesLagSec       int64   `json:"quotes_lag_sec"`
-		TradesLagSec       int64   `json:"trades_lag_sec"`
-		FeaturesLagSec     int64   `json:"features_lag_sec"`
-		DBSize             string  `json:"db_size"`
-		FeaturesPerMin     int64   `json:"features_per_minute"`
-		IngestQuotesPerMin float64 `json:"ingest_quotes_per_min"`
-		IngestTradesPerMin float64 `json:"ingest_trades_per_min"`
-
-		ApproxQuotesTotal   int64 `json:"approx_quotes_total"`
-		ApproxTradesTotal   int64 `json:"approx_trades_total"`
-		ApproxFeaturesTotal int64 `json:"approx_features_total"`
-
-		WriterQueueDepths map[string]int64 `json:"writer_queue_depths,omitempty"`
-	}
+	var snap StatsSnapshot
 
 	row := s.db.QueryRowContext(ctx, q)
 	if err := row.Scan(
-		&out.ActiveMarkets,
-		&out.Events24h,
-		&out.OpenPositions,
-		&out.TotalPnL,
-		&out.Strategies,
-		&out.QuotesLagSec,
-		&out.TradesLagSec,
-		&out.FeaturesLagSec,
-		&out.DBSize,
-		&out.FeaturesPerMin,
-		&out.IngestQuotesPerMin,
-		&out.IngestTradesPerMin,
-		&out.ApproxQuotesTotal,
-		&out.ApproxTradesTotal,
-		&out.ApproxFeaturesTotal,
+		&snap.ActiveMarkets,
+		&snap.Events24h,
+		&snap.OpenPositions,
+		&snap.TotalPnL,
+		&snap.Strategies,
+		&snap.QuotesLagSec,
+		&snap.TradesLagSec,
+		&snap.FeaturesLagSec,
+		&snap.DBSize,
+		&snap.FeaturesPerMin,
+		&snap.IngestQuotesPerMin,
+		&snap.IngestTradesPerMin,
+		&snap.ApproxQuotesTotal,
+		&snap.ApproxTradesTotal,
+		&snap.ApproxFeaturesTotal,
 	); err != nil {
-		s.log.Error("getStats", "err", err)
-		http.Error(w, "stats error", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
-	// Optional: fetch writer queue depths from the gatherer’s internal debug endpoint.
+	// Optional: fetch writer queue depths (same logic as before)
 	if base := os.Getenv("GATHERER_DEBUG_URL"); base != "" {
 		reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 		defer cancel()
@@ -309,12 +298,67 @@ SELECT
 			defer resp.Body.Close()
 			var qd map[string]int64
 			if json.NewDecoder(resp.Body).Decode(&qd) == nil {
-				out.WriterQueueDepths = qd
+				snap.WriterQueueDepths = qd
 			}
 		}
 	}
 
-	writeJSON(w, http.StatusOK, out)
+	snap.GeneratedAt = time.Now().UTC()
+	return &snap, nil
+}
+
+func (s *APIServer) refreshStatsOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	snap, err := s.computeStats(ctx)
+	if err != nil {
+		s.log.Error("stats refresh failed", "err", err)
+		return
+	}
+
+	s.statsMu.Lock()
+	s.latestStats = snap
+	s.statsMu.Unlock()
+
+	s.log.Info("stats refreshed",
+		"generated_at", snap.GeneratedAt,
+		"active_markets", snap.ActiveMarkets,
+		"events_24h", snap.Events24h,
+	)
+}
+
+func (s *APIServer) startStatsRefresher(interval time.Duration) {
+	// fire in the background; process exit will stop it
+	go func() {
+		// initial fetch (will take ~30s the first time)
+		s.refreshStatsOnce()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.refreshStatsOnce()
+		}
+	}()
+}
+
+// ---------- endpoints ----------
+
+// /api/stats — high-level system & trading stats (from cached snapshot)
+func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
+	s.statsMu.RLock()
+	snap := s.latestStats
+	s.statsMu.RUnlock()
+
+	if snap == nil {
+		// Still warming up; you can return 503 or a small JSON
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "stats snapshot not ready yet",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // /api/market-events — live event feed
@@ -790,6 +834,8 @@ func main() {
 		apiKey: apiKey,
 		log:    logger,
 	}
+
+	server.startStatsRefresher(10 * time.Minute)
 
 	r := mux.NewRouter()
 
