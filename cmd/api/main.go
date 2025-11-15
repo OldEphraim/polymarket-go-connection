@@ -378,9 +378,11 @@ SELECT
   me.new_value,
   me.detected_at,
   COALESCE(ms.question, me.token_id) AS question,
+  m.outcome,
   me.metadata
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
+LEFT JOIN markets m       ON me.token_id = m.token_id
 `
 
 	where := []string{}
@@ -443,8 +445,10 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 		NewValue   *float64               `json:"new_value,omitempty"`
 		DetectedAt time.Time              `json:"detected_at"`
 		Question   string                 `json:"question"`
+		Outcome    string                 `json:"outcome,omitempty"`
 		Metadata   map[string]interface{} `json:"metadata,omitempty"`
 	}
+
 	out := make([]ev, 0, limit)
 
 	for rows.Next() {
@@ -452,6 +456,7 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 		var evType sql.NullString
 		var oldV, newV sql.NullFloat64
 		var qn sql.NullString
+		var outcome sql.NullString
 		var raw json.RawMessage
 
 		if err := rows.Scan(
@@ -461,12 +466,16 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 			&newV,
 			&e.DetectedAt,
 			&qn,
+			&outcome,
 			&raw,
 		); err != nil {
+			// You might want to log this instead of silently skipping
+			s.log.Error("getMarketEvents scan", "err", err)
 			continue
 		}
 
 		e.EventType = evType.String
+
 		if oldV.Valid {
 			val := oldV.Float64
 			e.OldValue = &val
@@ -480,6 +489,11 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 		} else {
 			e.Question = e.TokenID
 		}
+
+		if outcome.Valid {
+			e.Outcome = outcome.String
+		}
+
 		if len(raw) > 0 {
 			_ = json.Unmarshal(raw, &e.Metadata)
 		}
