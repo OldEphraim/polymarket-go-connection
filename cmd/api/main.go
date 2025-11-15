@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -389,7 +388,7 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 
 	limit, offset := parseLimitOffset(r, 100)
 
-	// hours window
+	// Time window in hours
 	hours := atoiDefault(r.URL.Query().Get("hours"), 1)
 	if hours < 1 || hours > 168 {
 		hours = 1
@@ -407,12 +406,17 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// We’ll branch into a few simple query shapes instead of
+	// trying to build one giant dynamic query.
 	var (
-		args []any
-		sb   strings.Builder
+		query string
+		args  []any
 	)
 
-	sb.WriteString(`
+	switch {
+	case evType != "" && minRet > 0:
+		// Filter by type AND abs(ret_1m) >= minRet
+		query = `
 SELECT
   me.token_id,
   me.event_type,
@@ -424,38 +428,67 @@ SELECT
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
-`)
+  AND me.event_type = $4
+  AND ABS(COALESCE((me.metadata->>'ret_1m')::float8, 0)) >= $5
+ORDER BY me.detected_at DESC
+LIMIT $1 OFFSET $2;
+`
+		args = []any{
+			limit,
+			offset,
+			strconv.Itoa(hours),
+			evType,
+			minRet,
+		}
 
-	// Base args: limit, offset, hours
-	args = append(args, limit, offset, strconv.Itoa(hours))
+	case evType != "" && minRet <= 0:
+		// Filter by type only
+		query = `
+SELECT
+  me.token_id,
+  me.event_type,
+  me.old_value,
+  me.new_value,
+  me.detected_at,
+  COALESCE(ms.question, me.token_id) AS question,
+  me.metadata
+FROM market_events me
+LEFT JOIN market_scans ms ON me.token_id = ms.token_id
+WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
+  AND me.event_type = $4
+ORDER BY me.detected_at DESC
+LIMIT $1 OFFSET $2;
+`
+		args = []any{
+			limit,
+			offset,
+			strconv.Itoa(hours),
+			evType,
+		}
 
-	// Filter by type if provided
-	if evType != "" {
-		sb.WriteString("  AND me.event_type = $4\n")
-		args = append(args, evType)
+	default:
+		// No type filter; legacy behaviour
+		query = `
+SELECT
+  me.token_id,
+  me.event_type,
+  me.old_value,
+  me.new_value,
+  me.detected_at,
+  COALESCE(ms.question, me.token_id) AS question,
+  me.metadata
+FROM market_events me
+LEFT JOIN market_scans ms ON me.token_id = ms.token_id
+WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
+ORDER BY me.detected_at DESC
+LIMIT $1 OFFSET $2;
+`
+		args = []any{
+			limit,
+			offset,
+			strconv.Itoa(hours),
+		}
 	}
-
-	// If min_ret is provided and we're looking at price jump-ish events,
-	// filter on abs(ret_1m) in metadata when possible.
-	// (This assumes you stored ret_1m in JSON metadata.)
-	if minRet > 0 {
-		// Next argument index
-		argIdx := len(args) + 1
-
-		// We use COALESCE to treat missing ret_1m as 0.
-		sb.WriteString(fmt.Sprintf(
-			"  AND COALESCE( (me.metadata->>'ret_1m')::float8, 0 ) >= %s OR\n"+
-				"      COALESCE( (me.metadata->>'ret_1m')::float8, 0 ) <= -%s\n",
-			fmt.Sprintf("$%d", argIdx),
-			fmt.Sprintf("$%d", argIdx),
-		))
-		args = append(args, minRet)
-	}
-
-	sb.WriteString("ORDER BY me.detected_at DESC\n")
-	sb.WriteString("LIMIT $1 OFFSET $2;")
-
-	query := sb.String()
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
