@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -48,6 +49,13 @@ type APIServer struct {
 
 	statsMu     sync.RWMutex
 	latestStats *StatsResponse
+}
+
+type StreamLagSnapshot struct {
+	QuotesLagSec   float64   `json:"quotes_lag_sec"`
+	TradesLagSec   float64   `json:"trades_lag_sec"`
+	FeaturesLagSec float64   `json:"features_lag_sec"`
+	GeneratedAt    time.Time `json:"generated_at"`
 }
 
 // --------- helpers ---------
@@ -251,36 +259,12 @@ WITH
     CROSS JOIN features_span s
   ),
 
-  -- True lag from the underlying tables (last day of data)
-  quotes_lag AS (
-    SELECT
-      GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
-    FROM market_quotes
-    WHERE ts > now() - interval '1 day'
-  ),
-  trades_lag AS (
-    SELECT
-      GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
-    FROM market_trades
-    WHERE ts > now() - interval '1 day'
-  ),
-  features_lag AS (
-    SELECT
-      GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
-    FROM market_features
-    WHERE ts > now() - interval '1 day'
-  )
-
 SELECT
   (SELECT n FROM active_markets)                                 AS active_markets,
   (SELECT n FROM events_24h)                                     AS events_24h,
   (SELECT n FROM open_positions)                                 AS open_positions,
   (SELECT r FROM realized) + (SELECT unreal FROM open_positions) AS total_pnl,
   (SELECT n FROM strategies_active)                              AS strategies_count,
-
-  COALESCE((SELECT lag_sec FROM quotes_lag),   0)                AS quotes_lag_sec,
-  COALESCE((SELECT lag_sec FROM trades_lag),   0)                AS trades_lag_sec,
-  COALESCE((SELECT lag_sec FROM features_lag), 0)                AS features_lag_sec,
 
   (SELECT size FROM db_size)                                     AS db_size,
 
@@ -305,9 +289,6 @@ SELECT
 		&res.OpenPositions,
 		&res.TotalPnL,
 		&res.StrategiesCount,
-		&res.QuotesLagSec,
-		&res.TradesLagSec,
-		&res.FeaturesLagSec,
 		&res.DBSize,
 		&res.FeaturesPerMinute,
 		&res.IngestQuotesPerMin,
@@ -382,22 +363,13 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	q := r.URL.Query()
-
 	limit, offset := parseLimitOffset(r, 100)
-	hours := atoiDefault(q.Get("hours"), 1)
-	if hours < 1 || hours > 168 {
-		hours = 1
-	}
 
+	q := r.URL.Query()
+	hours := atoiDefault(q.Get("hours"), 0) // 0 = no time window
 	eventType := q.Get("type")
-	minRet := parseFloatDefault(q.Get("min_ret"), 0.05)
-	if minRet < 0 {
-		minRet = -minRet
-	}
+	minRet := parseFloatDefault(q.Get("min_ret"), 0) // 0 = no min filter
 
-	// Base query: last N hours, newest first.
-	// $1 = limit, $2 = offset, $3 = hours, optionally $4 = min_ret.
 	base := `
 SELECT
   me.token_id,
@@ -409,44 +381,52 @@ SELECT
   me.metadata
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
-WHERE me.detected_at > now() - ($3::text || ' hours')::interval
 `
 
-	args := []any{limit, offset, strconv.Itoa(hours)}
+	where := []string{}
+	args := []any{limit, offset}
+	argIdx := 3
 
-	switch eventType {
-	case "new_market":
-		// Only new market listings
-		base += `
-  AND me.event_type = 'new_market'
-`
-	case "price_jump":
-		// "Price jumps" are actually state_extreme events with a big 1-minute move.
-		// We use either metadata.ret_1m (fractional return) or the old/new price change.
-		base += `
-  AND me.event_type = 'state_extreme'
-  AND (
-    (
-      me.metadata->>'ret_1m' IS NOT NULL
-      AND abs((me.metadata->>'ret_1m')::double precision) >= $4
-    )
-    OR (
-      me.old_value IS NOT NULL
-      AND me.new_value IS NOT NULL
-      AND me.old_value > 0
-      AND abs((me.new_value - me.old_value) / me.old_value) >= $4
-    )
-  )
-`
-		args = append(args, minRet) // $4
-	default:
-		// "all" or empty: no extra filter, keep everything in the last N hours
+	// Optional time window: ONLY applied if hours > 0
+	if hours > 0 {
+		where = append(where,
+			fmt.Sprintf("me.detected_at > now() - ($%d::text || ' hours')::interval", argIdx),
+		)
+		args = append(args, strconv.Itoa(hours))
+		argIdx++
 	}
 
-	base += `
-ORDER BY me.detected_at DESC
-LIMIT $1 OFFSET $2;
-`
+	// Optional event_type filter
+	if eventType != "" {
+		where = append(where,
+			fmt.Sprintf("me.event_type = $%d", argIdx),
+		)
+		args = append(args, eventType)
+		argIdx++
+	}
+
+	// Optional "big move" filter for state_extreme (our price-jump proxy)
+	if eventType == "state_extreme" && minRet > 0 {
+		where = append(where, fmt.Sprintf(`
+(
+  (me.metadata->>'ret_1m' IS NOT NULL
+   AND abs((me.metadata->>'ret_1m')::double precision) >= $%d)
+  OR
+  (me.old_value IS NOT NULL
+   AND me.new_value IS NOT NULL
+   AND me.old_value > 0
+   AND abs((me.new_value - me.old_value) / me.old_value) >= $%d)
+)
+`, argIdx, argIdx))
+		args = append(args, minRet)
+		argIdx++
+	}
+
+	if len(where) > 0 {
+		base += "WHERE " + strings.Join(where, " AND ") + "\n"
+	}
+
+	base += "ORDER BY me.detected_at DESC\nLIMIT $1 OFFSET $2;"
 
 	rows, err := s.db.QueryContext(ctx, base, args...)
 	if err != nil {
@@ -457,13 +437,13 @@ LIMIT $1 OFFSET $2;
 	defer rows.Close()
 
 	type ev struct {
-		TokenID    string         `json:"token_id"`
-		EventType  string         `json:"event_type"`
-		OldValue   *float64       `json:"old_value,omitempty"`
-		NewValue   *float64       `json:"new_value,omitempty"`
-		DetectedAt time.Time      `json:"detected_at"`
-		Question   string         `json:"question"`
-		Metadata   map[string]any `json:"metadata,omitempty"`
+		TokenID    string                 `json:"token_id"`
+		EventType  string                 `json:"event_type"`
+		OldValue   *float64               `json:"old_value,omitempty"`
+		NewValue   *float64               `json:"new_value,omitempty"`
+		DetectedAt time.Time              `json:"detected_at"`
+		Question   string                 `json:"question"`
+		Metadata   map[string]interface{} `json:"metadata,omitempty"`
 	}
 	out := make([]ev, 0, limit)
 
@@ -483,12 +463,10 @@ LIMIT $1 OFFSET $2;
 			&qn,
 			&raw,
 		); err != nil {
-			s.log.Error("getMarketEvents scan", "err", err)
 			continue
 		}
 
 		e.EventType = evType.String
-
 		if oldV.Valid {
 			val := oldV.Float64
 			e.OldValue = &val
@@ -502,16 +480,11 @@ LIMIT $1 OFFSET $2;
 		} else {
 			e.Question = e.TokenID
 		}
-
-		if len(raw) > 0 && string(raw) != "null" {
+		if len(raw) > 0 {
 			_ = json.Unmarshal(raw, &e.Metadata)
 		}
 
 		out = append(out, e)
-	}
-
-	if err := rows.Err(); err != nil {
-		s.log.Error("getMarketEvents rows", "err", err)
 	}
 
 	writeJSON(w, http.StatusOK, out)
@@ -879,6 +852,57 @@ COALESCE(
 	writeJSON(w, http.StatusOK, out)
 }
 
+// /api/stream-lag — measures how much the system is lagging
+func (s *APIServer) getStreamLag(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.reqCtx(r)
+	defer cancel()
+
+	queryLag := func(table string) (float64, error) {
+		q := fmt.Sprintf(`
+			SELECT GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
+			FROM %s
+			WHERE ts > now() - interval '1 day';
+		`, table)
+
+		var lagSec float64
+		row := s.db.QueryRowContext(ctx, q)
+		if err := row.Scan(&lagSec); err != nil {
+			return 0, err
+		}
+		return lagSec, nil
+	}
+
+	quotesLag, err := queryLag("market_quotes")
+	if err != nil {
+		s.log.Error("streamLag quotes", "err", err)
+		writeErr(w, http.StatusInternalServerError, "lag query failed")
+		return
+	}
+
+	tradesLag, err := queryLag("market_trades")
+	if err != nil {
+		s.log.Error("streamLag trades", "err", err)
+		writeErr(w, http.StatusInternalServerError, "lag query failed")
+		return
+	}
+
+	featuresLag, err := queryLag("market_features")
+	if err != nil {
+		s.log.Error("streamLag features", "err", err)
+		writeErr(w, http.StatusInternalServerError, "lag query failed")
+		return
+	}
+
+	snap := StreamLagSnapshot{
+		QuotesLagSec:   quotesLag,
+		TradesLagSec:   tradesLag,
+		FeaturesLagSec: featuresLag,
+		GeneratedAt:    time.Now().UTC(),
+	}
+
+	writeJSON(w, http.StatusOK, snap)
+}
+
 // --------- main ---------
 
 func main() {
@@ -927,6 +951,7 @@ func main() {
 	// Protected (frontend)
 	r.HandleFunc("/api/stats", server.authenticate(server.getStats)).Methods("GET")
 	r.HandleFunc("/api/market-events", server.authenticate(server.getMarketEvents)).Methods("GET")
+	r.HandleFunc("/api/stream-lag", server.authenticate(server.getStreamLag)).Methods("GET")
 	r.HandleFunc("/api/fills", server.authenticate(server.getFills)).Methods("GET")
 
 	// Strategy lists & details
