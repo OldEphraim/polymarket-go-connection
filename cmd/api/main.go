@@ -21,27 +21,23 @@ import (
 	_ "github.com/lib/pq"
 )
 
-type StatsSnapshot struct {
-	ActiveMarkets      int64   `json:"active_markets"`
-	Events24h          int64   `json:"events_24h"`
-	OpenPositions      int64   `json:"open_positions"`
-	TotalPnL           float64 `json:"total_pnl"`
-	Strategies         int64   `json:"strategies_count"`
-	QuotesLagSec       int64   `json:"quotes_lag_sec"`
-	TradesLagSec       int64   `json:"trades_lag_sec"`
-	FeaturesLagSec     int64   `json:"features_lag_sec"`
-	DBSize             string  `json:"db_size"`
-	FeaturesPerMin     int64   `json:"features_per_minute"`
-	IngestQuotesPerMin float64 `json:"ingest_quotes_per_min"`
-	IngestTradesPerMin float64 `json:"ingest_trades_per_min"`
-
-	ApproxQuotesTotal   int64 `json:"approx_quotes_total"`
-	ApproxTradesTotal   int64 `json:"approx_trades_total"`
-	ApproxFeaturesTotal int64 `json:"approx_features_total"`
-
-	WriterQueueDepths map[string]int64 `json:"writer_queue_depths,omitempty"`
-
-	GeneratedAt time.Time `json:"generated_at"` // when this snapshot was computed
+type StatsResponse struct {
+	ActiveMarkets       int64     `json:"active_markets"`
+	Events24h           int64     `json:"events_24h"`
+	OpenPositions       int64     `json:"open_positions"`
+	TotalPnL            float64   `json:"total_pnl"`
+	StrategiesCount     int64     `json:"strategies_count"`
+	QuotesLagSec        float64   `json:"quotes_lag_sec"`
+	TradesLagSec        float64   `json:"trades_lag_sec"`
+	FeaturesLagSec      float64   `json:"features_lag_sec"`
+	DBSize              string    `json:"db_size"`
+	FeaturesPerMinute   int64     `json:"features_per_minute"`
+	IngestQuotesPerMin  float64   `json:"ingest_quotes_per_min"`
+	IngestTradesPerMin  float64   `json:"ingest_trades_per_min"`
+	ApproxQuotesTotal   int64     `json:"approx_quotes_total"`
+	ApproxTradesTotal   int64     `json:"approx_trades_total"`
+	ApproxFeaturesTotal int64     `json:"approx_features_total"`
+	GeneratedAt         time.Time `json:"generated_at"`
 }
 
 type APIServer struct {
@@ -51,7 +47,7 @@ type APIServer struct {
 	log    *slog.Logger
 
 	statsMu     sync.RWMutex
-	latestStats *StatsSnapshot
+	latestStats *StatsResponse
 }
 
 // --------- helpers ---------
@@ -121,7 +117,23 @@ func (s *APIServer) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *APIServer) computeStats(ctx context.Context) (*StatsSnapshot, error) {
+// parseFloatDefault returns the parsed float64 value if possible,
+// otherwise it returns def.
+func parseFloatDefault(s string, def float64) float64 {
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// computeStats runs one big SQL query and caches the result in memory.
+// Even if this takes a few seconds, it's fine: call it periodically from
+// a goroutine and serve the cached value under /api/stats.
+func (s *APIServer) computeStats(ctx context.Context) (*StatsResponse, error) {
 	const q = `
 WITH
   -- Basic, now index-accelerated stats
@@ -183,9 +195,7 @@ WITH
     SELECT * FROM poly_partition_span('market_features_p%')
   ),
 
-  -- Approximate per-minute ingest + lag from partition spans.
-  -- Per-minute is total / min(span_minutes, 60), so it roughly reflects
-  -- the last ~hour rather than the entire history.
+  -- Approximate per-minute ingest from partition spans.
   quotes_rates AS (
     SELECT
       q.n AS total,
@@ -200,12 +210,7 @@ WITH
           ),
           1.0
         )
-      END AS per_min,
-      CASE
-        WHEN s.newest_partition IS NULL
-        THEN 0::float8
-        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition)), 0)
-      END AS lag_sec
+      END AS per_min
     FROM quotes_est q
     CROSS JOIN quotes_span s
   ),
@@ -223,12 +228,7 @@ WITH
           ),
           1.0
         )
-      END AS per_min,
-      CASE
-        WHEN s.newest_partition IS NULL
-        THEN 0::float8
-        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition)), 0)
-      END AS lag_sec
+      END AS per_min
     FROM trades_est q
     CROSS JOIN trades_span s
   ),
@@ -246,14 +246,29 @@ WITH
           ),
           1.0
         )
-      END AS per_min,
-      CASE
-        WHEN s.newest_partition IS NULL
-        THEN 0::float8
-        ELSE GREATEST(EXTRACT(EPOCH FROM (NOW() - s.newest_partition)), 0)
-      END AS lag_sec
+      END AS per_min
     FROM features_est q
     CROSS JOIN features_span s
+  ),
+
+  -- True lag from the underlying tables (last day of data)
+  quotes_lag AS (
+    SELECT
+      GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
+    FROM market_quotes
+    WHERE ts > now() - interval '1 day'
+  ),
+  trades_lag AS (
+    SELECT
+      GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
+    FROM market_trades
+    WHERE ts > now() - interval '1 day'
+  ),
+  features_lag AS (
+    SELECT
+      GREATEST(EXTRACT(EPOCH FROM (now() - max(ts))), 0) AS lag_sec
+    FROM market_features
+    WHERE ts > now() - interval '1 day'
   )
 
 SELECT
@@ -263,9 +278,9 @@ SELECT
   (SELECT r FROM realized) + (SELECT unreal FROM open_positions) AS total_pnl,
   (SELECT n FROM strategies_active)                              AS strategies_count,
 
-  COALESCE((SELECT lag_sec FROM quotes_rates),   0)              AS quotes_lag_sec,
-  COALESCE((SELECT lag_sec FROM trades_rates),   0)              AS trades_lag_sec,
-  COALESCE((SELECT lag_sec FROM features_rates), 0)              AS features_lag_sec,
+  COALESCE((SELECT lag_sec FROM quotes_lag),   0)                AS quotes_lag_sec,
+  COALESCE((SELECT lag_sec FROM trades_lag),   0)                AS trades_lag_sec,
+  COALESCE((SELECT lag_sec FROM features_lag), 0)                AS features_lag_sec,
 
   (SELECT size FROM db_size)                                     AS db_size,
 
@@ -275,56 +290,37 @@ SELECT
 
   COALESCE((SELECT total FROM quotes_rates),   0)::bigint        AS approx_quotes_total,
   COALESCE((SELECT total FROM trades_rates),   0)::bigint        AS approx_trades_total,
-  COALESCE((SELECT total FROM features_rates), 0)::bigint        AS approx_features_total
-;`
+  COALESCE((SELECT total FROM features_rates), 0)::bigint        AS approx_features_total,
 
-	var snap StatsSnapshot
+  now()                                                          AS generated_at
+;
+`
 
 	row := s.db.QueryRowContext(ctx, q)
+
+	var res StatsResponse
 	if err := row.Scan(
-		&snap.ActiveMarkets,
-		&snap.Events24h,
-		&snap.OpenPositions,
-		&snap.TotalPnL,
-		&snap.Strategies,
-		&snap.QuotesLagSec,
-		&snap.TradesLagSec,
-		&snap.FeaturesLagSec,
-		&snap.DBSize,
-		&snap.FeaturesPerMin,
-		&snap.IngestQuotesPerMin,
-		&snap.IngestTradesPerMin,
-		&snap.ApproxQuotesTotal,
-		&snap.ApproxTradesTotal,
-		&snap.ApproxFeaturesTotal,
+		&res.ActiveMarkets,
+		&res.Events24h,
+		&res.OpenPositions,
+		&res.TotalPnL,
+		&res.StrategiesCount,
+		&res.QuotesLagSec,
+		&res.TradesLagSec,
+		&res.FeaturesLagSec,
+		&res.DBSize,
+		&res.FeaturesPerMinute,
+		&res.IngestQuotesPerMin,
+		&res.IngestTradesPerMin,
+		&res.ApproxQuotesTotal,
+		&res.ApproxTradesTotal,
+		&res.ApproxFeaturesTotal,
+		&res.GeneratedAt,
 	); err != nil {
 		return nil, err
 	}
 
-	// Optional: fetch writer queue depths (same logic as before)
-	if base := os.Getenv("GATHERER_DEBUG_URL"); base != "" {
-		reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
-		defer cancel()
-
-		req, _ := http.NewRequestWithContext(
-			reqCtx,
-			http.MethodGet,
-			strings.TrimRight(base, "/")+"/debug/queues",
-			nil,
-		)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil && resp != nil && resp.Body != nil {
-			defer resp.Body.Close()
-			var qd map[string]int64
-			if json.NewDecoder(resp.Body).Decode(&qd) == nil {
-				snap.WriterQueueDepths = qd
-			}
-		}
-	}
-
-	snap.GeneratedAt = time.Now().UTC()
-	return &snap, nil
+	return &res, nil
 }
 
 func (s *APIServer) refreshStatsOnce() {
@@ -381,42 +377,28 @@ func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snap)
 }
 
-// /api/market-events — live event feed with basic filters
+// /api/market-events — live event feed
 func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	limit, offset := parseLimitOffset(r, 100)
+	q := r.URL.Query()
 
-	// Time window in hours
-	hours := atoiDefault(r.URL.Query().Get("hours"), 1)
+	limit, offset := parseLimitOffset(r, 100)
+	hours := atoiDefault(q.Get("hours"), 1)
 	if hours < 1 || hours > 168 {
 		hours = 1
 	}
 
-	// Optional type filter: "new_market", "price_jump", etc.
-	evType := strings.TrimSpace(r.URL.Query().Get("type"))
-
-	// Optional minimum absolute return (for price_jump style events)
-	minRetStr := r.URL.Query().Get("min_ret")
-	minRet := 0.0
-	if minRetStr != "" {
-		if v, err := strconv.ParseFloat(minRetStr, 64); err == nil && v > 0 {
-			minRet = v
-		}
+	eventType := q.Get("type")
+	minRet := parseFloatDefault(q.Get("min_ret"), 0.05)
+	if minRet < 0 {
+		minRet = -minRet
 	}
 
-	// We’ll branch into a few simple query shapes instead of
-	// trying to build one giant dynamic query.
-	var (
-		query string
-		args  []any
-	)
-
-	switch {
-	case evType != "" && minRet > 0:
-		// Filter by type AND abs(ret_1m) >= minRet
-		query = `
+	// Base query: last N hours, newest first.
+	// $1 = limit, $2 = offset, $3 = hours, optionally $4 = min_ret.
+	base := `
 SELECT
   me.token_id,
   me.event_type,
@@ -427,85 +409,61 @@ SELECT
   me.metadata
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
-WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
-  AND me.event_type = $4
-  AND ABS(COALESCE((me.metadata->>'ret_1m')::float8, 0)) >= $5
-ORDER BY me.detected_at DESC
-LIMIT $1 OFFSET $2;
+WHERE me.detected_at > now() - ($3::text || ' hours')::interval
 `
-		args = []any{
-			limit,
-			offset,
-			strconv.Itoa(hours),
-			evType,
-			minRet,
-		}
 
-	case evType != "" && minRet <= 0:
-		// Filter by type only
-		query = `
-SELECT
-  me.token_id,
-  me.event_type,
-  me.old_value,
-  me.new_value,
-  me.detected_at,
-  COALESCE(ms.question, me.token_id) AS question,
-  me.metadata
-FROM market_events me
-LEFT JOIN market_scans ms ON me.token_id = ms.token_id
-WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
-  AND me.event_type = $4
-ORDER BY me.detected_at DESC
-LIMIT $1 OFFSET $2;
+	args := []any{limit, offset, strconv.Itoa(hours)}
+
+	switch eventType {
+	case "new_market":
+		// Only new market listings
+		base += `
+  AND me.event_type = 'new_market'
 `
-		args = []any{
-			limit,
-			offset,
-			strconv.Itoa(hours),
-			evType,
-		}
-
+	case "price_jump":
+		// "Price jumps" are actually state_extreme events with a big 1-minute move.
+		// We use either metadata.ret_1m (fractional return) or the old/new price change.
+		base += `
+  AND me.event_type = 'state_extreme'
+  AND (
+    (
+      me.metadata->>'ret_1m' IS NOT NULL
+      AND abs((me.metadata->>'ret_1m')::double precision) >= $4
+    )
+    OR (
+      me.old_value IS NOT NULL
+      AND me.new_value IS NOT NULL
+      AND me.old_value > 0
+      AND abs((me.new_value - me.old_value) / me.old_value) >= $4
+    )
+  )
+`
+		args = append(args, minRet) // $4
 	default:
-		// No type filter; legacy behaviour
-		query = `
-SELECT
-  me.token_id,
-  me.event_type,
-  me.old_value,
-  me.new_value,
-  me.detected_at,
-  COALESCE(ms.question, me.token_id) AS question,
-  me.metadata
-FROM market_events me
-LEFT JOIN market_scans ms ON me.token_id = ms.token_id
-WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
+		// "all" or empty: no extra filter, keep everything in the last N hours
+	}
+
+	base += `
 ORDER BY me.detected_at DESC
 LIMIT $1 OFFSET $2;
 `
-		args = []any{
-			limit,
-			offset,
-			strconv.Itoa(hours),
-		}
-	}
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, base, args...)
 	if err != nil {
-		s.log.Error("getMarketEvents", "err", err, "query", query)
+		s.log.Error("getMarketEvents", "err", err)
 		writeErr(w, http.StatusInternalServerError, "query failed")
 		return
 	}
 	defer rows.Close()
 
 	type ev struct {
-		TokenID    string                 `json:"token_id"`
-		EventType  string                 `json:"event_type"`
-		OldValue   *float64               `json:"old_value,omitempty"`
-		NewValue   *float64               `json:"new_value,omitempty"`
-		DetectedAt time.Time              `json:"detected_at"`
-		Question   string                 `json:"question"`
-		Metadata   map[string]interface{} `json:"metadata,omitempty"`
+		TokenID    string         `json:"token_id"`
+		EventType  string         `json:"event_type"`
+		OldValue   *float64       `json:"old_value,omitempty"`
+		NewValue   *float64       `json:"new_value,omitempty"`
+		DetectedAt time.Time      `json:"detected_at"`
+		Question   string         `json:"question"`
+		Metadata   map[string]any `json:"metadata,omitempty"`
 	}
 	out := make([]ev, 0, limit)
 
@@ -525,7 +483,7 @@ LIMIT $1 OFFSET $2;
 			&qn,
 			&raw,
 		); err != nil {
-			s.log.Error("scan market_events row", "err", err)
+			s.log.Error("getMarketEvents scan", "err", err)
 			continue
 		}
 
@@ -544,11 +502,16 @@ LIMIT $1 OFFSET $2;
 		} else {
 			e.Question = e.TokenID
 		}
-		if len(raw) > 0 {
+
+		if len(raw) > 0 && string(raw) != "null" {
 			_ = json.Unmarshal(raw, &e.Metadata)
 		}
 
 		out = append(out, e)
+	}
+
+	if err := rows.Err(); err != nil {
+		s.log.Error("getMarketEvents rows", "err", err)
 	}
 
 	writeJSON(w, http.StatusOK, out)
