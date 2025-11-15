@@ -257,7 +257,7 @@ WITH
       END AS per_min
     FROM features_est q
     CROSS JOIN features_span s
-  ),
+  )
 
 SELECT
   (SELECT n FROM active_markets)                                 AS active_markets,
