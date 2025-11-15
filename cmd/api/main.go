@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -381,31 +382,37 @@ func (s *APIServer) getStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snap)
 }
 
-// /api/market-events — live event feed
+// /api/market-events — live event feed with basic filters
 func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
 	limit, offset := parseLimitOffset(r, 100)
 
-	// hours lookback (1–168, default 1)
+	// hours window
 	hours := atoiDefault(r.URL.Query().Get("hours"), 1)
 	if hours < 1 || hours > 168 {
 		hours = 1
 	}
 
-	// Optional filters
-	qv := r.URL.Query()
-	eventType := qv.Get("type") // "", "new_market", "price_jump", "state_extreme", etc.
+	// Optional type filter: "new_market", "price_jump", etc.
+	evType := strings.TrimSpace(r.URL.Query().Get("type"))
 
+	// Optional minimum absolute return (for price_jump style events)
+	minRetStr := r.URL.Query().Get("min_ret")
 	minRet := 0.0
-	if ms := qv.Get("min_ret"); ms != "" {
-		if v, err := strconv.ParseFloat(ms, 64); err == nil && v >= 0 {
+	if minRetStr != "" {
+		if v, err := strconv.ParseFloat(minRetStr, 64); err == nil && v > 0 {
 			minRet = v
 		}
 	}
 
-	const q = `
+	var (
+		args []any
+		sb   strings.Builder
+	)
+
+	sb.WriteString(`
 SELECT
   me.token_id,
   me.event_type,
@@ -416,27 +423,43 @@ SELECT
   me.metadata
 FROM market_events me
 LEFT JOIN market_scans ms ON me.token_id = ms.token_id
-WHERE me.detected_at > now() - ($3::text || ' hours')::interval
-  AND ($4 = '' OR me.event_type = $4)
-  AND (
-    $5::float8 <= 0
-    OR ABS(COALESCE((me.metadata->>'ret_1m')::float8, 0)) >= $5::float8
-  )
-ORDER BY me.detected_at DESC
-LIMIT $1 OFFSET $2;
-`
+WHERE me.detected_at > NOW() - ($3::text || ' hours')::interval
+`)
 
-	rows, err := s.db.QueryContext(
-		ctx,
-		q,
-		limit,
-		offset,
-		strconv.Itoa(hours), // $3
-		eventType,           // $4
-		minRet,              // $5
-	)
+	// Base args: limit, offset, hours
+	args = append(args, limit, offset, strconv.Itoa(hours))
+
+	// Filter by type if provided
+	if evType != "" {
+		sb.WriteString("  AND me.event_type = $4\n")
+		args = append(args, evType)
+	}
+
+	// If min_ret is provided and we're looking at price jump-ish events,
+	// filter on abs(ret_1m) in metadata when possible.
+	// (This assumes you stored ret_1m in JSON metadata.)
+	if minRet > 0 {
+		// Next argument index
+		argIdx := len(args) + 1
+
+		// We use COALESCE to treat missing ret_1m as 0.
+		sb.WriteString(fmt.Sprintf(
+			"  AND COALESCE( (me.metadata->>'ret_1m')::float8, 0 ) >= %s OR\n"+
+				"      COALESCE( (me.metadata->>'ret_1m')::float8, 0 ) <= -%s\n",
+			fmt.Sprintf("$%d", argIdx),
+			fmt.Sprintf("$%d", argIdx),
+		))
+		args = append(args, minRet)
+	}
+
+	sb.WriteString("ORDER BY me.detected_at DESC\n")
+	sb.WriteString("LIMIT $1 OFFSET $2;")
+
+	query := sb.String()
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		s.log.Error("getMarketEvents", "err", err)
+		s.log.Error("getMarketEvents", "err", err, "query", query)
 		writeErr(w, http.StatusInternalServerError, "query failed")
 		return
 	}
@@ -469,7 +492,7 @@ LIMIT $1 OFFSET $2;
 			&qn,
 			&raw,
 		); err != nil {
-			// You were silently continuing before; keeping that behavior.
+			s.log.Error("scan market_events row", "err", err)
 			continue
 		}
 
