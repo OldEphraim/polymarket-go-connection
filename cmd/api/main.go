@@ -370,17 +370,22 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	eventType := q.Get("type")
 	minRet := parseFloatDefault(q.Get("min_ret"), 0) // 0 = no min filter
 
+	// We’ll build the WHERE dynamically like before, but now the whole
+	// SELECT lives in a CTE called "raw", then we dedupe in "dedup".
 	base := `
-SELECT
-  me.token_id,
-  me.event_type,
-  me.old_value,
-  me.new_value,
-  me.detected_at,
-  COALESCE(ms.question, me.token_id) AS question,
-  me.metadata
-FROM market_events me
-LEFT JOIN market_scans ms ON me.token_id = ms.token_id
+WITH raw AS (
+  SELECT
+    me.token_id,
+    me.event_type,
+    me.old_value,
+    me.new_value,
+    me.detected_at,
+    COALESCE(ms.question, me.token_id) AS question,
+    m.outcome,
+    me.metadata
+  FROM market_events me
+  LEFT JOIN market_scans ms ON me.token_id = ms.token_id
+  LEFT JOIN markets     m  ON me.token_id = m.token_id
 `
 
 	where := []string{}
@@ -426,7 +431,35 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 		base += "WHERE " + strings.Join(where, " AND ") + "\n"
 	}
 
-	base += "ORDER BY me.detected_at DESC\nLIMIT $1 OFFSET $2;"
+	// Close raw CTE, add dedup CTE + final select
+	base += `
+),
+dedup AS (
+  SELECT DISTINCT ON (token_id, event_type)
+    token_id,
+    event_type,
+    old_value,
+    new_value,
+    detected_at,
+    question,
+    outcome,
+    metadata
+  FROM raw
+  ORDER BY token_id, event_type, detected_at DESC
+)
+SELECT
+  token_id,
+  event_type,
+  old_value,
+  new_value,
+  detected_at,
+  question,
+  outcome,
+  metadata
+FROM dedup
+ORDER BY detected_at DESC
+LIMIT $1 OFFSET $2;
+`
 
 	rows, err := s.db.QueryContext(ctx, base, args...)
 	if err != nil {
@@ -443,8 +476,10 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 		NewValue   *float64               `json:"new_value,omitempty"`
 		DetectedAt time.Time              `json:"detected_at"`
 		Question   string                 `json:"question"`
+		Outcome    string                 `json:"outcome,omitempty"`
 		Metadata   map[string]interface{} `json:"metadata,omitempty"`
 	}
+
 	out := make([]ev, 0, limit)
 
 	for rows.Next() {
@@ -452,6 +487,7 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 		var evType sql.NullString
 		var oldV, newV sql.NullFloat64
 		var qn sql.NullString
+		var outcome sql.NullString
 		var raw json.RawMessage
 
 		if err := rows.Scan(
@@ -461,12 +497,15 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 			&newV,
 			&e.DetectedAt,
 			&qn,
+			&outcome,
 			&raw,
 		); err != nil {
+			s.log.Error("getMarketEvents scan", "err", err)
 			continue
 		}
 
 		e.EventType = evType.String
+
 		if oldV.Valid {
 			val := oldV.Float64
 			e.OldValue = &val
@@ -479,6 +518,9 @@ LEFT JOIN market_scans ms ON me.token_id = ms.token_id
 			e.Question = qn.String
 		} else {
 			e.Question = e.TokenID
+		}
+		if outcome.Valid {
+			e.Outcome = outcome.String
 		}
 		if len(raw) > 0 {
 			_ = json.Unmarshal(raw, &e.Metadata)
