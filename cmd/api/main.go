@@ -370,19 +370,29 @@ func (s *APIServer) getMarketEvents(w http.ResponseWriter, r *http.Request) {
 	eventType := q.Get("type")
 	minRet := parseFloatDefault(q.Get("min_ret"), 0) // 0 = no min filter
 
+	// We'll build a CTE (ranked) that assigns rn=1 to the "latest"
+	// event for each (token_id, rounded old_value, rounded new_value).
 	base := `
-SELECT
-  me.token_id,
-  me.event_type,
-  me.old_value,
-  me.new_value,
-  me.detected_at,
-  COALESCE(ms.question, me.token_id) AS question,
-  m.outcome,
-  me.metadata
-FROM market_events me
-LEFT JOIN market_scans ms ON me.token_id = ms.token_id
-LEFT JOIN markets m       ON me.token_id = m.token_id
+WITH ranked AS (
+  SELECT
+    me.token_id,
+    me.event_type,
+    me.old_value,
+    me.new_value,
+    me.detected_at,
+    COALESCE(ms.question, me.token_id) AS question,
+    m.outcome,
+    me.metadata,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        me.token_id,
+        round(COALESCE(me.old_value, 0)::numeric, 3),
+        round(COALESCE(me.new_value, 0)::numeric, 3)
+      ORDER BY me.detected_at DESC
+    ) AS rn
+  FROM market_events me
+  LEFT JOIN market_scans ms ON me.token_id = ms.token_id
+  LEFT JOIN markets      m  ON me.token_id = m.token_id
 `
 
 	where := []string{}
@@ -392,7 +402,10 @@ LEFT JOIN markets m       ON me.token_id = m.token_id
 	// Optional time window: ONLY applied if hours > 0
 	if hours > 0 {
 		where = append(where,
-			fmt.Sprintf("me.detected_at > now() - ($%d::text || ' hours')::interval", argIdx),
+			fmt.Sprintf(
+				"me.detected_at > now() - ($%d::text || ' hours')::interval",
+				argIdx,
+			),
 		)
 		args = append(args, strconv.Itoa(hours))
 		argIdx++
@@ -425,10 +438,26 @@ LEFT JOIN markets m       ON me.token_id = m.token_id
 	}
 
 	if len(where) > 0 {
-		base += "WHERE " + strings.Join(where, " AND ") + "\n"
+		base += "  WHERE " + strings.Join(where, " AND ") + "\n"
 	}
 
-	base += "ORDER BY me.detected_at DESC\nLIMIT $1 OFFSET $2;"
+	// Close CTE and select only rn = 1
+	base += `
+)
+SELECT
+  token_id,
+  event_type,
+  old_value,
+  new_value,
+  detected_at,
+  question,
+  outcome,
+  metadata
+FROM ranked
+WHERE rn = 1
+ORDER BY detected_at DESC
+LIMIT $1 OFFSET $2;
+`
 
 	rows, err := s.db.QueryContext(ctx, base, args...)
 	if err != nil {
@@ -469,7 +498,6 @@ LEFT JOIN markets m       ON me.token_id = m.token_id
 			&outcome,
 			&raw,
 		); err != nil {
-			// You might want to log this instead of silently skipping
 			s.log.Error("getMarketEvents scan", "err", err)
 			continue
 		}
