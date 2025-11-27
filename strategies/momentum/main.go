@@ -185,13 +185,25 @@ func main() {
 			}
 
 			// ===== STEP 10: Filter for momentum-eligible events =====
-			if event.Type != gatherer.PriceJump {
+			// Accept both "true jumps" and "state extremes" as candidates.
+			if event.Type != gatherer.PriceJump && event.Type != gatherer.StateExtreme {
 				continue
 			}
 
 			volX, hasVolX := getFloat(event.Metadata, "vol_1m_over_5m")
 			ret1m, hasRet1m := getFloat(event.Metadata, "ret_1m")
 			spreadBps, hasSpread := getFloat(event.Metadata, "spread_bps")
+
+			// If vol_1m_over_5m not explicitly present (older events),
+			// derive it from vol_1m / avg_vol_5m if possible.
+			if !hasVolX {
+				v1, ok1 := getFloat(event.Metadata, "vol_1m")
+				v5, ok5 := getFloat(event.Metadata, "avg_vol_5m")
+				if ok1 && ok5 && v5 > 0 {
+					volX = v1 / v5
+					hasVolX = true
+				}
+			}
 
 			var passes bool
 			var dir string // "YES" for up, "NO" for down

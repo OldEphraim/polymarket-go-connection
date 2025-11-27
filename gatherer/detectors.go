@@ -103,6 +103,12 @@ func (g *Gatherer) detectMeanRevertHint(f FeatureUpdate) {
 		return
 	}
 
+	// Compute vol_1m_over_5m so momentum can use it too
+	volx := 0.0
+	if f.AvgVol5m > 0 {
+		volx = f.Vol1m / f.AvgVol5m
+	}
+
 	g.emitEvent(MarketEvent{
 		Type:      StateExtreme,
 		TokenID:   f.TokenID,
@@ -114,11 +120,12 @@ func (g *Gatherer) detectMeanRevertHint(f FeatureUpdate) {
 		HasNew:   f.MidNow > 0,
 
 		Metadata: map[string]interface{}{
-			"zscore_5m":  f.ZScore5m,
-			"spread_bps": f.SpreadBps,
-			"ret_1m":     f.Ret1m,
-			"vol_1m":     f.Vol1m,
-			"avg_vol_5m": f.AvgVol5m,
+			"zscore_5m":      f.ZScore5m,
+			"spread_bps":     f.SpreadBps,
+			"ret_1m":         f.Ret1m,
+			"vol_1m":         f.Vol1m,
+			"avg_vol_5m":     f.AvgVol5m,
+			"vol_1m_over_5m": volx, // <-- new: momentum can reuse this
 		},
 	})
 }
