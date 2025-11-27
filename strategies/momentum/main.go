@@ -205,32 +205,70 @@ func main() {
 				}
 			}
 
+			z, hasZ := getFloat(event.Metadata, "zscore_5m")
+
 			var passes bool
 			var dir string // "YES" for up, "NO" for down
 
-			if hasVolX && hasRet1m && hasSpread {
-				if int(spreadBps) <= cfg.MaxSpreadBps && volX >= cfg.MinVolSurge && abs(ret1m) >= cfg.MinAbsRet1m {
-					passes = true
-					if ret1m > 0 {
-						dir = "YES"
-					} else {
-						dir = "NO"
+			isJump := event.Type == gatherer.PriceJump
+			isExtreme := event.Type == gatherer.StateExtreme
+
+			switch {
+			case isJump:
+				// Original "burst + flow" momentum logic.
+				if hasVolX && hasRet1m && hasSpread {
+					if int(spreadBps) <= cfg.MaxSpreadBps &&
+						volX >= cfg.MinVolSurge &&
+						abs(ret1m) >= cfg.MinAbsRet1m {
+						passes = true
+						if ret1m > 0 {
+							dir = "YES"
+						} else {
+							dir = "NO"
+						}
+					}
+				} else {
+					percentChange, ok := getFloat(event.Metadata, "percent_change")
+					if ok && (percentChange/100.0) >= cfg.MomentumThreshold {
+						passes = true
+						if percentChange >= 0 {
+							dir = "YES"
+						} else {
+							dir = "NO"
+						}
 					}
 				}
-			} else {
-				percentChange, ok := getFloat(event.Metadata, "percent_change")
-				if ok && (percentChange/100.0) >= cfg.MomentumThreshold {
-					passes = true
-					if percentChange >= 0 {
-						dir = "YES"
-					} else {
-						dir = "NO"
+
+			case isExtreme:
+				// New path: ride strong extremes in the direction of the move.
+				// Looser gates: focus on z-score + spread, *not* on volX.
+				if hasZ && hasSpread {
+					// You can tune these numbers; starting point:
+					if abs(z) >= 3.0 && int(spreadBps) <= cfg.MaxSpreadBps {
+						passes = true
+
+						// Direction: prefer ret1m if non-zero, otherwise use z-score sign.
+						if hasRet1m && ret1m != 0 {
+							if ret1m > 0 {
+								dir = "YES"
+							} else {
+								dir = "NO"
+							}
+						} else {
+							if z > 0 {
+								dir = "YES"
+							} else {
+								dir = "NO"
+							}
+						}
 					}
 				}
 			}
+
 			if !passes {
 				continue
 			}
+
 			momentumHits++
 
 			// ===== STEP 12: Skip if already in position =====
