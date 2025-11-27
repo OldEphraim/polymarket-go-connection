@@ -31,38 +31,34 @@ func (g *Gatherer) detectorLoop() {
 }
 
 func (g *Gatherer) detectMomentum(f FeatureUpdate) {
-	// Basic gates: need some volume and not insane spread
-	if f.AvgVol5m <= 0 || f.Vol1m <= 0 {
+	// Need at least *some* recent volume
+	if f.Vol1m <= 0 {
 		return
 	}
+
+	// Spread sanity check
 	if int(f.SpreadBps) > g.config.Thresholds.MaxSpreadBps {
 		return
 	}
 
-	avg5 := f.AvgVol5m
-	if avg5 <= 0 {
-		return
-	}
-	volx := f.Vol1m / avg5
-	if volx < g.config.Thresholds.VolSurgeMin {
+	// Require at least a 1% 1m move
+	if math.Abs(f.Ret1m) < 0.01 {
 		return
 	}
 
-	// ⚠️ Temporarily do NOT require ImbalanceTop to be strong,
-	// because it's currently always zero.
-	if g.config.Thresholds.ImbMin > 0 && math.Abs(f.ImbalanceTop) > 0 && math.Abs(f.ImbalanceTop) < g.config.Thresholds.ImbMin {
-		return
+	// Soft volume surge: if we *have* a 5m baseline, ask for a mild pickup
+	volx := 1.0
+	if f.AvgVol5m > 0 {
+		volx = f.Vol1m / f.AvgVol5m
+		// Much looser than the old 2.0x requirement
+		if volx < 1.2 {
+			return
+		}
 	}
 
-	// Only enforce sign-consistency when we actually have non-zero flow
-	if f.SignedFlow1m != 0 {
-		if f.Ret1m > 0 && f.SignedFlow1m < 0 {
-			return
-		}
-		if f.Ret1m < 0 && f.SignedFlow1m > 0 {
-			return
-		}
-	}
+	// For now, do NOT gate on ImbalanceTop at all — it's basically unused.
+	// Also, drop SignedFlow sign-consistency for now to avoid silently killing events
+	// while we're just trying to get momentum alive.
 
 	if g.shouldDebounce(PriceJump, f.TokenID, g.debounceWindow()) {
 		return
