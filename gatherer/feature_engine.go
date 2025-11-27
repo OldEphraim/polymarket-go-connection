@@ -2,11 +2,10 @@ package gatherer
 
 import (
 	"container/list"
-	"math"
-	"time"
-
 	"context"
 	"log/slog"
+	"math"
+	"time"
 )
 
 // A small rolling window engine (per token)
@@ -48,19 +47,30 @@ type priced struct {
 	ts  time.Time
 	mid float64
 }
+
 type traded struct {
 	ts     time.Time
 	size   float64
 	signed float64
 } // signed +buy/-sell
 
-func runFeatureEngine(ctx context.Context, log *slog.Logger, cfg *Config, p *Persister,
-	out chan<- FeatureUpdate, quotes <-chan Quote, trades <-chan Trade) {
-
+func runFeatureEngine(
+	ctx context.Context,
+	log *slog.Logger,
+	cfg *Config,
+	p *Persister,
+	out chan<- FeatureUpdate,
+	quotes <-chan Quote,
+	trades <-chan Trade,
+) {
 	fe := &featureEngine{
-		cfg: cfg, log: log, p: p,
-		out: out, quotes: quotes, trades: trades,
-		state: map[string]*rollState{},
+		cfg:    cfg,
+		log:    log,
+		p:      p,
+		out:    out,
+		quotes: quotes,
+		trades: trades,
+		state:  map[string]*rollState{},
 	}
 
 	cadence := cfg.Stats.FeatCadence
@@ -150,13 +160,27 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 		return
 	}
 
-	// compute features
+	// --- compute mids & returns with safe fallbacks on windows ---
+
 	midNow := mid
 	if math.IsNaN(midNow) {
 		midNow = fe.latestMid(st)
 	}
-	ret1m := fe.windowRet(st, fe.cfg.Stats.Ret1m)
-	ret5m := fe.windowRet(st, fe.cfg.Stats.Ret5m)
+
+	// Ensure Ret1m and Ret5m have sane defaults if misconfigured.
+	ret1Window := fe.cfg.Stats.Ret1m
+	if ret1Window <= 0 {
+		ret1Window = time.Minute
+	}
+	ret5Window := fe.cfg.Stats.Ret5m
+	if ret5Window <= 0 {
+		ret5Window = 5 * time.Minute
+	}
+
+	ret1m := fe.windowRet(st, ret1Window)
+	ret5m := fe.windowRet(st, ret5Window)
+
+	// --- volume & sigma windows (same as before, with existing defaults) ---
 
 	w1 := fe.cfg.Stats.Vol1m
 	if w1 <= 0 {
@@ -174,19 +198,27 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 	vol1m, sflow1m := fe.windowVol(st, w1)
 	avgVol5m, _ := fe.windowVol(st, w5)
 
-	// compute sigma over returns, not level diffs
+	// sigma over returns (unchanged helper), but now used consistently
 	sigma5m := fe.windowSigmaRet(st, sigW)
 
 	floor := fe.cfg.Thresholds.SigmaFloor
 	if floor <= 0 {
-		floor = 0.01 // 1¢ default
+		floor = 0.01 // sensible default in "return space"
 	}
 	denom := sigma5m
 	if denom < floor {
 		denom = floor
 	}
 
-	z5 := (midNow - 0.5) / denom
+	// --- NEW: return-based z-score instead of level-based ---
+
+	z5 := 0.0
+	if denom > 0 {
+		// Choose ret1m as the "surprise" we’re scoring.
+		// (You could swap to ret5m here if you want a slower horizon.)
+		z5 = ret1m / denom
+	}
+
 	// clamp to keep hints sane
 	if z5 > 10 {
 		z5 = 10
@@ -208,23 +240,28 @@ func (fe *featureEngine) maybeEmit(token string, ts time.Time, spreadBps, mid fl
 		return
 	}
 
-	// compute mid 1m ago
-	// Reuse the same horizon as your 1m return, with sane default.
-	retH := fe.cfg.Stats.Ret1m
+	// compute mid 1m ago using the same horizon as your 1m return
+	retH := ret1Window
 	if retH <= 0 {
 		retH = time.Minute
 	}
 	mid1mAgo := fe.midAgo(st, retH)
 
 	fu := FeatureUpdate{
-		TokenID: token, TS: ts,
-		Ret1m: ret1m, Ret5m: ret5m,
-		Vol1m: vol1m, AvgVol5m: avgVol5m,
-		Sigma5m: sigma5m, ZScore5m: z5,
-		SpreadBps: spreadBps, SignedFlow1m: sflow1m,
-		BrokeHigh15m: brokeHi, BrokeLow15m: brokeLo,
-		MidNow:   midNow,
-		Mid1mAgo: mid1mAgo,
+		TokenID:      token,
+		TS:           ts,
+		Ret1m:        ret1m,
+		Ret5m:        ret5m,
+		Vol1m:        vol1m,
+		AvgVol5m:     avgVol5m,
+		Sigma5m:      sigma5m,
+		ZScore5m:     z5,
+		SpreadBps:    spreadBps,
+		SignedFlow1m: sflow1m,
+		BrokeHigh15m: brokeHi,
+		BrokeLow15m:  brokeLo,
+		MidNow:       midNow,
+		Mid1mAgo:     mid1mAgo,
 		// TimeToResolveH: TODO(poly) — compute if you have resolve timestamp
 	}
 
