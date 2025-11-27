@@ -31,12 +31,14 @@ func (g *Gatherer) detectorLoop() {
 }
 
 func (g *Gatherer) detectMomentum(f FeatureUpdate) {
+	// Basic gates: need some volume and not insane spread
 	if f.AvgVol5m <= 0 || f.Vol1m <= 0 {
 		return
 	}
 	if int(f.SpreadBps) > g.config.Thresholds.MaxSpreadBps {
 		return
 	}
+
 	avg5 := f.AvgVol5m
 	if avg5 <= 0 {
 		return
@@ -45,14 +47,21 @@ func (g *Gatherer) detectMomentum(f FeatureUpdate) {
 	if volx < g.config.Thresholds.VolSurgeMin {
 		return
 	}
-	if g.config.Thresholds.ImbMin > 0 && math.Abs(f.ImbalanceTop) < g.config.Thresholds.ImbMin {
+
+	// ⚠️ Temporarily do NOT require ImbalanceTop to be strong,
+	// because it's currently always zero.
+	if g.config.Thresholds.ImbMin > 0 && math.Abs(f.ImbalanceTop) > 0 && math.Abs(f.ImbalanceTop) < g.config.Thresholds.ImbMin {
 		return
 	}
-	if f.Ret1m > 0 && (f.SignedFlow1m <= 0 || f.ImbalanceTop <= 0) {
-		return
-	}
-	if f.Ret1m < 0 && (f.SignedFlow1m >= 0 || f.ImbalanceTop >= 0) {
-		return
+
+	// Only enforce sign-consistency when we actually have non-zero flow
+	if f.SignedFlow1m != 0 {
+		if f.Ret1m > 0 && f.SignedFlow1m < 0 {
+			return
+		}
+		if f.Ret1m < 0 && f.SignedFlow1m > 0 {
+			return
+		}
 	}
 
 	if g.shouldDebounce(PriceJump, f.TokenID, g.debounceWindow()) {

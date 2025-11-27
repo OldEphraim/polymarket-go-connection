@@ -57,7 +57,7 @@ func loadConfig(filename string) *MeanReversionConfig {
 		return cfg
 	}
 	if err := json.Unmarshal(data, cfg); err != nil {
-		log.Printf("Error parsing config: %v, using defaults")
+		log.Printf("Error parsing config: %v, using defaults", err)
 	}
 	return cfg
 }
@@ -181,7 +181,7 @@ func main() {
 			}
 
 			// ===== STEP 10: Filter for reversion-eligible events =====
-			if event.Type != gatherer.PriceJump {
+			if event.Type != gatherer.StateExtreme {
 				continue
 			}
 

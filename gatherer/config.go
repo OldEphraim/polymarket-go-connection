@@ -67,17 +67,17 @@ func DefaultConfig() *Config {
 			FeatCadence: 5 * time.Second,
 		},
 		Thresholds: Thresholds{
-			MaxSpreadBps:      120,
-			ZMin:              2.5,
-			VolSurgeMin:       2.0,
-			ImbMin:            0.2,
-			MaxAbsSpread:      0.02, // 2¢
-			MinLiquidity:      50,   // tune for your scale
+			MaxSpreadBps:      150, // a bit looser but still sane
+			ZMin:              2.0, // only used by StateExtreme, makes MR a bit chattier
+			VolSurgeMin:       1.5, // easier to cross than 2.0
+			ImbMin:            0.2, // still fine, currently inert
+			MaxAbsSpread:      0.02,
+			MinLiquidity:      50,
 			DebounceWindow:    30 * time.Second,
-			SigmaFloor:        0.01,            // 1¢
-			PriceJumpMinPct:   0.05,            // 5%
-			PriceJumpMinAbs:   0.01,            // 1¢
-			PriceJumpDebounce: 5 * time.Minute, //
+			SigmaFloor:        0.01,
+			PriceJumpMinPct:   0.05,
+			PriceJumpMinAbs:   0.01,
+			PriceJumpDebounce: 5 * time.Minute,
 		},
 
 		EventQueueSize:   100000,
