@@ -1,6 +1,15 @@
 --
 -- PostgreSQL database dump
 --
+-- To regenerate this file (excluding partition instances and migration leftovers):
+--   pg_dump -U a8garber -d polymarket_dev --schema-only --no-owner --no-privileges \
+--     --exclude-table='market_quotes_p*' \
+--     --exclude-table='market_trades_p*' \
+--     --exclude-table='market_features_p*' \
+--     --exclude-table='market_events_p*' \
+--     --exclude-table='*_old' \
+--     > sql/schemas/schema.sql
+--
 
 \restrict a9GEPzQE1UejqYSJ0aBZr8qHFoycQgoSn8BfA7aOIsoF0AgaU00YVmBxna4UUeb
 
