@@ -43,6 +43,26 @@ type MarketEvent struct {
 	DetectedAt sql.NullTime          `json:"detected_at"`
 }
 
+type MarketEventsOld struct {
+	ID         int32                 `json:"id"`
+	TokenID    string                `json:"token_id"`
+	EventType  sql.NullString        `json:"event_type"`
+	OldValue   sql.NullFloat64       `json:"old_value"`
+	NewValue   sql.NullFloat64       `json:"new_value"`
+	Metadata   pqtype.NullRawMessage `json:"metadata"`
+	DetectedAt sql.NullTime          `json:"detected_at"`
+}
+
+type MarketEventsOldView struct {
+	ID         int32                 `json:"id"`
+	TokenID    string                `json:"token_id"`
+	EventType  sql.NullString        `json:"event_type"`
+	OldValue   sql.NullFloat64       `json:"old_value"`
+	NewValue   sql.NullFloat64       `json:"new_value"`
+	Metadata   pqtype.NullRawMessage `json:"metadata"`
+	DetectedAt sql.NullTime          `json:"detected_at"`
+}
+
 type MarketFeature struct {
 	TokenID        string          `json:"token_id"`
 	Ts             sql.NullTime    `json:"ts"`

@@ -8,6 +8,9 @@ SELECT ensure_trades_partitions_hourly(sqlc.arg(back)::int, sqlc.arg(fwd)::int);
 -- name: EnsureFeaturesPartitionsHourly :exec
 SELECT ensure_features_partitions_hourly(sqlc.arg(back)::int, sqlc.arg(fwd)::int);
 
+-- name: EnsureEventsPartitionsHourly :exec
+SELECT ensure_events_partitions_hourly(sqlc.arg(back)::int, sqlc.arg(fwd)::int);
+
 
 
 -- Windowed deletes (rename param to avoid reserved keyword)
@@ -31,6 +34,10 @@ SELECT drop_archived_market_trades_partitions_hourly(sqlc.arg(keep_hours)::int) 
 
 -- name: DropArchivedMarketFeaturesPartitionsHourly :one
 SELECT drop_archived_market_features_partitions_hourly(sqlc.arg(keep_hours)::int) AS dropped;
+
+-- Drop old market_events partitions (no archive check needed - events are reconstructable)
+-- name: DropOldMarketEventsPartitionsHourly :one
+SELECT drop_old_market_events_partitions_hourly(sqlc.arg(keep_hours)::int) AS dropped;
 
 
 

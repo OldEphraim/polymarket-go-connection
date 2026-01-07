@@ -25,18 +25,19 @@ type TableConfig struct {
 	keepHours       int
 }
 
-func loadDynamicPolicy(defaultWindow, defaultTradesWindow, defaultFeaturesWindow string) (string, string, string, int) {
+func loadDynamicPolicy(defaultWindow, defaultTradesWindow, defaultFeaturesWindow, defaultEventsWindow string) (string, string, string, string, int) {
 	policyFile := "/tmp/retention_policy.json"
 	data, err := os.ReadFile(policyFile)
 	if err != nil {
 		log.Printf("[janitor] Using defaults, no policy file: %v", err)
-		return defaultWindow, defaultTradesWindow, defaultFeaturesWindow, 3000
+		return defaultWindow, defaultTradesWindow, defaultFeaturesWindow, defaultEventsWindow, 3000
 	}
 
 	var policy struct {
 		QuotesHours        float64 `json:"quotes_hours"`
 		TradesHours        float64 `json:"trades_hours"`
 		FeaturesHours      float64 `json:"features_hours"`
+		EventsHours        float64 `json:"events_hours"`
 		EmergencyThreshold int     `json:"emergency_threshold_mb"`
 		JanitorSleepSecs   int     `json:"janitor_sleep_secs"`
 		BacklogQuotesH     float64 `json:"backlog_quotes_h"`
@@ -46,18 +47,22 @@ func loadDynamicPolicy(defaultWindow, defaultTradesWindow, defaultFeaturesWindow
 
 	if err := json.Unmarshal(data, &policy); err != nil {
 		log.Printf("[janitor] Using defaults, bad policy file: %v", err)
-		return defaultWindow, defaultTradesWindow, defaultFeaturesWindow, 3000
+		return defaultWindow, defaultTradesWindow, defaultFeaturesWindow, defaultEventsWindow, 3000
 	}
 
 	quotesWindow := fmt.Sprintf("%.1f hours", policy.QuotesHours)
 	tradesWindow := fmt.Sprintf("%.1f hours", policy.TradesHours)
 	featuresWindow := fmt.Sprintf("%.1f hours", policy.FeaturesHours)
+	eventsWindow := defaultEventsWindow
+	if policy.EventsHours > 0 {
+		eventsWindow = fmt.Sprintf("%.1f hours", policy.EventsHours)
+	}
 
-	log.Printf("[janitor] Loaded dynamic policy: quotes=%s trades=%s features=%s emergency=%dMB sleep=%ds backlog(h): q=%.1f t=%.1f f=%.1f",
-		quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold,
+	log.Printf("[janitor] Loaded dynamic policy: quotes=%s trades=%s features=%s events=%s emergency=%dMB sleep=%ds backlog(h): q=%.1f t=%.1f f=%.1f",
+		quotesWindow, tradesWindow, featuresWindow, eventsWindow, policy.EmergencyThreshold,
 		policy.JanitorSleepSecs, policy.BacklogQuotesH, policy.BacklogTradesH, policy.BacklogFeaturesH)
 
-	return quotesWindow, tradesWindow, featuresWindow, policy.EmergencyThreshold
+	return quotesWindow, tradesWindow, featuresWindow, eventsWindow, policy.EmergencyThreshold
 }
 
 func main() {
@@ -65,7 +70,8 @@ func main() {
 		quotesWindow   = flag.String("quotes_window", "2 hours", "default hot window for quotes")
 		tradesWindow   = flag.String("trades_window", "12 hours", "default hot window for trades")
 		featuresWindow = flag.String("features_window", "6 hours", "default hot window for features")
-		tables         = flag.String("tables", "market_features,market_trades,market_quotes", "comma list of table names")
+		eventsWindow   = flag.String("events_window", "24 hours", "default retention window for events (no archive)")
+		tables         = flag.String("tables", "market_features,market_trades,market_quotes,market_events", "comma list of table names")
 
 		batchQuotes    = flag.Int("batch_quotes", 100000, "delete batch size for quotes in emergency")
 		batchTrades    = flag.Int("batch_trades", 50000, "delete batch size for trades in emergency")
@@ -95,8 +101,8 @@ func main() {
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 
-		dynQuotes, dynTrades, dynFeatures, dynEmergencyMB :=
-			loadDynamicPolicy(*quotesWindow, *tradesWindow, *featuresWindow)
+		dynQuotes, dynTrades, dynFeatures, dynEvents, dynEmergencyMB :=
+			loadDynamicPolicy(*quotesWindow, *tradesWindow, *featuresWindow, *eventsWindow)
 
 		tableConfigs := map[string]*TableConfig{
 			"market_features": {
@@ -116,6 +122,12 @@ func main() {
 				emergencyWindow: dynQuotes,
 				emergencyBatch:  *batchQuotes,
 				keepHours:       int(math.Ceil(parseHours(dynQuotes))),
+			},
+			"market_events": {
+				window:          dynEvents,
+				emergencyWindow: dynEvents,
+				emergencyBatch:  0, // no emergency delete for events
+				keepHours:       int(math.Ceil(parseHours(dynEvents))),
 			},
 		}
 
@@ -171,6 +183,11 @@ func runJanitorCycle(
 		Back: int32(precreateBack), Fwd: int32(precreateFwd),
 	}); err != nil {
 		log.Printf("[janitor] ensure_quotes_partitions_hourly failed: %v", err)
+	}
+	if err := q.EnsureEventsPartitionsHourly(ctx, database.EnsureEventsPartitionsHourlyParams{
+		Back: int32(precreateBack), Fwd: int32(precreateFwd),
+	}); err != nil {
+		log.Printf("[janitor] ensure_events_partitions_hourly failed: %v", err)
 	}
 
 	free := freeMB("/")
@@ -237,6 +254,14 @@ func runJanitorCycle(
 				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
 				dbCheckpoint(ctx, q)
 			}
+		case "market_events":
+			// Events don't require archive check - just drop old partitions
+			if dropped, err := q.DropOldMarketEventsPartitionsHourly(ctx, int32(cfg.keepHours)); err != nil {
+				log.Printf("[janitor] drop_old events failed: %v", err)
+			} else if dropped > 0 {
+				log.Printf("[janitor] dropped %d %s partitions", dropped, tableName)
+				dbCheckpoint(ctx, q)
+			}
 		}
 	}
 
@@ -258,6 +283,9 @@ func runJanitorCycle(
 			deleted, err = q.DeleteExportedHoursTrades(ctx, cfg.window)
 		case "market_features":
 			deleted, err = q.DeleteExportedHoursFeatures(ctx, cfg.window)
+		case "market_events":
+			// Events use partition drops only (no archive, so no windowed deletes needed)
+			continue
 		default:
 			log.Printf("skip unknown table: %s", tableName)
 		}

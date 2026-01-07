@@ -77,6 +77,18 @@ func (q *Queries) DropArchivedMarketTradesPartitionsHourly(ctx context.Context, 
 	return dropped, err
 }
 
+const dropOldMarketEventsPartitionsHourly = `-- name: DropOldMarketEventsPartitionsHourly :one
+SELECT drop_old_market_events_partitions_hourly($1::int) AS dropped
+`
+
+// Drop old market_events partitions (no archive check needed - events are reconstructable)
+func (q *Queries) DropOldMarketEventsPartitionsHourly(ctx context.Context, keepHours int32) (int32, error) {
+	row := q.db.QueryRowContext(ctx, dropOldMarketEventsPartitionsHourly, keepHours)
+	var dropped int32
+	err := row.Scan(&dropped)
+	return dropped, err
+}
+
 const emergencyDeleteFeatures = `-- name: EmergencyDeleteFeatures :one
 WITH doomed AS (
   SELECT token_id, ts
@@ -164,6 +176,20 @@ func (q *Queries) EmergencyDeleteTrades(ctx context.Context, arg EmergencyDelete
 	var deleted int64
 	err := row.Scan(&deleted)
 	return deleted, err
+}
+
+const ensureEventsPartitionsHourly = `-- name: EnsureEventsPartitionsHourly :exec
+SELECT ensure_events_partitions_hourly($1::int, $2::int)
+`
+
+type EnsureEventsPartitionsHourlyParams struct {
+	Back int32 `json:"back"`
+	Fwd  int32 `json:"fwd"`
+}
+
+func (q *Queries) EnsureEventsPartitionsHourly(ctx context.Context, arg EnsureEventsPartitionsHourlyParams) error {
+	_, err := q.db.ExecContext(ctx, ensureEventsPartitionsHourly, arg.Back, arg.Fwd)
+	return err
 }
 
 const ensureFeaturesPartitionsHourly = `-- name: EnsureFeaturesPartitionsHourly :exec
