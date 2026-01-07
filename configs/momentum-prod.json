@@ -1,6 +1,6 @@
 {
     "name": "momentum-prod",
-    "duration": "168h",
+    "duration": "infinite",
     "momentum_threshold": 0.02,
     "hold_period": "10m",
     "max_spread_bps": 200,
