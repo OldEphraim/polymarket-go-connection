@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
+	"github.com/OldEphraim/polymarket-go-connection/internal/metrics"
 	"github.com/lib/pq"
 )
 
@@ -150,8 +151,17 @@ func (p *Persister) tryFlush(ctx context.Context) {
 		return
 	}
 	defer atomic.StoreInt32(&p.flushing, 0)
-	if err := p.flush(ctx); err != nil {
-		p.log.Error("persister flush error", "err", err)
+
+	start := time.Now()
+	err := p.flush(ctx)
+	duration := time.Since(start).Seconds()
+
+	metrics.FlushDuration.Observe(duration)
+	if err != nil {
+		metrics.FlushTotal.WithLabelValues("error").Inc()
+		p.log.Error("persister flush error", "err", err, "duration_ms", duration*1000)
+	} else {
+		metrics.FlushTotal.WithLabelValues("success").Inc()
 	}
 }
 
@@ -161,6 +171,7 @@ func (p *Persister) EnqueueQuote(q Quote) bool {
 	case p.quotesCh <- q:
 		return true
 	default:
+		metrics.QueueDrops.WithLabelValues("quotes").Inc()
 		return false
 	}
 }
@@ -169,6 +180,7 @@ func (p *Persister) EnqueueTrade(t Trade) bool {
 	case p.tradesCh <- t:
 		return true
 	default:
+		metrics.QueueDrops.WithLabelValues("trades").Inc()
 		return false
 	}
 }
@@ -177,6 +189,7 @@ func (p *Persister) EnqueueFeatures(f FeatureUpdate) bool {
 	case p.featuresCh <- f:
 		return true
 	default:
+		metrics.QueueDrops.WithLabelValues("features").Inc()
 		return false
 	}
 }
@@ -342,6 +355,17 @@ func (p *Persister) flush(ctx context.Context) (err error) {
 	if cerr := tx.Commit(); cerr != nil {
 		err = cerr
 		return err
+	}
+
+	// Track records written
+	if len(quotes) > 0 {
+		metrics.RecordsWritten.WithLabelValues("quotes").Add(float64(len(quotes)))
+	}
+	if len(trades) > 0 {
+		metrics.RecordsWritten.WithLabelValues("trades").Add(float64(len(trades)))
+	}
+	if len(features) > 0 {
+		metrics.RecordsWritten.WithLabelValues("features").Add(float64(len(features)))
 	}
 
 	p.log.Debug("persister flush committed",

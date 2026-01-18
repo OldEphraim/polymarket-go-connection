@@ -1,0 +1,107 @@
+groups:
+  - name: polymarket_alerts
+    rules:
+      # Data freshness alerts
+      - alert: QuotesDataStale
+        expr: data_lag_seconds{table="quotes"} > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Quotes data is stale"
+          description: "Quotes lag is {{ $value }}s (>5 min)"
+
+      - alert: QuotesDataCritical
+        expr: data_lag_seconds{table="quotes"} > 900
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Quotes data critically stale"
+          description: "Quotes lag is {{ $value }}s (>15 min) - gatherer may be stuck"
+
+      - alert: TradesDataStale
+        expr: data_lag_seconds{table="trades"} > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trades data is stale"
+          description: "Trades lag is {{ $value }}s (>5 min)"
+
+      - alert: FeaturesDataStale
+        expr: data_lag_seconds{table="features"} > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Features data is stale"
+          description: "Features lag is {{ $value }}s (>2 min)"
+
+      # Flush errors
+      - alert: GathererFlushErrors
+        expr: rate(gatherer_flush_total{status="error"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gatherer flush errors detected"
+          description: "Flush errors occurring - data may be lost"
+
+      - alert: GathererFlushErrorsHigh
+        expr: rate(gatherer_flush_total{status="error"}[5m]) / rate(gatherer_flush_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High gatherer flush error rate"
+          description: "Over 10% of flushes are failing"
+
+      # Queue drops
+      - alert: QueueDropsDetected
+        expr: rate(gatherer_queue_drops_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue drops detected"
+          description: "{{ $labels.queue }} queue is dropping records"
+
+      # Disk space
+      - alert: DiskSpaceLow
+        expr: disk_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low"
+          description: "Disk usage is {{ $value }}%"
+
+      - alert: DiskSpaceCritical
+        expr: disk_usage_percent > 90
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk space critical"
+          description: "Disk usage is {{ $value }}% - gatherer may pause"
+
+      # Service health
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.job }}"
+
+      # No data being written
+      - alert: NoRecordsWritten
+        expr: rate(gatherer_records_written_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No records being written"
+          description: "{{ $labels.table }} has had no writes for 5+ minutes"

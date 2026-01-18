@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/OldEphraim/polymarket-go-connection/gatherer"
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
@@ -158,6 +160,24 @@ func main() {
 					}
 				}
 			}
+		}
+	}()
+
+	// Start metrics server
+	metricsPort := os.Getenv("GATHERER_METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9090"
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		logger.Info("Starting metrics server", "port", metricsPort)
+		if err := http.ListenAndServe(":"+metricsPort, mux); err != nil {
+			logger.Error("metrics server error", "err", err)
 		}
 	}()
 

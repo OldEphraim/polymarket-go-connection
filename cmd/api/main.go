@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/db"
+	"github.com/OldEphraim/polymarket-go-connection/internal/metrics"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type StatsResponse struct {
@@ -317,6 +319,13 @@ func (s *APIServer) refreshStatsOnce() {
 	s.statsMu.Lock()
 	s.latestStats = snap
 	s.statsMu.Unlock()
+
+	// Update Prometheus metrics
+	metrics.ActiveMarkets.Set(float64(snap.ActiveMarkets))
+	metrics.DataLagSeconds.WithLabelValues("quotes").Set(snap.QuotesLagSec)
+	metrics.DataLagSeconds.WithLabelValues("trades").Set(snap.TradesLagSec)
+	metrics.DataLagSeconds.WithLabelValues("features").Set(snap.FeaturesLagSec)
+	metrics.ServiceHealth.WithLabelValues("api").Set(1)
 
 	s.log.Info("stats refreshed",
 		"generated_at", snap.GeneratedAt,
@@ -947,6 +956,7 @@ func main() {
 	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}).Methods("GET")
+	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
 
 	// Protected (frontend)
 	r.HandleFunc("/api/stats", server.authenticate(server.getStats)).Methods("GET")
