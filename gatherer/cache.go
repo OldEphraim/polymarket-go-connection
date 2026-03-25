@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/OldEphraim/polymarket-go-connection/internal/database"
 )
@@ -94,6 +95,40 @@ func (g *Gatherer) seedAssetsFromDB() error {
 		}(),
 		"inserted", totalInserted)
 	return nil
+}
+
+// cacheCleanupLoop periodically prunes stale entries from in-memory maps
+// to prevent unbounded memory growth over long-running sessions.
+func (g *Gatherer) cacheCleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-ticker.C:
+			// Prune debounce map (entries older than 5 minutes are useless)
+			g.pruneLastEmit(5 * time.Minute)
+
+			// Log map sizes for observability
+			g.emitMu.Lock()
+			emitLen := len(g.lastEmit)
+			g.emitMu.Unlock()
+
+			g.cacheMu.RLock()
+			cacheLen := len(g.marketCache)
+			g.cacheMu.RUnlock()
+
+			g.assetMu.RLock()
+			assetLen := len(g.assetToToken)
+			g.assetMu.RUnlock()
+
+			g.logger.Info("cache cleanup",
+				"lastEmit", emitLen,
+				"marketCache", cacheLen,
+				"assetToToken", assetLen)
+		}
+	}
 }
 
 func (g *Gatherer) addClobMap(tokenID string, clobIDs string) {

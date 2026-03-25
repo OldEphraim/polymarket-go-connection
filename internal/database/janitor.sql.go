@@ -77,6 +77,23 @@ func (q *Queries) DropArchivedMarketTradesPartitionsHourly(ctx context.Context, 
 	return dropped, err
 }
 
+const dropOldEmptyPartitions = `-- name: DropOldEmptyPartitions :one
+SELECT drop_old_empty_partitions($1::text, $2::int) AS dropped
+`
+
+type DropOldEmptyPartitionsParams struct {
+	ParentTable string `json:"parent_table"`
+	KeepHours   int32  `json:"keep_hours"`
+}
+
+// Drop old empty partitions (safety net for when archiver falls behind)
+func (q *Queries) DropOldEmptyPartitions(ctx context.Context, arg DropOldEmptyPartitionsParams) (int32, error) {
+	row := q.db.QueryRowContext(ctx, dropOldEmptyPartitions, arg.ParentTable, arg.KeepHours)
+	var dropped int32
+	err := row.Scan(&dropped)
+	return dropped, err
+}
+
 const dropOldMarketEventsPartitionsHourly = `-- name: DropOldMarketEventsPartitionsHourly :one
 SELECT drop_old_market_events_partitions_hourly($1::int) AS dropped
 `

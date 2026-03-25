@@ -265,6 +265,24 @@ func runJanitorCycle(
 		}
 	}
 
+	// Safety net: drop old EMPTY partitions that the archiver never got to.
+	// This prevents empty partition shells from accumulating when the archiver falls behind.
+	for _, tableName := range splitCSV(tablesCSV) {
+		cfg, ok := tableConfigs[tableName]
+		if !ok {
+			continue
+		}
+		if dropped, err := q.DropOldEmptyPartitions(ctx, database.DropOldEmptyPartitionsParams{
+			ParentTable: tableName,
+			KeepHours:   int32(cfg.keepHours),
+		}); err != nil {
+			log.Printf("[janitor] drop_old_empty %s failed: %v", tableName, err)
+		} else if dropped > 0 {
+			log.Printf("[janitor] dropped %d empty %s partitions", dropped, tableName)
+			dbCheckpoint(ctx, q)
+		}
+	}
+
 	// Then do windowed deletes (rows that are archived but still inside the keep window)
 	for _, tableName := range splitCSV(tablesCSV) {
 		cfg, ok := tableConfigs[tableName]

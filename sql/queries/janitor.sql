@@ -108,3 +108,7 @@ CHECKPOINT;
 
 -- name: PgSwitchWal :one
 SELECT pg_switch_wal()::text AS lsn;
+
+-- Drop old empty partitions (safety net for when archiver falls behind)
+-- name: DropOldEmptyPartitions :one
+SELECT drop_old_empty_partitions(sqlc.arg(parent_table)::text, sqlc.arg(keep_hours)::int) AS dropped;

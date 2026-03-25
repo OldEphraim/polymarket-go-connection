@@ -139,6 +139,13 @@ func (g *Gatherer) Start() error {
 		g.detectorLoop()
 	}()
 
+	// Periodic cache cleanup to prevent unbounded memory growth
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.cacheCleanupLoop()
+	}()
+
 	// Metrics loop
 	g.wg.Add(1)
 	go g.metricsLoop()

@@ -180,3 +180,15 @@ func (g *Gatherer) shouldDebounce(t MarketEventType, tokenID string, window time
 	g.lastEmit[key] = now
 	return false
 }
+
+// pruneLastEmit removes entries older than maxAge from the debounce map.
+func (g *Gatherer) pruneLastEmit(maxAge time.Duration) {
+	now := time.Now()
+	g.emitMu.Lock()
+	defer g.emitMu.Unlock()
+	for k, t := range g.lastEmit {
+		if now.Sub(t) > maxAge {
+			delete(g.lastEmit, k)
+		}
+	}
+}

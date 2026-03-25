@@ -27,6 +27,8 @@ type Querier interface {
 	// Drop archived partitions
 	DropArchivedMarketQuotesPartitionsHourly(ctx context.Context, keepHours int32) (int32, error)
 	DropArchivedMarketTradesPartitionsHourly(ctx context.Context, keepHours int32) (int32, error)
+	// Drop old empty partitions (safety net for when archiver falls behind)
+	DropOldEmptyPartitions(ctx context.Context, arg DropOldEmptyPartitionsParams) (int32, error)
 	// Drop old market_events partitions (no archive check needed - events are reconstructable)
 	DropOldMarketEventsPartitionsHourly(ctx context.Context, keepHours int32) (int32, error)
 	DumpFeaturesHourPage(ctx context.Context, arg DumpFeaturesHourPageParams) ([]MarketFeature, error)
